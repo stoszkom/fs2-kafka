@@ -46,7 +46,9 @@ abstract class BaseKafkaSpec extends BaseAsyncSpec with ForAllTestContainer {
 
   override def runTest(testName: String, args: Args) = super.runTest(testName, args)
 
-  private val imageVersion = "8.1.2"
+  protected def imageVersion: String = "8.1.2"
+
+  protected def brokerEnvironment: Map[String, String] = Map.empty
 
   private lazy val imageName = "confluentinc/cp-kafka"
 
@@ -65,6 +67,7 @@ abstract class BaseKafkaSpec extends BaseAsyncSpec with ForAllTestContainer {
             "org.apache.kafka.metadata.authorizer.StandardAuthorizer"
           )
           .withEnv("KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND", "true")
+          .withEnv(brokerEnvironment.asJava)
 
         ()
     }

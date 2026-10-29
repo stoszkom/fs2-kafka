@@ -27,7 +27,7 @@ lazy val root = project
     Test / console        := (core / Test / console).value
   )
   .enablePlugins(TypelevelMimaPlugin)
-  .aggregate(core, vulcan, `vulcan-testkit-munit`)
+  .aggregate(core, share, vulcan, `vulcan-testkit-munit`)
 
 lazy val core = project
   .in(file("modules/core"))
@@ -50,6 +50,28 @@ lazy val core = project
     scalaSettings,
     testSettings
   )
+
+lazy val share = project
+  .in(file("modules/share"))
+  .settings(
+    moduleName := "fs2-kafka-share",
+    name       := moduleName.value,
+    dependencySettings ++ Seq(
+      libraryDependencies ++= Seq(
+        "co.fs2"          %% "fs2-core"           % fs2Version,
+        "org.apache.kafka" % "kafka-clients"      % kafkaVersion,
+        "org.typelevel"   %% "cats-core"          % catsVersion,
+        "org.typelevel"   %% "cats-effect-kernel" % catsEffectVersion,
+        "org.typelevel"   %% "cats-effect-std"    % catsEffectVersion,
+        "org.typelevel"   %% "cats-effect"        % catsEffectVersion
+      )
+    ),
+    publishSettings,
+    scalaSettings,
+    testSettings,
+    versionIntroduced("4.2.0")
+  )
+  .dependsOn(core % "compile->compile;test->test")
 
 lazy val vulcan = project
   .in(file("modules/vulcan"))
@@ -107,7 +129,7 @@ lazy val docs = project
     mdocSettings,
     buildInfoSettings
   )
-  .dependsOn(core, vulcan, `vulcan-testkit-munit`)
+  .dependsOn(core, share, vulcan, `vulcan-testkit-munit`)
   .enablePlugins(BuildInfoPlugin, DocusaurusPlugin, MdocPlugin, ScalaUnidocPlugin)
 
 lazy val dependencySettings = Seq(
@@ -149,7 +171,7 @@ lazy val mdocSettings = Seq(
   mdoc                                       := (Compile / run).evaluated,
   scalacOptions                             --= Seq("-Xfatal-warnings", "-Ywarn-unused"),
   crossScalaVersions                         := Seq(scala213),
-  ScalaUnidoc / unidoc / unidocProjectFilter := inProjects(core, vulcan),
+  ScalaUnidoc / unidoc / unidocProjectFilter := inProjects(core, share, vulcan),
   ScalaUnidoc / unidoc / target              := (LocalRootProject / baseDirectory)
     .value / "website" / "static" / "api",
   cleanFiles           += (ScalaUnidoc / unidoc / target).value,
@@ -188,6 +210,9 @@ lazy val buildInfoSettings = Seq(
     },
     BuildInfoKey.map(core / crossScalaVersions) { case (k, v) =>
       "core" ++ k.capitalize -> v
+    },
+    BuildInfoKey.map(share / moduleName) { case (k, v) =>
+      "share" ++ k.capitalize -> v
     },
     BuildInfoKey.map(vulcan / moduleName) { case (k, v) =>
       "vulcan" ++ k.capitalize -> v
