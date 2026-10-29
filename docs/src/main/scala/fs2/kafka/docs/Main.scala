@@ -35,6 +35,7 @@ object Main {
         Map(
           "ORGANIZATION"                     -> organization,
           "CORE_MODULE_NAME"                 -> coreModuleName,
+          "SHARE_MODULE_NAME"                -> shareModuleName,
           "CORE_CROSS_SCALA_VERSIONS"        -> minorVersionsString(coreCrossScalaVersions),
           "VULCAN_MODULE_NAME"               -> vulcanModuleName,
           "VULCAN_CROSS_SCALA_VERSIONS"      -> minorVersionsString(vulcanCrossScalaVersions),

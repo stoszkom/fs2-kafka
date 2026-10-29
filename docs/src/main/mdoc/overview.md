@@ -40,6 +40,12 @@ In order to test vulcan codecs against a [schema registry](https://docs.confluen
 libraryDependencies += "@ORGANIZATION@" %% "@VULCAN_TESTKIT_MUNIT_MODULE_NAME@" % "@LATEST_VERSION@"
 ```
 
+For [share group](https://cwiki.apache.org/confluence/display/KAFKA/KIP-932%3A+Queues+for+Kafka) support using the experimental [share consumers](share-consumers.md), add the following line to your `build.sbt` file.
+
+```scala
+libraryDependencies += "@ORGANIZATION@" %% "@SHARE_MODULE_NAME@" % "@LATEST_VERSION@"
+```
+
 #### External Modules
 
 Following is an incomplete list of third-party integrations.
@@ -74,6 +80,7 @@ Refer to the table below for dependencies and version support across modules.
 | Module                 | Dependencies                                                                                                                                                           | Scala                               |
 | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
 | `@CORE_MODULE_NAME@`   | [FS2 @FS2_VERSION@](https://github.com/typelevel/fs2), [Apache Kafka Client @KAFKA_VERSION@](https://github.com/apache/kafka)                                          | Scala @CORE_CROSS_SCALA_VERSIONS@   |
+| `@SHARE_MODULE_NAME@`  | [FS2 @FS2_VERSION@](https://github.com/typelevel/fs2), [Apache Kafka Client @KAFKA_VERSION@](https://github.com/apache/kafka)                                          | Scala @CORE_CROSS_SCALA_VERSIONS@   |
 | `@VULCAN_MODULE_NAME@` | [Vulcan @VULCAN_VERSION@](https://github.com/typelevel/vulcan), [Confluent Kafka Avro Serializer @CONFLUENT_VERSION@](https://github.com/confluentinc/schema-registry) | Scala @VULCAN_CROSS_SCALA_VERSIONS@ |
 
 ## Adopters
