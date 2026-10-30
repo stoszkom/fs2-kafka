@@ -310,10 +310,40 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V] private (
       .flatMap { round =>
         val next =
           state.copy(commits = rest, deferred = state.deferred ++ round.deferred)
+        val sync = commits.headOption.exists(_.sync)
         if (round.staged.isEmpty) F.pure(next)
-        else commitRound(next, round.staged, sync = commits.headOption.exists(_.sync))
+        else if (!sync && ridesWithPoll(next, round.staged)) commitWithPoll(next, round.staged)
+        else commitRound(next, round.staged, sync)
       }
   }
+
+  /**
+    * Whether the acknowledgements of a round can go with the next poll, as Java sends them, instead
+    * of in a request of their own: they settle the latest poll, nothing else waits, and the latest
+    * poll was full. On a quiet topic, the broker may hold a fetch while it waits for records, which
+    * would delay the confirmation, so they are committed on their own.
+    */
+  private def ridesWithPoll(state: State, parts: Vector[Part[F]]): Boolean = {
+    val staged = parts.flatMap(_.staged)
+    val ids    = staged.iterator.map(_._1.id).toSet
+    state.admitting && state.commits.isEmpty && state.lastPollRecords >= maxPollRecords &&
+    staged.forall(_._1.acknowledgeType != AcknowledgeType.Renew) &&
+    state.unacknowledged.keysIterator.forall(ids.contains)
+  }
+
+  // Sends the acknowledgements of a round with a poll, then tracks the polled records.
+  private def commitWithPoll(state: State, parts: Vector[Part[F]]): F[State] =
+    for {
+      timeout <- effectiveCommitTimeout(settings, state.lock).liftTo[F]
+      start   <- F.monotonic
+      sent    <-
+        client.pollWithAcknowledgements(parts.flatMap(_.staged), timeout, settings.pollTimeout)
+      (result, records) = sent
+      settled          <- completeRound(state, parts, result, start)
+      next             <- records.fold(F.pure(settled)) { case (polledRecords, lock) =>
+                polled(settled, start, polledRecords, lock.orElse(settled.lock))
+              }
+    } yield next
 
   private def addToRound(
     state: State,
@@ -374,35 +404,52 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V] private (
         (if (sync) client.commitSync(staged, timeout)
          else client.commitAsync(staged, timeout, state.confirmationTimes)).attempt
       confirmedAt <- F.monotonic
-      next         = staged.foldLeft(state) { case (s, (ack, record)) =>
-               val error = failure(ack, result)
-               // A renewal which timed out may still complete, so its record is kept.
-               if (
-                 ack.acknowledgeType == AcknowledgeType.Renew &&
-                 error.forall(_.isInstanceOf[TimeoutException])
-               )
-                 s.copy(inFlight =
-                   s.inFlight
-                     .updated(
-                       ack.id,
-                       record.copy(
-                         renewing = true,
-                         lockedSince = submittedAt,
-                         renewalConfirmed = error.isEmpty
-                       )
-                     )
-                 )
-               else s.copy(inFlight = s.inFlight - ack.id)
-             }
-      timed = if (result.isRight && !sync) next.withConfirmationTime(confirmedAt - submittedAt)
-              else next
-      _ <- pendingRef.set(timed.pending)
-      _ <- parts.traverse_ { part =>
-             part.callback(
-               result.map(results => part.partitions.map(p => p -> results.get(p).flatten).toMap)
-             )
-           }
-    } yield timed
+      timed        =
+        if (result.isRight && !sync) state.withConfirmationTime(confirmedAt - submittedAt)
+        else state
+      next <- completeRound(timed, parts, result, submittedAt)
+    } yield next
+  }
+
+  /**
+    * Updates the records of a round with its result, and completes each callback with its
+    * partitions' results.
+    */
+  private def completeRound(
+    state: State,
+    parts: Vector[Part[F]],
+    result: Either[Throwable, CommitResult],
+    submittedAt: FiniteDuration
+  ): F[State] = {
+    val staged = parts.flatMap(_.staged)
+    val next   = staged.foldLeft(state) { case (s, (ack, record)) =>
+      val error = failure(ack, result)
+      // A renewal which timed out may still complete, so its record is kept.
+      if (
+        ack.acknowledgeType == AcknowledgeType.Renew &&
+        error.forall(_.isInstanceOf[TimeoutException])
+      )
+        s.copy(inFlight =
+          s.inFlight
+            .updated(
+              ack.id,
+              record.copy(
+                renewing = true,
+                lockedSince = submittedAt,
+                renewalConfirmed = error.isEmpty
+              )
+            )
+        )
+      else s.copy(inFlight = s.inFlight - ack.id)
+    }
+    pendingRef.set(next.pending) *>
+      parts
+        .traverse_ { part =>
+          part.callback(
+            result.map(results => part.partitions.map(p => p -> results.get(p).flatten).toMap)
+          )
+        }
+        .as(next)
   }
 
   private def failure(

@@ -7,7 +7,7 @@
 package fs2.kafka
 
 import java.time.Duration
-import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicReference}
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.Optional
 
@@ -41,14 +41,18 @@ final class KafkaShareConsumerTimeoutSpec extends BaseAsyncSpec {
   /**
     * A share consumer on Kafka's own in-flight tracking. It confirms acknowledgements during later
     * calls, like Java's consumer, but only while `confirming` is set; `commitSync` then times out.
-    * Renewals submitted while `renewalError` is set fail. With `implicitMode`, polls and commits
-    * accept the records of the previous poll, as in Java's implicit mode.
+    * Renewals submitted while `renewalError` is set fail, and other acknowledgements while
+    * `acknowledgementError` is set. Like Java, a poll sends the staged acknowledgements and
+    * confirms them before it returns. With `implicitMode`, polls and commits accept the records of
+    * the previous poll, as in Java's implicit mode. `commits` counts the commit calls.
     */
   final private class TestShareConsumer(batches: List[Long]*)
       extends MockShareConsumer[Array[Byte], Array[Byte]] {
 
     val confirming                                      = new AtomicBoolean(true)
     val renewalError                                    = new AtomicReference[KafkaException]
+    val acknowledgementError                            = new AtomicReference[KafkaException]
+    val commits                                         = new AtomicInteger
     val acknowledged                                    = new ConcurrentLinkedQueue[(Long, KafkaAcknowledgeType)]
     var lock                                            = Optional.empty[Integer]()
     var implicitMode                                    = false
@@ -68,6 +72,7 @@ final class KafkaShareConsumerTimeoutSpec extends BaseAsyncSpec {
       fetch.acknowledge(record, kind)
 
     override def commitAsync(): Unit = {
+      commits.incrementAndGet(): Unit
       confirm()
       submit()
     }
@@ -75,6 +80,7 @@ final class KafkaShareConsumerTimeoutSpec extends BaseAsyncSpec {
     override def commitSync(
       timeout: Duration
     ): java.util.Map[TopicIdPartition, Optional[KafkaException]] = {
+      commits.incrementAndGet(): Unit
       confirm()
       submit()
       if (!confirming.get)
@@ -94,7 +100,8 @@ final class KafkaShareConsumerTimeoutSpec extends BaseAsyncSpec {
           val types = acks.getAcknowledgementsTypeMap.asScala
           types.foreach { case (offset, kind) => acknowledged.add(offset.longValue -> kind) }
           val error =
-            if (types.values.exists(_ == KafkaAcknowledgeType.RENEW)) renewalError.get else null
+            if (types.values.exists(_ == KafkaAcknowledgeType.RENEW)) renewalError.get
+            else acknowledgementError.get
           acks.complete(error)
           done.enqueue(acks -> error)
         }
@@ -102,7 +109,8 @@ final class KafkaShareConsumerTimeoutSpec extends BaseAsyncSpec {
 
     override def poll(timeout: Duration): KafkaByteConsumerRecords = {
       confirm()
-      if (implicitMode) submit()
+      submit()
+      confirm()
       fetch.takeRenewedRecords()
       if (fetch.isEmpty && !fetch.hasRenewals && next.nonEmpty) {
         val batch = new ShareInFlightBatch[Array[Byte], Array[Byte]](0, tip, lock)
@@ -332,6 +340,70 @@ final class KafkaShareConsumerTimeoutSpec extends BaseAsyncSpec {
       accept shouldBe Right(())
       native.acknowledged.asScala.toList.filter(_._1 == 1L) shouldBe
         List(1L -> KafkaAcknowledgeType.ACCEPT)
+    }
+  }
+
+  describe("KafkaShareConsumer committing whole polls") {
+    def commitChunks(
+      native: TestShareConsumer,
+      settings: ShareConsumerSettings[IO, String, String],
+      count: Long
+    ) =
+      consume(native, settings)(
+        _.records
+          .take(count)
+          .chunks
+          .evalMap(chunk =>
+            AcknowledgedOffsetBatch
+              .fromFoldable(chunk.map(_.offset.acknowledge(AcknowledgeType.Accept)))
+              .commit
+              .attempt
+          )
+          .compile
+          .toList
+      )
+
+    it("should send the acknowledgements of a full poll with the next poll") {
+      val native  = new TestShareConsumer(List(1L, 2L), List(3L, 4L))
+      val results = commitChunks(native, settings.withMaxPollRecords(2), 4)
+      results shouldBe List(Right(()), Right(()))
+      native.acknowledged.asScala.toList.map(_._1) shouldBe List(1L, 2L, 3L, 4L)
+      native.commits.get shouldBe 0
+    }
+
+    it("should commit the acknowledgements of a poll which was not full on their own") {
+      val native  = new TestShareConsumer(List(1L, 2L))
+      val results = commitChunks(native, settings.withMaxPollRecords(5), 2)
+      results shouldBe List(Right(()))
+      native.commits.get should be > 0
+    }
+
+    it("should report an error confirmed by the poll which sent the acknowledgements") {
+      val native = new TestShareConsumer(List(1L, 2L))
+      native.acknowledgementError.set(new KafkaException("acknowledgement failed"))
+      val results = commitChunks(native, settings.withMaxPollRecords(2), 2)
+      results.head.swap.toOption.get.getMessage shouldBe "acknowledgement failed"
+      native.commits.get shouldBe 0
+    }
+
+    it("should time out acknowledgements sent with a poll which are not confirmed") {
+      val native = new TestShareConsumer(List(1L, 2L))
+      val result = consume(native, settings.withMaxPollRecords(2))(
+        _.records
+          .take(2)
+          .chunks
+          .evalMap(chunk =>
+            withoutConfirmation(native)(
+              AcknowledgedOffsetBatch
+                .fromFoldable(chunk.map(_.offset.acknowledge(AcknowledgeType.Accept)))
+                .commit
+                .attempt
+            )
+          )
+          .compile
+          .lastOrError
+      )
+      result.swap.toOption.get shouldBe a[ShareCommitTimeoutException]
     }
   }
 
