@@ -21,7 +21,7 @@ import org.apache.kafka.clients.consumer.ConsumerConfig
   * needs an acknowledgement before the next poll, and `record_limit` acquisition, where a poll
   * returns at most `max.poll.records` records. Both modes can be changed with [[withProperty]], and
   * behave as in Java's share consumer. As in Java, records are not renewed automatically unless
-  * enabled with [[withAutoRenewal]].<br><br>
+  * enabled with [[withAutoRenewal]], except to let a renewed record be acknowledged.<br><br>
   *
   * Several convenience functions are provided so that you don't have to work with `String` values
   * and `ConsumerConfig` for configuration. It's still possible to specify `ConsumerConfig` values
@@ -201,9 +201,11 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
     * Creates a new [[ShareConsumerSettings]] with the specified [[autoRenewal]].<br><br>
     *
     * Without automatic renewal, a record which is neither acknowledged nor renewed in time is
-    * delivered again, possibly to another consumer, and its later acknowledgement fails. Enable it
-    * when processing may outlast the lock. A record whose processing hangs is then renewed, and
-    * holds back the next poll of its consumer, until the stream ends.
+    * delivered again, possibly to another consumer, and its later acknowledgement fails. Only while
+    * an acknowledgement waits for a record you renewed are the other records renewed, so that the
+    * consumer can poll the renewed record again. Enable it when processing may outlast the lock. A
+    * record whose processing hangs is then renewed, and holds back the next poll of its consumer,
+    * until the stream ends.
     */
   def withAutoRenewal(enabled: Boolean): ShareConsumerSettings[F, K, V]
 

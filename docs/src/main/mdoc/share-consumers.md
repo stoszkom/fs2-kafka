@@ -166,13 +166,13 @@ def processOrReject(
 
 ## Renewal
 
-A record which is not acknowledged within its acquisition lock, 30 seconds by default, is delivered again, possibly to another consumer, and its later acknowledgement fails. As in Java, records are not renewed automatically. We can renew a record with `Renew`, any number of times before its final acknowledgement.
+A record which is not acknowledged within its acquisition lock, 30 seconds by default, is delivered again, possibly to another consumer, and its later acknowledgement fails. As in Java, records are not renewed automatically, except to let a renewed record be acknowledged, see below. We can renew a record with `Renew`, any number of times before its final acknowledgement.
 
 With `withAutoRenewal(true)`, records without an acknowledgement are renewed at about half of the lock duration, or earlier when the commit timeout or half of `max.poll.interval.ms` requires it. Enable it when processing may outlast the lock. Note that a record whose processing hangs is then renewed, and holds back its consumer, until the stream ends.
 
 - **A slow record holds back its consumer.** Renewing lets the consumer poll again, but Java then returns only the renewed records, and polls new ones only once every record is settled. No setting changes this. Use [several consumers](#several-consumers) to keep polling past slow records.
 
-- **A renewed record is acknowledged after the next poll.** That poll needs every other record of the batch acknowledged. With auto-renewal, the consumer renews the other records right away, so it can poll. Without it, the acknowledgement waits until every other record is acknowledged or renewed, so do not hold those back while waiting for it.
+- **A renewed record is acknowledged after the next poll.** Java returns it from that poll, and allows the poll only once every other record of the batch is acknowledged or renewed. So while an acknowledgement waits for a renewed record, the consumer renews the other records itself, also without auto-renewal: right away when the broker confirmed the renewal, otherwise at about half of the lock duration, until the renewal resolves. The other records are not handed out again.
 
 - **Without auto-renewal, the consumer does not poll** while a record has no acknowledgement, so keep processing within `max.poll.interval.ms`.
 

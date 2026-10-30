@@ -232,12 +232,17 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V] private (
         }
       }
 
-  // A decision waiting for a renewed record makes renewal due at once, so the actor can poll.
+  /**
+    * A decision waiting for a renewed record needs the next poll, which Java allows only once the
+    * other records are acknowledged or renewed. So the actor renews them, even without automatic
+    * renewal: at once when the broker confirmed the renewal, so the poll returns the record, and
+    * otherwise at the renewal interval, until the renewal resolves.
+    */
   private def nextRenewal(state: State, now: FiniteDuration): Option[FiniteDuration] =
-    if (!settings.autoRenewal) None
-    else if (state.awaitsConfirmedRenewal && state.commits.isEmpty && state.unacknowledged.nonEmpty)
+    if (state.awaitsConfirmedRenewal && state.commits.isEmpty && state.unacknowledged.nonEmpty)
       Some(now)
-    else state.nextRenewal
+    else if (settings.autoRenewal || state.deferred.nonEmpty) state.nextRenewal
+    else None
 
   private def unemitted(state: State): F[Vector[ShareState.Id]] =
     state
@@ -544,7 +549,9 @@ private[kafka] object KafkaShareConsumerActor {
     emitted: Ref[F, Boolean]
   )
 
-  // The acknowledgements of one commit request, by what happens to them in a round.
+  /**
+    * Creates the actor from the settings, reading the Java configuration it needs.
+    */
   def resource[F[_], K, V](
     settings: ShareConsumerSettings[F, K, V],
     keyDeserializer: KeyDeserializer[F, K],

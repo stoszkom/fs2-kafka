@@ -281,6 +281,53 @@ final class KafkaShareConsumerTimeoutSpec extends BaseAsyncSpec {
     }
   }
 
+  describe("KafkaShareConsumer without automatic renewal") {
+    it("should renew the rest of the batch so that a renewed record can be accepted") {
+      val native  = new TestShareConsumer(List(0L, 1L))
+      val results = consume(native)(
+        _.records
+          .take(2)
+          .evalMap { r =>
+            val accept = r.offset.acknowledge(AcknowledgeType.Accept).commit.attempt
+            if (r.offset.offset == 0L)
+              r.offset.acknowledge(AcknowledgeType.Renew).commit *> accept
+            else accept
+          }
+          .compile
+          .toList
+      )
+      results shouldBe List(Right(()), Right(()))
+      native.acknowledged.asScala.toList shouldBe List(
+        0L -> KafkaAcknowledgeType.RENEW,
+        1L -> KafkaAcknowledgeType.RENEW,
+        0L -> KafkaAcknowledgeType.ACCEPT,
+        1L -> KafkaAcknowledgeType.ACCEPT
+      )
+    }
+
+    it(
+      "should renew the rest of the batch so that a record whose renewal timed out can be accepted"
+    ) {
+      val native  = new TestShareConsumer(List(0L, 1L))
+      val results = consume(native)(
+        _.records
+          .take(2)
+          .evalMap { r =>
+            val accept = r.offset.acknowledge(AcknowledgeType.Accept).commit.attempt
+            if (r.offset.offset == 0L)
+              withoutConfirmation(native)(
+                r.offset.acknowledge(AcknowledgeType.Renew).commit.attempt
+              ) *> accept
+            else accept
+          }
+          .compile
+          .toList
+      )
+      results shouldBe List(Right(()), Right(()))
+      native.acknowledged.asScala.toList should contain(1L -> KafkaAcknowledgeType.RENEW)
+    }
+  }
+
   describe("KafkaShareConsumer when the broker does not confirm in time") {
     it("should fail the acknowledgement with a ShareCommitTimeoutException") {
       val native = new TestShareConsumer(List(1L))
