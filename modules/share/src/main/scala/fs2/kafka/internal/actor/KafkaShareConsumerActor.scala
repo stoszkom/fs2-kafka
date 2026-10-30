@@ -277,7 +277,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V] private (
         )
     )
     Deferred[F, Either[Throwable, CommitResult]].flatMap { done =>
-      commitRound(state, Vector(staged -> (done.complete(_).void)), sync = false).flatTap(_ =>
+      commitRound(state, Vector(Part(staged, done.complete(_).void)), sync = false).flatTap(_ =>
         done
           .get
           .flatMap {
@@ -293,8 +293,9 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V] private (
   /**
     * Commits one round: the first request if it is synchronous, or else the asynchronous requests
     * up to the next synchronous one. Each acknowledgement is staged, deferred while its record is
-    * renewing, or failed with a [[RecordNotInFlightException]]. A second decision for a record
-    * moves to the next round.
+    * renewing, or failed with a [[RecordNotInFlightException]]. As in Java, the last decision for a
+    * record in a round wins; the requests whose decisions it replaced get the result of its
+    * partition.
     */
   private def processCommits(state: State): F[State] = {
     val (commits, rest) =
@@ -305,7 +306,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V] private (
       .foldLeftM(Round[F]())((round, commit) => addToRound(state, round, commit))
       .flatMap { round =>
         val next =
-          state.copy(commits = round.later ++ rest, deferred = state.deferred ++ round.deferred)
+          state.copy(commits = rest, deferred = state.deferred ++ round.deferred)
         if (round.staged.isEmpty) F.pure(next)
         else commitRound(next, round.staged, sync = commits.headOption.exists(_.sync))
       }
@@ -316,45 +317,42 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V] private (
     round: Round[F],
     commit: ShareRequest.Commit[F]
   ): F[Round[F]] = {
-    val (claimed, parts)                                             = split(state, round.claimed, commit.acknowledgements)
+    val parts = split(state, commit.acknowledgements)
+    // The last decision for a record in a round wins, as in Java, replacing earlier ones.
+    val decided  = parts.staged.map(_._1.id).toSet
+    val replaced = decided.filter(round.claimed.contains)
+    val earlier  =
+      if (replaced.isEmpty) round.staged
+      else
+        round
+          .staged
+          .map(part => part.copy(staged = part.staged.filterNot(s => replaced.contains(s._1.id))))
     def retry(acks: Vector[ShareRequest.Ack], callback: Callback[F]) =
       ShareRequest.Commit[F](Chunk.from(acks), commit.sync, callback)
 
     joinCallbacks(commit.callback, parts.count).flatMap { callbacks =>
       val next     = callbacks.iterator
-      val staged   = when(parts.staged.nonEmpty)(parts.staged -> next.next())
+      val staged   = when(parts.staged.nonEmpty)(Part(parts.staged, next.next()))
       val deferred = when(parts.deferred.nonEmpty)(retry(parts.deferred, next.next()))
       val invalid  = when(parts.invalid.nonEmpty)(next.next())
-      val later    = when(parts.later.nonEmpty)(retry(parts.later, next.next()))
       invalid
         .traverse_(_(Right(notInFlight(parts.invalid))))
-        .as(
-          Round(
-            claimed,
-            round.staged ++ staged,
-            round.deferred ++ deferred,
-            round.later ++ later
-          )
-        )
+        .as(Round(round.claimed ++ decided, earlier ++ staged, round.deferred ++ deferred))
     }
   }
 
-  private def split(
-    state: State,
-    claimed: Set[ShareState.Id],
-    acknowledgements: Chunk[ShareRequest.Ack]
-  ): (Set[ShareState.Id], Split[F]) =
-    acknowledgements.foldLeft((claimed, Split[F]())) { case ((claimed, split), ack) =>
+  private def split(state: State, acknowledgements: Chunk[ShareRequest.Ack]): Split[F] = {
+    val split = acknowledgements.foldLeft(Split[F]()) { (split, ack) =>
       val record =
         state.inFlight.get(ack.id).filter(r => ack.deliveryCount.forall(_ == r.deliveryCount))
       record match {
-        case _ if claimed.contains(ack.id) => (claimed, split.copy(later = split.later :+ ack))
-        case Some(r) if r.renewing         => (claimed, split.copy(deferred = split.deferred :+ ack))
-        case Some(r)                       =>
-          (claimed + ack.id, split.copy(staged = split.staged :+ (ack -> r)))
-        case None => (claimed, split.copy(invalid = split.invalid :+ ack))
+        case Some(r) if r.renewing => split.copy(deferred = split.deferred :+ ack)
+        case Some(r)               => split.copy(staged = split.staged :+ (ack -> r))
+        case None                  => split.copy(invalid = split.invalid :+ ack)
       }
     }
+    split.copy(staged = lastDecisions(split.staged))
+  }
 
   /**
     * Stages the acknowledgements, commits them with one Java call, and completes each callback with
@@ -362,10 +360,10 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V] private (
     */
   private def commitRound(
     state: State,
-    parts: Vector[(Vector[Staged[F]], Callback[F])],
+    parts: Vector[Part[F]],
     sync: Boolean
   ): F[State] = {
-    val staged = parts.flatMap(_._1)
+    val staged = parts.flatMap(_.staged)
     for {
       timeout     <- effectiveCommitTimeout(settings, state.lock).liftTo[F]
       submittedAt <- F.monotonic
@@ -396,9 +394,10 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V] private (
       timed = if (result.isRight && !sync) next.withConfirmationTime(confirmedAt - submittedAt)
               else next
       _ <- pendingRef.set(timed.pending)
-      _ <- parts.traverse_ { case (acks, callback) =>
-             val partitions = acks.map(_._1.topicPartition).distinct
-             callback(result.map(results => partitions.map(p => p -> results.get(p).flatten).toMap))
+      _ <- parts.traverse_ { part =>
+             part.callback(
+               result.map(results => part.partitions.map(p => p -> results.get(p).flatten).toMap)
+             )
            }
     } yield timed
   }

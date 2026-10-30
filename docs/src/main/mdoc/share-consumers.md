@@ -131,6 +131,8 @@ Errors are reported per partition, so an error fails every acknowledgement of th
 
 - `ShareCommitTimeoutException` means the broker did not confirm within the commit timeout. The acknowledgements may still have been applied.
 
+As in Java, the last decision for a record wins until it is sent. If you commit a `Release` and then an `Accept` for the same record before the consumer sends the first, only the `Accept` is sent, and both commits complete with its result. Whether two separate commits fall in the same window depends on timing: a commit you wait for has been sent, so a later decision for that record fails with `RecordNotInFlightException`.
+
 Delivery is at-least-once, so processing must tolerate redelivery. A failed record can be released for another attempt.
 
 ```scala mdoc:silent

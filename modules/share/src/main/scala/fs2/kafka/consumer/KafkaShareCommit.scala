@@ -33,8 +33,10 @@ trait KafkaShareCommit[F[_]] {
     * This completes once Kafka has confirmed the acknowledgements, and fails with the first error
     * reported for any partition.<br><br>
     *
-    * Acknowledgements of the same record are guaranteed to be sent in the same order as the
-    * invocations.<br><br>
+    * As in Java, the last acknowledgement of a record wins until it is sent: acknowledgements of
+    * the same record which have not been sent yet are replaced, and their invocations complete with
+    * the result of the one that was sent. Acknowledgements which are sent are sent in the same
+    * order as the invocations.<br><br>
     *
     * Note, that the recommended way for committing offsets in fs2-kafka is to use `commit` on
     * [[AcknowledgedOffset]] or [[AcknowledgedOffsetBatch]], or `commitWithResults` on
@@ -74,8 +76,10 @@ trait KafkaShareCommit[F[_]] {
     * Despite its name, this method is not blocking. But it's based on the blocking
     * org.apache.kafka.clients.consumer.ShareConsumer#commitSync method.<br><br>
     *
-    * Acknowledgements of the same record are guaranteed to be sent in the same order as the
-    * invocations.<br><br>
+    * As in Java, the last acknowledgement of a record wins until it is sent: acknowledgements of
+    * the same record which have not been sent yet are replaced, and their invocations complete with
+    * the result of the one that was sent. Acknowledgements which are sent are sent in the same
+    * order as the invocations.<br><br>
     *
     * Note, that the recommended way for committing offsets in fs2-kafka is to use `commit` on
     * [[AcknowledgedOffset]] or [[AcknowledgedOffsetBatch]], or `commitWithResults` on

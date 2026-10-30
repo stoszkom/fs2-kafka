@@ -27,23 +27,45 @@ private[kafka] object ShareCommits {
   final case class Split[F[_]](
     staged: Vector[Staged[F]] = Vector.empty[Staged[F]],
     deferred: Vector[ShareRequest.Ack] = Vector.empty,
-    invalid: Vector[ShareRequest.Ack] = Vector.empty,
-    later: Vector[ShareRequest.Ack] = Vector.empty
+    invalid: Vector[ShareRequest.Ack] = Vector.empty
   ) {
 
     def count: Int =
-      List(staged.nonEmpty, deferred.nonEmpty, invalid.nonEmpty, later.nonEmpty).count(identity)
+      List(staged.nonEmpty, deferred.nonEmpty, invalid.nonEmpty).count(identity)
 
   }
 
-  // The commit requests of one round, with the records already claimed by a decision.
+  /**
+    * The staged acknowledgements of one commit request, and the partitions its callback gets
+    * results for. A later decision for the same record can replace a staged acknowledgement, but
+    * its partition still reports to this callback.
+    */
+  final case class Part[F[_]](
+    staged: Vector[Staged[F]],
+    partitions: Set[TopicPartition],
+    callback: Callback[F]
+  )
+
+  object Part {
+
+    def apply[F[_]](staged: Vector[Staged[F]], callback: Callback[F]): Part[F] =
+      Part(staged, staged.map(_._1.topicPartition).toSet, callback)
+
+  }
+
+  // The commit requests of one round, with the records they staged a decision for.
   final case class Round[F[_]](
     claimed: Set[ShareState.Id] = Set.empty,
-    staged: Vector[(Vector[Staged[F]], Callback[F])] =
-      Vector.empty[(Vector[Staged[F]], Callback[F])],
-    deferred: Vector[ShareRequest.Commit[F]] = Vector.empty[ShareRequest.Commit[F]],
-    later: Vector[ShareRequest.Commit[F]] = Vector.empty[ShareRequest.Commit[F]]
+    staged: Vector[Part[F]] = Vector.empty[Part[F]],
+    deferred: Vector[ShareRequest.Commit[F]] = Vector.empty[ShareRequest.Commit[F]]
   )
+
+  // Keeps the last staged decision for each record, in the order of those decisions.
+  def lastDecisions[F[_]](staged: Vector[Staged[F]]): Vector[Staged[F]] = {
+    val last = staged.iterator.zipWithIndex.map { case ((ack, _), i) => ack.id -> i }.toMap
+    if (last.size == staged.size) staged
+    else staged.iterator.zipWithIndex.collect { case (s, i) if last(s._1.id) == i => s }.toVector
+  }
 
   def when[A](condition: Boolean)(value: => A): Option[A] =
     if (condition) Some(value) else None

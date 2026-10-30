@@ -279,6 +279,60 @@ final class KafkaShareConsumerTimeoutSpec extends BaseAsyncSpec {
       accept.swap.toOption.get shouldBe a[RecordNotInFlightException]
       native.acknowledged.asScala.toList should not contain (1L -> KafkaAcknowledgeType.ACCEPT)
     }
+
+    it("should send only the last decision for a record in one request") {
+      val native = new TestShareConsumer(List(1L))
+      val result = consume(native)(
+        _.records
+          .take(1)
+          .evalMap { r =>
+            AcknowledgedOffsetBatch
+              .fromFoldable(
+                List(
+                  r.offset.acknowledge(AcknowledgeType.Renew),
+                  r.offset.acknowledge(AcknowledgeType.Release),
+                  r.offset.acknowledge(AcknowledgeType.Accept)
+                )
+              )
+              .commit
+              .attempt
+          }
+          .compile
+          .lastOrError
+      )
+      result shouldBe Right(())
+      native.acknowledged.asScala.toList shouldBe List(1L -> KafkaAcknowledgeType.ACCEPT)
+    }
+
+    it("should send only the last decision for a record among requests waiting together") {
+      val native            = new TestShareConsumer(List(1L, 2L))
+      val (release, accept) = consume(native) { consumer =>
+        consumer
+          .records
+          .take(2)
+          .compile
+          .toList
+          .flatMap { records =>
+            val List(first, second) = records: @unchecked
+            // The unconfirmed commit holds the actor, so the next two requests wait together.
+            for {
+              _       <- IO(native.confirming.set(false))
+              _       <- second.offset.acknowledge(AcknowledgeType.Accept).commit.attempt.start
+              _       <- IO.sleep(50.millis)
+              release <- first.offset.acknowledge(AcknowledgeType.Release).commit.attempt.start
+              _       <- IO.sleep(20.millis)
+              accept  <- first.offset.acknowledge(AcknowledgeType.Accept).commit.attempt.start
+              _       <- IO.sleep(20.millis) *> IO(native.confirming.set(true))
+              r       <- release.joinWithNever
+              a       <- accept.joinWithNever
+            } yield r -> a
+          }
+      }
+      release shouldBe Right(())
+      accept shouldBe Right(())
+      native.acknowledged.asScala.toList.filter(_._1 == 1L) shouldBe
+        List(1L -> KafkaAcknowledgeType.ACCEPT)
+    }
   }
 
   describe("KafkaShareConsumer without automatic renewal") {
