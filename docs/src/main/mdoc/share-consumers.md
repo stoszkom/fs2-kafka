@@ -121,7 +121,7 @@ As in Java, acknowledging and committing are separate steps.
 
 - `KafkaShareConsumer#commitAsync` and `commitSync` take offsets by topic and partition, with their acknowledge types.
 
-A commit completes once the broker has confirmed it, and fails with the first error the broker reported. `AcknowledgedOffsetBatch#commitWithResults` returns the result per partition instead, as a `Map[TopicPartition, Option[KafkaException]]`. It still fails when the whole commit fails, for example with a `ShareCommitTimeoutException`.
+A commit completes once the broker has confirmed it, and fails with the first error the broker reported. `AcknowledgedOffsetBatch#commitWithResults` returns the result per partition instead, as a `Map[TopicPartition, Option[KafkaException]]`. It still fails when the whole commit fails, for example with a `ShareCommitTimeoutException`. The consumer does not wait for one commit to be confirmed before sending the next, so commits from concurrent callers overlap, up to four groups of them at a time.
 
 Errors are reported per partition, so an error fails every acknowledgement of that partition in the same request, even ones that may have been applied.
 

@@ -10,7 +10,6 @@ import java.util.concurrent.ConcurrentLinkedQueue
 
 import scala.concurrent.duration.*
 
-import cats.effect.syntax.all.*
 import cats.effect.Async
 import cats.syntax.all.*
 import fs2.kafka.*
@@ -23,16 +22,39 @@ import org.apache.kafka.common.{KafkaException, TopicPartition}
 import org.apache.kafka.common.errors.TimeoutException
 
 /**
-  * Stages acknowledgements with Java's `acknowledge` and commits them, for
-  * [[KafkaShareConsumerActor]], which decides what to commit.
+  * Stages acknowledgements with Java's `acknowledge` and sends them, for
+  * [[KafkaShareConsumerActor]], which decides what to commit. Java reports the results of sent
+  * acknowledgements to one callback, during later consumer calls; they are collected for the actor
+  * to [[drain]].
   */
 final private[actor] class ShareCommitClient[F[_]](
-  withConsumer: WithShareConsumer[F],
-  pollInterval: FiniteDuration
+  withConsumer: WithShareConsumer[F]
 )(implicit F: Async[F]) {
 
   import ShareCommits.*
   import ShareTimeouts.acquisitionLock
+
+  private val completions =
+    new ConcurrentLinkedQueue[(TopicPartition, Set[Long], Option[KafkaException])]()
+
+  private val callback: AcknowledgementCommitCallback = (offsets, error) => {
+    val reported = Option(error).map {
+      case kafka: KafkaException => kafka
+      case other                 => new KafkaException(other)
+    }
+    offsets
+      .asScala
+      .foreach { case (partition, values) =>
+        completions.add((partition.topicPartition, values.asScala.map(_.longValue).toSet, reported))
+      }
+  }
+
+  // Registers the callback which collects the results of sent acknowledgements.
+  def install: F[Unit] = withConsumer.blocking(_.setAcknowledgementCommitCallback(callback))
+
+  // The results Java reported since the last drain, by partition and offsets.
+  def drain: F[Vector[(TopicPartition, Set[Long], Option[KafkaException])]] =
+    F.delay(Iterator.continually(completions.poll()).takeWhile(_ != null).toVector)
 
   def commitSync(staged: Vector[Staged[F]], timeout: FiniteDuration): F[CommitResult] =
     withConsumer
@@ -54,141 +76,41 @@ final private[actor] class ShareCommitClient[F[_]](
       }
 
   /**
-    * Commits with Java's `commitAsync` and waits for the callback. Java runs it only during
-    * consumer calls, so the wait calls `commitAsync` again, in growing steps.
+    * Sends the acknowledgements with Java's `commitAsync`, without waiting for their results.
     */
-  def commitAsync(
-    staged: Vector[Staged[F]],
-    timeout: FiniteDuration,
-    recentConfirmations: Vector[FiniteDuration]
-  ): F[CommitResult] =
-    F.defer {
-      val confirmations = new Confirmations
+  def commitAsync(staged: Vector[Staged[F]]): F[Unit] =
+    withConsumer.blocking { consumer =>
       // Submit whatever was staged, even if staging fails part-way.
-      val submit = withConsumer.blocking { consumer =>
-        consumer.setAcknowledgementCommitCallback(confirmations.callback)
-        try stage(consumer, staged)
-        finally consumer.commitAsync()
-      }
-      val recent   = recentConfirmations
-      val presleep =
-        if (recent.isEmpty) Duration.Zero else (recent.min * 3 / 4).min(pollInterval)
-      val confirm =
-        submit *> F.sleep(presleep).whenA(presleep > Duration.Zero) *>
-          confirmations.await(staged)
-      confirm.timeoutTo(
-        timeout,
-        F.raiseError[CommitResult](ShareCommitTimeoutException(timeout, offsetsOf(staged, None)))
-      )
+      try stage(consumer, staged)
+      finally consumer.commitAsync()
     }
 
   /**
     * Stages the acknowledgements and polls, so that Java sends them with the poll's fetch, as it
-    * does between two polls of its own. Java usually confirms them during that poll; any it has not
-    * confirmed yet are awaited as in [[commitAsync]]. Returns the result of the acknowledgements,
-    * and the polled records with the lock, unless staging failed or the consumer is unsubscribed.
+    * does between two polls of its own. Returns the polled records with the lock, or `None` if the
+    * consumer is unsubscribed. Fails if staging fails, after submitting whatever was staged.
     */
   def pollWithAcknowledgements(
     staged: Vector[Staged[F]],
-    timeout: FiniteDuration,
     pollTimeout: FiniteDuration
-  ): F[
-    (
-      Either[Throwable, CommitResult],
-      Option[(Vector[KafkaByteConsumerRecord], Option[FiniteDuration])]
-    )
-  ] =
-    F.defer {
-      val confirmations = new Confirmations
-      withConsumer
-        .blocking { consumer =>
-          consumer.setAcknowledgementCommitCallback(confirmations.callback)
-          scala.util.Try(stage(consumer, staged)) match {
-            // Submit whatever was staged, as Java cannot poll with records left undecided.
-            case scala.util.Failure(error) =>
-              consumer.commitAsync()
-              Left(error)
-            case scala.util.Success(_) if consumer.subscription().isEmpty =>
-              consumer.commitAsync()
-              Right(None)
-            case scala.util.Success(_) =>
-              val records = consumer.poll(pollTimeout.toJava).iterator().asScala.toVector
-              Right(Some(records -> acquisitionLock(consumer)))
-          }
-        }
-        .flatMap {
-          case Left(error)   => F.pure(Left(error) -> None)
-          case Right(polled) =>
-            confirmations
-              .await(staged)
-              .timeoutTo(
-                timeout,
-                F.raiseError[CommitResult](
-                  ShareCommitTimeoutException(timeout, offsetsOf(staged, None))
-                )
-              )
-              .attempt
-              .map(_ -> polled)
-        }
+  ): F[Option[(Vector[KafkaByteConsumerRecord], Option[FiniteDuration])]] =
+    withConsumer.blocking { consumer =>
+      scala.util.Try(stage(consumer, staged)) match {
+        // Java cannot poll with records left undecided.
+        case scala.util.Failure(error) =>
+          consumer.commitAsync()
+          throw error
+        case scala.util.Success(_) if consumer.subscription().isEmpty =>
+          consumer.commitAsync()
+          None
+        case scala.util.Success(_) =>
+          val records = consumer.poll(pollTimeout.toJava).iterator().asScala.toVector
+          Some(records -> acquisitionLock(consumer))
+      }
     }
 
-  /**
-    * Collects the results Java reports to the acknowledgement commit callback, and waits for those
-    * of the staged acknowledgements.
-    */
-  private class Confirmations {
-
-    private val completions =
-      new ConcurrentLinkedQueue[(TopicPartition, Set[Long], Option[KafkaException])]()
-
-    val callback: AcknowledgementCommitCallback = (offsets, error) => {
-      val reported = Option(error).map {
-        case kafka: KafkaException => kafka
-        case other                 => new KafkaException(other)
-      }
-      offsets
-        .asScala
-        .foreach { case (partition, values) =>
-          completions.add(
-            (partition.topicPartition, values.asScala.map(_.longValue).toSet, reported)
-          )
-        }
-    }
-
-    private val maxBackoff = pollInterval
-
-    private def drain(
-      remaining: Set[ShareState.Id],
-      results: CommitResult
-    ): F[(Set[ShareState.Id], CommitResult)] =
-      F.delay {
-        Iterator
-          .continually(completions.poll())
-          .takeWhile(_ != null)
-          .foldLeft((remaining, results)) { case ((pending, merged), (partition, offsets, error)) =>
-            val ids = offsets.map(partition -> _)
-            if (ids.exists(pending.contains))
-              (pending -- ids, mergeResults(merged, Map(partition -> error)))
-            else (pending, merged)
-          }
-      }
-
-    private def loop(
-      remaining: Set[ShareState.Id],
-      results: CommitResult,
-      backoff: FiniteDuration
-    ): F[CommitResult] =
-      drain(remaining, results).flatMap { case (pending, merged) =>
-        if (pending.isEmpty) F.pure(merged)
-        else
-          F.sleep(backoff) *> withConsumer.blocking(_.commitAsync()) *>
-            loop(pending, merged, (backoff * 2).min(maxBackoff))
-      }
-
-    def await(staged: Vector[Staged[F]]): F[CommitResult] =
-      loop(staged.map(_._1.id).toSet, Map.empty, 100.micros.min(maxBackoff))
-
-  }
+  // Lets Java report the results it has received, as it does only during consumer calls.
+  def nudge: F[Unit] = withConsumer.blocking(_.commitAsync())
 
   private def stage(consumer: KafkaByteShareConsumer, staged: Vector[Staged[F]]): Unit =
     staged.foreach { case (ack, record) =>

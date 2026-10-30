@@ -33,8 +33,10 @@ import org.apache.kafka.common.TopicPartition
   *
   * ==Commit flow==
   *
-  * Commits run in rounds, see [[processCommits]]. Failed commits of the actor itself fail the
-  * stream, except timed-out renewals and releases.
+  * Commits run in rounds, see [[processCommits]]. A round is sent without waiting for its results,
+  * which Java reports to one callback during later consumer calls; up to `maxSentRounds` rounds of
+  * commit requests wait for results at once. Only a failure to send the actor's own renewals and
+  * releases fails the stream.
   *
   * ==Renewal flow==
   *
@@ -71,7 +73,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V] private (
 
   private type State = ShareState[F]
 
-  private val client = new ShareCommitClient[F](withConsumer, settings.pollInterval)
+  private val client = new ShareCommitClient[F](withConsumer)
 
   // Whether Java accepts a poll's records once they are handed out.
   private[kafka] val implicitAcknowledgement: Boolean = implicitMode
@@ -188,6 +190,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V] private (
     pendingRef.set(state.pending) *> requests
       .tryTakeN(None)
       .flatMap(_.foldM(state)(receive))
+      .flatMap(confirm)
       .flatMap(state => if (state.isFinished) F.unit else step(state).flatMap(loop))
 
   private def step(state: State): F[State] =
@@ -236,22 +239,45 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V] private (
 
   private def explicitStep(state: State): F[State] =
     F.monotonic
-      .flatMap { now =>
+      .flatMap(now => expire(state, now).tupleRight(now))
+      .flatMap { case (state, now) =>
         val renewal      = nextRenewal(state, now)
         val renewalFirst = !(state.renewedLast && state.commits.nonEmpty)
         renewal match {
           case Some(at) if at <= now && renewalFirst =>
             renew(state).map(_.copy(renewedLast = true))
-          case _ if state.commits.nonEmpty =>
+          case _ if state.commits.nonEmpty && state.sent.size < maxSentRounds =>
             processCommits(state).map(_.copy(renewedLast = false))
           case _ =>
             unemitted(state).flatMap { toRelease =>
               if (toRelease.nonEmpty) release(state, toRelease)
               else if (state.canPoll) poll(state)
+              else if (state.sent.nonEmpty) awaitResults(state, renewal, now)
               else awaitRequestOrTimeout(state, renewal.map(_ - now))
             }
         }
       }
+
+  /**
+    * Waits for a request, or else asks Java for the results of the sent rounds, as Java reports
+    * them only during consumer calls. The wait grows while no results arrive.
+    */
+  private def awaitResults(
+    state: State,
+    renewal: Option[FiniteDuration],
+    now: FiniteDuration
+  ): F[State] = {
+    val wakeUp = (state.nudgeBackoff :: (state.sent.map(_.deadline) ++ renewal).map(_ - now).toList)
+      .min
+      .max(Duration.Zero)
+    val nudge = client
+      .nudge
+      .as(state.copy(nudgeBackoff = (state.nudgeBackoff * 2).min(settings.pollInterval)))
+    // Commits waiting only for room among the sent rounds would win every race, so the results
+    // which make room would never be asked for.
+    if (state.commits.nonEmpty) F.sleep(wakeUp) *> nudge
+    else takeWithin(wakeUp).flatMap(_.fold(nudge)(receive(state, _)))
+  }
 
   /**
     * A decision waiting for a renewed record needs the next poll, which Java allows only once the
@@ -297,17 +323,15 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V] private (
           ShareRequest.Ack(id._1, id._2, Some(record.deliveryCount), acknowledgeType) -> record
         )
     )
-    Deferred[F, Either[Throwable, CommitResult]].flatMap { done =>
-      commitRound(state, Vector(Part(staged, done.complete(_).void)), sync = false).flatTap(_ =>
-        done
-          .get
-          .flatMap {
-            // Records whose renewal or release failed are dropped, so their lock expires. A
-            // timed-out renewal is kept.
-            case Right(_) | Left(_: TimeoutException) => F.unit
-            case Left(error)                          => F.raiseError[Unit](error)
-          }
-      )
+    // Records whose renewal or release failed are dropped, so their lock expires, and a timed-out
+    // renewal is kept; only a failure to send fails the stream.
+    sendRound(
+      state,
+      Vector(Part(staged, (_: Either[Throwable, CommitResult]) => F.unit)),
+      viaPoll = false
+    ).flatMap {
+      case (next, None)     => F.pure(next)
+      case (_, Some(error)) => F.raiseError[State](error)
     }
   }
 
@@ -328,10 +352,9 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V] private (
       .flatMap { round =>
         val next =
           state.copy(commits = rest, deferred = state.deferred ++ round.deferred)
-        val sync = commits.headOption.exists(_.sync)
         if (round.staged.isEmpty) F.pure(next)
-        else if (!sync && ridesWithPoll(next, round.staged)) commitWithPoll(next, round.staged)
-        else commitRound(next, round.staged, sync)
+        else if (commits.headOption.exists(_.sync)) commitSyncRound(next, round.staged)
+        else sendRound(next, round.staged, viaPoll = ridesWithPoll(next, round.staged)).map(_._1)
       }
   }
 
@@ -348,20 +371,6 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V] private (
     staged.forall(_._1.acknowledgeType != AcknowledgeType.Renew) &&
     state.unacknowledged.keysIterator.forall(ids.contains)
   }
-
-  // Sends the acknowledgements of a round with a poll, then tracks the polled records.
-  private def commitWithPoll(state: State, parts: Vector[Part[F]]): F[State] =
-    for {
-      timeout <- effectiveCommitTimeout(settings, state.lock).liftTo[F]
-      start   <- F.monotonic
-      sent    <-
-        client.pollWithAcknowledgements(parts.flatMap(_.staged), timeout, settings.pollTimeout)
-      (result, records) = sent
-      settled          <- completeRound(state, parts, result, start)
-      next             <- records.fold(F.pure(settled)) { case (polledRecords, lock) =>
-                polled(settled, start, polledRecords, lock.orElse(settled.lock))
-              }
-    } yield next
 
   private def addToRound(
     state: State,
@@ -406,62 +415,153 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V] private (
   }
 
   /**
-    * Stages the acknowledgements, commits them with one Java call, and completes each callback with
-    * its partitions' results.
+    * Sends a round, with `commitAsync` or with the next poll, without waiting for its results,
+    * which [[confirm]] applies later. Returns the failure if the round could not be sent, in which
+    * case it is already completed with it.
     */
-  private def commitRound(
+  private def sendRound(
     state: State,
     parts: Vector[Part[F]],
-    sync: Boolean
-  ): F[State] = {
+    viaPoll: Boolean
+  ): F[(State, Option[Throwable])] = {
+    val staged = parts.flatMap(_.staged)
+    for {
+      timeout <- effectiveCommitTimeout(settings, state.lock).liftTo[F]
+      start   <- F.monotonic
+      sent    <-
+        (if (viaPoll) client.pollWithAcknowledgements(staged, settings.pollTimeout)
+         else client.commitAsync(staged).as(None)).attempt
+      marked = markSent(state, staged, start)
+      next  <- sent match {
+                case Left(error) =>
+                  confirmRound(
+                    marked,
+                    SentRound(parts, Set.empty, Map.empty, start, timeout),
+                    Left(error)
+                  ).map(_ -> Some(error))
+                case Right(records) =>
+                  val round     = SentRound(parts, staged.map(_._1.id).toSet, Map.empty, start, timeout)
+                  val withRound =
+                    marked.copy(sent = marked.sent :+ round, nudgeBackoff = ShareState.initialNudge)
+                  records
+                    .fold(F.pure(withRound)) { case (polledRecords, lock) =>
+                      polled(withRound, start, polledRecords, lock.orElse(withRound.lock))
+                    }
+                    .map(_ -> None)
+              }
+    } yield next
+  }
+
+  // Commits a synchronous round with Java's `commitSync`, which waits for its results.
+  private def commitSyncRound(state: State, parts: Vector[Part[F]]): F[State] = {
     val staged = parts.flatMap(_.staged)
     for {
       timeout     <- effectiveCommitTimeout(settings, state.lock).liftTo[F]
       submittedAt <- F.monotonic
-      result      <-
-        (if (sync) client.commitSync(staged, timeout)
-         else client.commitAsync(staged, timeout, state.confirmationTimes)).attempt
-      confirmedAt <- F.monotonic
-      timed        =
-        if (result.isRight && !sync) state.withConfirmationTime(confirmedAt - submittedAt)
-        else state
-      next <- completeRound(timed, parts, result, submittedAt)
+      result      <- client.commitSync(staged, timeout).attempt
+      round        = SentRound(parts, Set.empty, Map.empty, submittedAt, timeout)
+      next        <- confirmRound(markSent(state, staged, submittedAt), round, result)
     } yield next
   }
 
   /**
-    * Updates the records of a round with its result, and completes each callback with its
-    * partitions' results.
+    * Records with a final decision stop being tracked once it is sent, so later decisions for them
+    * fail. Renewed records wait for the renewal's result, as their lock may still be extended.
     */
-  private def completeRound(
+  private def markSent(
     state: State,
-    parts: Vector[Part[F]],
-    result: Either[Throwable, CommitResult],
+    staged: Vector[Staged[F]],
     submittedAt: FiniteDuration
-  ): F[State] = {
-    val staged = parts.flatMap(_.staged)
-    val next   = staged.foldLeft(state) { case (s, (ack, record)) =>
-      val error = failure(ack, result)
-      // A renewal which timed out may still complete, so its record is kept.
-      if (
-        ack.acknowledgeType == AcknowledgeType.Renew &&
-        error.forall(_.isInstanceOf[TimeoutException])
-      )
+  ): State =
+    staged.foldLeft(state) { case (s, (ack, record)) =>
+      if (ack.acknowledgeType == AcknowledgeType.Renew)
         s.copy(inFlight =
           s.inFlight
             .updated(
               ack.id,
-              record.copy(
-                renewing = true,
-                lockedSince = submittedAt,
-                renewalConfirmed = error.isEmpty
-              )
+              record.copy(renewing = true, lockedSince = submittedAt, renewalConfirmed = false)
             )
         )
       else s.copy(inFlight = s.inFlight - ack.id)
     }
+
+  /**
+    * Applies the results Java reported to the sent rounds, oldest first, and completes the rounds
+    * whose results are all known.
+    */
+  private def confirm(state: State): F[State] =
+    client
+      .drain
+      .flatMap { reported =>
+        if (reported.isEmpty) F.pure(state)
+        else {
+          val sent = reported.foldLeft(state.sent) { case (rounds, (partition, offsets, error)) =>
+            offsets.foldLeft(rounds) { (rounds, offset) =>
+              val id = partition -> offset
+              rounds.indexWhere(_.remaining.contains(id)) match {
+                case -1    => rounds
+                case index =>
+                  val round = rounds(index)
+                  rounds.updated(
+                    index,
+                    round.copy(
+                      remaining = round.remaining - id,
+                      results = mergeResults(round.results, Map(partition -> error))
+                    )
+                  )
+              }
+            }
+          }
+          val (done, open) = sent.partition(_.remaining.isEmpty)
+          done.foldLeftM(state.copy(sent = open, nudgeBackoff = ShareState.initialNudge)) {
+            (s, round) => confirmRound(s, round, Right(round.results))
+          }
+        }
+      }
+
+  // Fails the sent rounds whose results did not all arrive within the commit timeout.
+  private def expire(state: State, now: FiniteDuration): F[State] = {
+    val (expired, open) = state.sent.partition(_.deadline <= now)
+    expired.foldLeftM(state.copy(sent = open)) { (s, round) =>
+      confirmRound(
+        s,
+        round,
+        Left(ShareCommitTimeoutException(round.timeout, offsetsOf(round.staged, None)))
+      )
+    }
+  }
+
+  /**
+    * Completes a round with its result: a renewal is confirmed, kept unconfirmed if it timed out,
+    * or else its record is dropped, so its lock expires. Each callback gets its partitions'
+    * results.
+    */
+  private def confirmRound(
+    state: State,
+    round: SentRound[F],
+    result: Either[Throwable, CommitResult]
+  ): F[State] = {
+    val next = round
+      .staged
+      .foldLeft(state) { case (s, (ack, record)) =>
+        val renewing = s
+          .inFlight
+          .get(ack.id)
+          .filter(r => r.renewing && r.deliveryCount == record.deliveryCount)
+        (ack.acknowledgeType, renewing) match {
+          case (AcknowledgeType.Renew, Some(r)) =>
+            failure(ack, result) match {
+              case None =>
+                s.copy(inFlight = s.inFlight.updated(ack.id, r.copy(renewalConfirmed = true)))
+              case Some(_: TimeoutException) => s
+              case Some(_)                   => s.copy(inFlight = s.inFlight - ack.id)
+            }
+          case _ => s
+        }
+      }
     pendingRef.set(next.pending) *>
-      parts
+      round
+        .parts
         .traverse_ { part =>
           part.callback(
             result.map(results => part.partitions.map(p => p -> results.get(p).flatten).toMap)
@@ -598,7 +698,8 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V] private (
       .flatMap { now =>
         F.race(
           shutdown.get,
-          loop(ShareState.empty[F](now, settings.pollInterval.min(maxPollInterval / 2)))
+          client.install *>
+            loop(ShareState.empty[F](now, settings.pollInterval.min(maxPollInterval / 2)))
         )
       }
       .attempt
@@ -610,6 +711,9 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V] private (
 }
 
 private[kafka] object KafkaShareConsumerActor {
+
+  // The most rounds of commit requests sent to Java and awaiting their results at once.
+  private[actor] val maxSentRounds: Int = 4
 
   final private[actor] case class Entry[F[_], K, V](
     record: AcknowledgeableConsumerRecord[F, K, V],

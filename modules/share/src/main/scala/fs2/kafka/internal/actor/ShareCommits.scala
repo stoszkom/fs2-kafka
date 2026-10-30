@@ -6,6 +6,8 @@
 
 package fs2.kafka.internal.actor
 
+import scala.concurrent.duration.FiniteDuration
+
 import cats.effect.{Async, Ref}
 import cats.syntax.all.*
 import fs2.kafka.*
@@ -50,6 +52,24 @@ private[kafka] object ShareCommits {
 
     def apply[F[_]](staged: Vector[Staged[F]], callback: Callback[F]): Part[F] =
       Part(staged, staged.map(_._1.topicPartition).toSet, callback)
+
+  }
+
+  /**
+    * A round sent to Java whose results are not all known yet: its requests, the records still
+    * without a result, the results so far, and when it was sent and times out.
+    */
+  final case class SentRound[F[_]](
+    parts: Vector[Part[F]],
+    remaining: Set[ShareState.Id],
+    results: CommitResult,
+    submittedAt: FiniteDuration,
+    timeout: FiniteDuration
+  ) {
+
+    def staged: Vector[Staged[F]] = parts.flatMap(_.staged)
+
+    def deadline: FiniteDuration = submittedAt + timeout
 
   }
 

@@ -30,8 +30,12 @@ private[kafka] object ShareState {
       lastPollStart = now,
       lastPollRecords = 0,
       lastAcquiredAt = now,
-      confirmationTimes = Vector.empty
+      sent = Vector.empty,
+      nudgeBackoff = initialNudge
     )
+
+  // The first wait before asking Java for the results of sent acknowledgements.
+  val initialNudge: FiniteDuration = FiniteDuration(100, java.util.concurrent.TimeUnit.MICROSECONDS)
 
 }
 
@@ -72,8 +76,10 @@ final private[kafka] case class InFlightRecord[F[_]](
   *   how many records the previous poll returned, which shows whether it drained Java's buffer
   * @param lastAcquiredAt
   *   a conservative acquisition time of the records the previous poll returned
-  * @param confirmationTimes
-  *   recent times from submitting a commit to its confirmation
+  * @param sent
+  *   rounds sent to Java whose results are not all known yet, oldest first
+  * @param nudgeBackoff
+  *   how long to wait, while idle, before asking Java for the results of sent rounds
   * @param renewedLast
   *   whether the latest round was a renewal, so waiting commits go next
   */
@@ -89,7 +95,8 @@ final private[kafka] case class ShareState[F[_]](
   lastPollStart: FiniteDuration,
   lastPollRecords: Int,
   lastAcquiredAt: FiniteDuration,
-  confirmationTimes: Vector[FiniteDuration],
+  sent: Vector[ShareCommits.SentRound[F]],
+  nudgeBackoff: FiniteDuration,
   renewedLast: Boolean = false
 ) {
 
@@ -104,7 +111,7 @@ final private[kafka] case class ShareState[F[_]](
     started && commits.isEmpty && unacknowledged.isEmpty && (admitting || inFlight.nonEmpty)
 
   def isFinished: Boolean =
-    !admitting && inFlight.isEmpty && commits.isEmpty && deferred.isEmpty
+    !admitting && inFlight.isEmpty && commits.isEmpty && deferred.isEmpty && sent.isEmpty
 
   // Records from the latest poll for which no acknowledgement was requested yet.
   def pending: Int = {
@@ -133,10 +140,8 @@ final private[kafka] case class ShareState[F[_]](
   def withCommit(commit: ShareRequest.Commit[F]): ShareState[F] =
     copy(commits = commits :+ commit)
 
-  def withConfirmationTime(time: FiniteDuration): ShareState[F] =
-    copy(confirmationTimes = (confirmationTimes :+ time).takeRight(8))
-
   override def toString: String =
-    s"ShareState(inFlight = ${inFlight.size}, commits = ${commits.size}, deferred = ${deferred.size}, started = $started, stopping = $stopping, readerClosed = $readerClosed, lock = $lock, renewAfter = $renewAfter)"
+    s"ShareState(inFlight = ${inFlight.size}, commits = ${commits.size}, deferred = ${deferred.size}, sent = ${sent
+        .size}, started = $started, stopping = $stopping, readerClosed = $readerClosed, lock = $lock, renewAfter = $renewAfter)"
 
 }

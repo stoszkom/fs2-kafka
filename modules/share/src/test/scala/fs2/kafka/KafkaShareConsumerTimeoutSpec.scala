@@ -16,6 +16,7 @@ import scala.concurrent.duration.*
 
 import cats.effect.unsafe.implicits.global
 import cats.effect.IO
+import cats.syntax.all.*
 import fs2.kafka.consumer.MkShareConsumer
 import fs2.kafka.internal.converters.collection.*
 
@@ -71,7 +72,15 @@ final class KafkaShareConsumerTimeoutSpec extends BaseAsyncSpec {
     override def acknowledge(record: KafkaByteConsumerRecord, kind: KafkaAcknowledgeType): Unit =
       fetch.acknowledge(record, kind)
 
+    // Holds commitAsync calls, and so the actor, until released.
+    private val gate = new AtomicReference[java.util.concurrent.CountDownLatch]
+
+    def holdCommits(): Unit = gate.set(new java.util.concurrent.CountDownLatch(1))
+
+    def releaseCommits(): Unit = Option(gate.getAndSet(null)).foreach(_.countDown())
+
     override def commitAsync(): Unit = {
+      Option(gate.get).foreach(_.await())
       commits.incrementAndGet(): Unit
       confirm()
       submit()
@@ -264,9 +273,9 @@ final class KafkaShareConsumerTimeoutSpec extends BaseAsyncSpec {
           .toList
           .flatMap { records =>
             val List(first, second) = records: @unchecked
-            // The unconfirmed commit holds the actor, so the next two requests wait together.
+            // The held commit holds the actor, so the next two requests wait together.
             for {
-              _       <- IO(native.confirming.set(false))
+              _       <- IO(native.holdCommits())
               _       <- second.offset.acknowledge(AcknowledgeType.Accept).commit.attempt.start
               _       <- IO.sleep(50.millis)
               release <- consumer
@@ -277,7 +286,7 @@ final class KafkaShareConsumerTimeoutSpec extends BaseAsyncSpec {
                            .start
               _      <- IO.sleep(20.millis)
               accept <- first.offset.acknowledge(AcknowledgeType.Accept).commit.attempt.start
-              _      <- IO.sleep(20.millis) *> IO(native.confirming.set(true))
+              _      <- IO.sleep(20.millis) *> IO(native.releaseCommits())
               r      <- release.joinWithNever
               a      <- accept.joinWithNever
             } yield r -> a
@@ -322,15 +331,15 @@ final class KafkaShareConsumerTimeoutSpec extends BaseAsyncSpec {
           .toList
           .flatMap { records =>
             val List(first, second) = records: @unchecked
-            // The unconfirmed commit holds the actor, so the next two requests wait together.
+            // The held commit holds the actor, so the next two requests wait together.
             for {
-              _       <- IO(native.confirming.set(false))
+              _       <- IO(native.holdCommits())
               _       <- second.offset.acknowledge(AcknowledgeType.Accept).commit.attempt.start
               _       <- IO.sleep(50.millis)
               release <- first.offset.acknowledge(AcknowledgeType.Release).commit.attempt.start
               _       <- IO.sleep(20.millis)
               accept  <- first.offset.acknowledge(AcknowledgeType.Accept).commit.attempt.start
-              _       <- IO.sleep(20.millis) *> IO(native.confirming.set(true))
+              _       <- IO.sleep(20.millis) *> IO(native.releaseCommits())
               r       <- release.joinWithNever
               a       <- accept.joinWithNever
             } yield r -> a
@@ -340,6 +349,57 @@ final class KafkaShareConsumerTimeoutSpec extends BaseAsyncSpec {
       accept shouldBe Right(())
       native.acknowledged.asScala.toList.filter(_._1 == 1L) shouldBe
         List(1L -> KafkaAcknowledgeType.ACCEPT)
+    }
+  }
+
+  describe("KafkaShareConsumer with commits in flight") {
+    it("should send further rounds while earlier ones are unconfirmed, up to a limit") {
+      val native  = new TestShareConsumer((1L to 6L).toList)
+      val results = consume(native) { consumer =>
+        consumer
+          .records
+          .take(6)
+          .compile
+          .toList
+          .flatMap { records =>
+            for {
+              _       <- IO(native.confirming.set(false))
+              commits <- records.traverse(r =>
+                           r.offset.acknowledge(AcknowledgeType.Accept).commit.attempt.start <*
+                             IO.sleep(10.millis)
+                         )
+              sent    <- IO(native.acknowledged.size)
+              _       <- IO(native.confirming.set(true))
+              results <- commits.traverse(_.joinWithNever)
+            } yield sent -> results
+          }
+      }
+      results._1 shouldBe 4
+      results._2.foreach(_ shouldBe Right(()))
+      native.acknowledged.size shouldBe 6
+    }
+
+    it("should fail a decision for a record whose decision was sent, without waiting for it") {
+      val native = new TestShareConsumer(List(1L))
+      val again  = consume(native) { consumer =>
+        consumer
+          .records
+          .take(1)
+          .compile
+          .lastOrError
+          .flatMap { r =>
+            for {
+              _      <- IO(native.confirming.set(false))
+              accept <- r.offset.acknowledge(AcknowledgeType.Accept).commit.attempt.start
+              _      <- IO.sleep(20.millis)
+              again  <-
+                r.offset.acknowledge(AcknowledgeType.Release).commit.attempt.timeout(100.millis)
+              _ <- IO(native.confirming.set(true))
+              _ <- accept.joinWithNever.flatMap(IO.fromEither)
+            } yield again
+          }
+      }
+      again.swap.toOption.get shouldBe a[RecordNotInFlightException]
     }
   }
 
