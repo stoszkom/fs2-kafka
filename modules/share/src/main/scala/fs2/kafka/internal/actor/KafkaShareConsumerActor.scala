@@ -8,7 +8,7 @@ package fs2.kafka.internal.actor
 
 import scala.concurrent.duration.*
 
-import cats.effect.{Async, Deferred, Ref, Resource}
+import cats.effect.{Async, Deferred, Outcome, Ref, Resource}
 import cats.effect.std.Queue
 import cats.syntax.all.*
 import fs2.{Chunk, Stream}
@@ -162,9 +162,27 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V] private (
 
   private def awaitRequestOrTimeout(state: State, timeout: Option[FiniteDuration]): F[State] =
     timeout.fold(awaitRequest(state)) { duration =>
-      F.race(requests.take, F.sleep(duration))
-        .flatMap(_.fold(receive(state, _), _ => F.pure(state)))
+      takeWithin(duration).flatMap(_.fold(F.pure(state))(receive(state, _)))
     }
+
+  /**
+    * Takes a request, or `None` after the duration. A plain race would drop a request taken just as
+    * the timer wins, so a taker which lost is cancelled and its request kept, if it got one.
+    */
+  private def takeWithin(duration: FiniteDuration): F[Option[ShareRequest[F]]] =
+    F.racePair(requests.take, F.sleep(duration))
+      .flatMap {
+        case Left((taken, timer)) =>
+          timer.cancel *> taken.embedNever.map(Some(_))
+        case Right((taker, _)) =>
+          taker.cancel *> taker
+            .join
+            .flatMap {
+              case Outcome.Succeeded(request) => request.map(Some(_))
+              case Outcome.Errored(error)     => F.raiseError(error)
+              case Outcome.Canceled()         => F.pure(None)
+            }
+      }
 
   private def loop(state: State): F[Unit] =
     pendingRef.set(state.pending) *> requests
