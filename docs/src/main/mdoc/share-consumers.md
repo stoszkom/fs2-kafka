@@ -252,7 +252,7 @@ When `client.id` is set, consumer `i` uses `client.id-i`.
 
 - `stopConsuming` stops polling. The stream ends once every polled record is acknowledged.
 
-- When the stream ends, records it never handed out are released. Operators such as `prefetch` count records as handed out. With auto-renewal, handed-out records are renewed until acknowledged.
+- When the stream ends, records it never handed out are released. In explicit acknowledgement mode, the records of a poll are handed out as one chunk, so operators such as `take` or `prefetch` count the whole chunk as handed out; closing the consumer releases the records they skipped. With auto-renewal, handed-out records are renewed until acknowledged.
 
 - Releasing the resource closes the Java consumer, which releases the records it still holds, and never accepts them automatically. Later commits fail with a `ConsumerShutdownException`.
 

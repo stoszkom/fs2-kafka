@@ -73,6 +73,9 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V] private (
 
   private val client = new ShareCommitClient[F](withConsumer, settings.pollInterval)
 
+  // Whether Java accepts a poll's records once they are handed out.
+  private[kafka] val implicitAcknowledgement: Boolean = implicitMode
+
   val committer: KafkaShareCommitter[F] =
     KafkaShareCommitter(
       commitOffsets = offsets => commit(fromOffsets(offsets), sync = false),

@@ -14,12 +14,12 @@ import cats.effect.{Async, Resource}
 import cats.effect.instances.spawn.*
 import cats.syntax.all.*
 import cats.Reducible
+import fs2.{Pipe, Stream}
 import fs2.kafka.consumer.*
 import fs2.kafka.internal.actor.{KafkaShareConsumerActor, ShareCommits, ShareTimeouts}
 import fs2.kafka.internal.converters.collection.*
 import fs2.kafka.internal.syntax.*
 import fs2.kafka.internal.WithShareConsumer
-import fs2.Stream
 
 import org.apache.kafka.clients.consumer.ConsumerConfig
 import org.apache.kafka.common.{Metric, MetricName, TopicPartition, Uuid}
@@ -85,6 +85,18 @@ sealed abstract class KafkaShareConsumer[F[_], K, V]
     */
   private[kafka] def markableRecords: Stream[F, (AcknowledgeableConsumerRecord[F, K, V], F[Unit])]
 
+  /**
+    * Marks records as handed out as they leave the `Stream`. In explicit acknowledgement mode, a
+    * whole chunk is marked at once, which keeps a poll in one chunk; records a `take` skips are
+    * then released when the consumer closes. In implicit mode, where handing out a poll accepts it,
+    * each record is marked as it leaves.
+    */
+  private[kafka] def handOut: Pipe[
+    F,
+    (AcknowledgeableConsumerRecord[F, K, V], F[Unit]),
+    AcknowledgeableConsumerRecord[F, K, V]
+  ]
+
 }
 
 object KafkaShareConsumer {
@@ -104,8 +116,17 @@ object KafkaShareConsumer {
         : Stream[F, (AcknowledgeableConsumerRecord[F, K, V], F[Unit])] =
         actor.entries
 
+      override private[kafka] def handOut: Pipe[
+        F,
+        (AcknowledgeableConsumerRecord[F, K, V], F[Unit]),
+        AcknowledgeableConsumerRecord[F, K, V]
+      ] =
+        if (actor.implicitAcknowledgement)
+          _.evalMap { case (record, markEmitted) => markEmitted.as(record) }
+        else _.evalMapChunk { case (record, markEmitted) => markEmitted.as(record) }
+
       override def stream: Stream[F, AcknowledgeableConsumerRecord[F, K, V]] =
-        markableRecords.evalMap { case (record, markEmitted) => markEmitted.as(record) }
+        markableRecords.through(handOut)
 
       override def stopConsuming: F[Unit] = actor.stopConsuming
 

@@ -96,7 +96,7 @@ object KafkaShareConsumers {
           .emits(values.toVector)
           .map(_.markableRecords)
           .parJoin(values.length)
-          .evalMap { case (record, markEmitted) => markEmitted.as(record) }
+          .through(values.head.handOut)
 
       override def perConsumerRecords
         : Stream[F, Stream[F, AcknowledgeableConsumerRecord[F, K, V]]] =
