@@ -39,8 +39,9 @@ import org.apache.kafka.common.TopicPartition
   * ==Renewal flow==
   *
   * With automatic renewal, unacknowledged records are renewed before their lock expires, so the
-  * actor can poll; Java returns them from the next poll. A due renewal goes before waiting commits,
-  * but never twice in a row. A timed-out renewal may still complete, so its record is kept.
+  * actor can poll; Java returns them from the next poll. Each step, the actor does one of two
+  * things: renew records whose time has come, or process the commits users requested. A timed-out
+  * renewal may still complete, so its record is kept.
   *
   * ==Implicit acknowledgement==
   *
@@ -74,10 +75,11 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V] private (
 
   val committer: KafkaShareCommitter[F] =
     KafkaShareCommitter(
-      offsets => commit(fromOffsets(offsets), sync = false),
-      offsets => commit(fromAcknowledged(offsets), sync = false),
-      offsets => commitWithResults(fromAcknowledged(offsets), sync = false),
-      pendingRef.get
+      commitOffsets = offsets => commit(fromOffsets(offsets), sync = false),
+      commitDeliveries = offsets => commit(fromAcknowledged(offsets), sync = false),
+      commitDeliveriesWithResults =
+        offsets => commitWithResults(fromAcknowledged(offsets), sync = false),
+      pendingRecords = pendingRef.get
     )
 
   /**
@@ -125,8 +127,9 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V] private (
               .fromQueueNoneTerminated(output)
               .flatMap(Stream.chunk)
               .map(entry =>
-                entry.record -> (entry.emitted.set(true) *>
-                  requests.offer(ShareRequest.HandedOut()).whenA(implicitMode))
+                entry.record -> (entry.emitted.set(true) *> requests
+                  .offer(ShareRequest.HandedOut())
+                  .whenA(implicitMode))
               )
               .onFinalize(requests.offer(ShareRequest.ReaderClosed()))
               .interruptWhen(failed)
@@ -429,8 +432,8 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V] private (
     records: Vector[KafkaByteConsumerRecord],
     lock: Option[FiniteDuration]
   ): F[State] = {
-    val identified = records.map(record =>
-      (new TopicPartition(record.topic, record.partition) -> record.offset) -> record
+    val identified: Vector[((TopicPartition, Long), KafkaByteConsumerRecord)] = records.map(
+      record => (new TopicPartition(record.topic, record.partition) -> record.offset) -> record
     )
     // Any record the actor did not renew is a new delivery.
     def renewed(id: ShareState.Id): Option[InFlightRecord[F]] =
@@ -582,21 +585,21 @@ private[kafka] object KafkaShareConsumerActor {
       finished      <- Resource.eval(Deferred[F, Either[Throwable, Unit]])
       // Java does not allow renewal in implicit acknowledgement mode.
       actor = new KafkaShareConsumerActor(
-                if (implicitMode) settings.withAutoRenewal(false) else settings,
-                keyDeserializer,
-                valueDeserializer,
-                withConsumer,
-                requests,
-                output,
-                pending,
-                readerStarted,
-                shutdown,
-                finished,
-                maxPollInterval.millis,
-                apiTimeout.millis,
-                implicitMode,
-                batchOptimized,
-                maxPollRecords
+                settings = if (implicitMode) settings.withAutoRenewal(false) else settings,
+                keyDeserializer = keyDeserializer,
+                valueDeserializer = valueDeserializer,
+                withConsumer = withConsumer,
+                requests = requests,
+                output = output,
+                pendingRef = pending,
+                readerStarted = readerStarted,
+                shutdown = shutdown,
+                finished = finished,
+                maxPollInterval = maxPollInterval.millis,
+                apiTimeout = apiTimeout.millis,
+                implicitMode = implicitMode,
+                batchOptimized = batchOptimized,
+                maxPollRecords = maxPollRecords
               )
       _ <- Resource.make(F.start(actor.run))(fiber =>
              fiber.cancel *> finished.complete(Left(ConsumerShutdownException())).void
