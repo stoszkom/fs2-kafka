@@ -43,7 +43,8 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
   readerStarted: Ref[F, Boolean],
   shutdown: Deferred[F, Unit],
   finished: Deferred[F, Either[Throwable, Unit]],
-  drained: Ref[F, Option[Either[Throwable, KafkaShareConsumerActor.CommitResult]]]
+  drained: Ref[F, Option[Either[Throwable, KafkaShareConsumerActor.CommitResult]]],
+  waiters: Ref[F, Vector[KafkaShareConsumerActor.Waiter[F]]]
 )(implicit F: Async[F], logging: ShareLogging[F])
     extends Stager[F] {
 
@@ -184,6 +185,29 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
           }
     }
 
+  // Completes the requests waiting for a decision on the position with its staging result.
+  private def settle(position: Position)(result: Either[Throwable, Unit]): F[Unit] =
+    waiters
+      .modify { all =>
+        val (hit, rest)   = all.partition(_.positions(position))
+        val left          = hit.map(w => w.copy(positions = w.positions - position))
+        val (ready, keep) =
+          if (result.isLeft) (hit, Vector.empty) else left.partition(_.positions.isEmpty)
+        (rest ++ keep, ready.traverse_(_.done(result)))
+      }
+      .flatten
+
+  // A waiting decision whose record lost its lock before a poll returned it.
+  private def settleLost(state: ShareState): F[Unit] =
+    waiters
+      .get
+      .flatMap(
+        _.flatMap(_.positions)
+          .distinct
+          .filterNot(state.deferred.contains)
+          .traverse_(p => settle(p)(Left(RecordNotInFlightException(p._1, p._2))))
+      )
+
   // --- Requests ---
 
   private def receive(state: ShareState, request: ShareRequest[F]): F[ShareState] =
@@ -301,15 +325,17 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
             withLast.copy(decided = withLast.decided ++ gone, renewing = withLast.renewing -- gone)
           outcomes
             .traverse_ { case (request, (_, gone, error)) =>
-              request.done(
-                error
-                  .orElse(
-                    (gone ++ request.notHeld)
-                      .headOption
-                      .map(d => RecordNotInFlightException(d.topicPartition, d.offset))
-                  )
-                  .toLeft(())
-              )
+              val result = error
+                .orElse(
+                  (gone ++ request.notHeld)
+                    .headOption
+                    .map(d => RecordNotInFlightException(d.topicPartition, d.offset))
+                )
+                .toLeft(())
+              // Completes once a poll returns the renewing records and Java staged their decisions.
+              if (result.isRight && request.waiting.nonEmpty)
+                waiters.update(_ :+ Waiter(request.waiting.map(_.position).toSet, request.done))
+              else request.done(result)
             }
             .as(if (sending) staged.withoutDecided else staged)
         case (_, Left(error)) =>
@@ -411,16 +437,25 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
       _ <-
         output.offer(Some(next.pollId -> Chunk.from(admitted.map(_._2)))).whenA(admitted.nonEmpty)
       // Waiting decisions are the user's, sent at once rather than behind the slowest record.
-      waiting   = returned.flatMap { case (p, _) => next.deferred.get(p).map(p -> _) }
-      decisions =
-        waiting.map { case (p, kind) => decision(next, p, kind) } ++
-          rejected.map { case (p, _) => decision(next, p, AcknowledgeType.Release) }
+      waiting      = returned.flatMap { case (p, _) => next.deferred.get(p).map(p -> _) }
+      waitingBatch =
+        waiting.map { case (p, kind) =>
+          Chunk.singleton(decision(next, p, kind)) -> ((r: Either[Throwable, Unit]) => settle(p)(r))
+        }
+      releases = rejected.map { case (p, _) => decision(next, p, AcknowledgeType.Release) }
+      batch    = waitingBatch ++
+                (if (releases.isEmpty) Vector.empty
+                 else
+                   Vector(
+                     Chunk.from(releases) -> ((r: Either[Throwable, Unit]) => r.liftTo[F])
+                   ))
       staged <-
-        if (decisions.isEmpty) F.pure(next)
+        if (batch.isEmpty) F.pure(next)
         else
-          stageOwn(
+          stageAll(
             next.copy(deferred = next.deferred -- waiting.map(_._1)),
-            decisions,
+            batch,
+            send = true,
             byUser = true
           )
     } yield staged
@@ -540,6 +575,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
       .tryTakeN(None)
       .flatMap(receiveAll(state, _))
       .flatMap(dropFailedRenewals)
+      .flatTap(settleLost)
       .flatMap { current =>
         F.monotonic
           .flatMap { now =>
@@ -595,6 +631,12 @@ private[kafka] object KafkaShareConsumerActor {
 
   def deliveryCountOf(record: KafkaByteConsumerRecord): Short =
     if (record.deliveryCount().isPresent) record.deliveryCount().get.shortValue else 1
+
+  // A request completed once its decisions for renewing records are staged.
+  final case class Waiter[F[_]](
+    positions: Set[Position],
+    done: Either[Throwable, Unit] => F[Unit]
+  )
 
   // One request's held decisions, to stage now or waiting for a renewed record, and its first
   // decision for a delivery not held.
@@ -663,6 +705,7 @@ private[kafka] object KafkaShareConsumerActor {
       shutdown      <- Resource.eval(Deferred[F, Unit])
       finished      <- Resource.eval(Deferred[F, Either[Throwable, Unit]])
       drained       <- Resource.eval(Ref.of[F, Option[Either[Throwable, CommitResult]]](None))
+      waiters       <- Resource.eval(Ref.of[F, Vector[Waiter[F]]](Vector.empty))
       config        <- Resource.eval(ShareActorConfig.from(settings))
       actor          = new KafkaShareConsumerActor(
                 config,
@@ -674,7 +717,8 @@ private[kafka] object KafkaShareConsumerActor {
                 readerStarted,
                 shutdown,
                 finished,
-                drained
+                drained,
+                waiters
               )(F, logging)
       // Once closed, requests fail with ConsumerShutdownException.
       _ <- Resource.make(F.start(actor.run))(fiber =>

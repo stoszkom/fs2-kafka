@@ -43,8 +43,9 @@ sealed abstract class AcknowledgeableOffset[F[_]] { self =>
     * replaces it until it is sent, by the next poll, a commit, or after the
     * [[ShareConsumerSettings.maxAcknowledgementDelay]]. Once sent, or for a delivery the consumer
     * no longer holds, a decision fails with a [[RecordNotInFlightException]]. A decision for a
-    * record being renewed waits until a poll returns it. In implicit acknowledgement mode, it fails
-    * with an [[ImplicitAcknowledgementException]].
+    * record being renewed completes once a poll returns the record and Java staged the decision, or
+    * fails if the record loses its lock first. In implicit acknowledgement mode, it fails with an
+    * [[ImplicitAcknowledgementException]].
     */
   final def acknowledge(acknowledgeType: AcknowledgeType): F[Unit] =
     stager.stage(Chunk.singleton(decision(acknowledgeType)))

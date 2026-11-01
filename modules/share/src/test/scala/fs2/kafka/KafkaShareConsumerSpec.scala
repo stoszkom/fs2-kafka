@@ -643,7 +643,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
                     r.accept
                 )
                 .compile
-                .drain *> IO.sleep(2.seconds) *> consumer.commitSync
+                .drain
             }
         )
         publish(topic, "after")

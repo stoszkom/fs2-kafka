@@ -186,7 +186,7 @@ With `withAutoRenewal(true)`, records without an acknowledgement are renewed `wi
 
 - **A slow record holds back its consumer.** Renewing lets the consumer poll again, but Java then returns only the renewed records, and polls new ones only once every record is settled. Use [several consumers](#several-consumers) to keep polling past slow records; `withMaxProcessingTime` only lets go of records that take too long.
 
-- **A renewed record is acknowledged after the next poll**, as Java lets you decide on it again only once a poll has returned it. A decision made before that waits in the consumer without holding back the caller, and is sent as soon as the poll returns the record. Until then, the consumer promptly renews the other records of the poll so that it can poll, also without auto-renewal. If the renewal fails, the waiting decision is dropped, as the record is delivered again.
+- **A renewed record is acknowledged after the next poll**, as Java lets you decide on it again only once a poll has returned it. A decision made before that completes once the poll returns the record and Java staged the decision, usually within one poll, so closing the consumer afterwards still sends it. Until then, the consumer promptly renews the other records of the poll so that it can poll, also without auto-renewal. If the renewal fails, the decision fails with a `RecordNotInFlightException`, as the record is delivered again.
 
 - **Without auto-renewal, the consumer does not poll** while a record has no acknowledgement, as in Java, so keep processing within the lock and `max.poll.interval.ms`. A record whose lock expired is delivered again, possibly to another consumer, but holds back this consumer until it is decided, or until the max processing time releases it.
 
