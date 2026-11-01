@@ -274,7 +274,8 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
   def maxProcessingTime: Option[FiniteDuration]
 
   /**
-    * Creates a new [[ShareConsumerSettings]] with the specified [[maxProcessingTime]].
+    * Creates a new [[ShareConsumerSettings]] with the specified [[maxProcessingTime]], at most 365
+    * days. For no limit, use [[withoutMaxProcessingTime]].
     */
   def withMaxProcessingTime(time: FiniteDuration): ShareConsumerSettings[F, K, V]
 
@@ -297,7 +298,8 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
   def maxAcknowledgementDelay: Option[FiniteDuration]
 
   /**
-    * Creates a new [[ShareConsumerSettings]] with the specified [[maxAcknowledgementDelay]].
+    * Creates a new [[ShareConsumerSettings]] with the specified [[maxAcknowledgementDelay]], at
+    * most 365 days. For no limit, use [[withoutMaxAcknowledgementDelay]].
     */
   def withMaxAcknowledgementDelay(delay: FiniteDuration): ShareConsumerSettings[F, K, V]
 
@@ -310,6 +312,9 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
 }
 
 object ShareConsumerSettings {
+
+  // The longest limit, far from the overflow of the deadlines computed from it.
+  private val maxLimit: FiniteDuration = 365.days
 
   final private case class Impl[F[_], K, V](
     keyDeserializer: Resource[F, KeyDeserializer[F, K]],
@@ -355,6 +360,10 @@ object ShareConsumerSettings {
 
     override def withMaxProcessingTime(time: FiniteDuration): ShareConsumerSettings[F, K, V] = {
       require(time > Duration.Zero, "max processing time must be positive")
+      require(
+        time <= maxLimit,
+        "max processing time must be at most 365 days; use withoutMaxProcessingTime for no limit"
+      )
       copy(maxProcessingTime = Some(time))
     }
 
@@ -365,6 +374,10 @@ object ShareConsumerSettings {
       delay: FiniteDuration
     ): ShareConsumerSettings[F, K, V] = {
       require(delay >= Duration.Zero, "max acknowledgement delay must be non-negative")
+      require(
+        delay <= maxLimit,
+        "max acknowledgement delay must be at most 365 days; use withoutMaxAcknowledgementDelay for no limit"
+      )
       copy(maxAcknowledgementDelay = Some(delay))
     }
 

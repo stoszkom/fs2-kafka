@@ -66,6 +66,8 @@ final class ShareConsumerSettingsSpec extends BaseSpec {
       intercept[IllegalArgumentException](settings.withMaxProcessingTime(Duration.Zero))
       intercept[IllegalArgumentException](settings.withRenewalMargin(Duration.Zero))
       intercept[IllegalArgumentException](settings.withMaxAcknowledgementDelay((-1).second))
+      intercept[IllegalArgumentException](settings.withMaxProcessingTime(366.days))
+      intercept[IllegalArgumentException](settings.withMaxAcknowledgementDelay(366.days))
     }
 
     it("should use a 15 second commit timeout while the lock is unknown") {

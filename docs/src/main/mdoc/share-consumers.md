@@ -78,9 +78,9 @@ In addition, there are several settings specific to the library.
 
 - `withCommitTimeout` sets how long to wait for the broker to confirm a commit. Default is 15 seconds. With auto-renewal, it must be shorter than the lock, with a small margin, or the stream fails with a `ConfigException`; the default suits locks of about 17 seconds and longer.
 
-- `withMaxProcessingTime` sets how long a record may be held without a decision before it is released, so a hung record does not hold back its consumer. No limit by default. See [renewal](#renewal).
+- `withMaxProcessingTime` sets how long a record may be held without a decision before it is released, so a hung record does not hold back its consumer. No limit by default, or with `withoutMaxProcessingTime`; a limit can be at most 365 days. See [renewal](#renewal).
 
-- `withMaxAcknowledgementDelay` sets how long a staged decision may wait before the consumer sends it, without waiting for the next poll. Default is 1 second; `withoutMaxAcknowledgementDelay` sends decisions only with the next poll or commit, as in Java. See [acknowledging](#acknowledging).
+- `withMaxAcknowledgementDelay` sets how long a staged decision may wait before the consumer sends it, without waiting for the next poll. Default is 1 second; `withoutMaxAcknowledgementDelay` sends decisions only with the next poll or commit, as in Java; a delay can be at most 365 days. See [acknowledging](#acknowledging).
 
 - `withMaxPollRecords` sets the records polled at once, and so held per consumer with `record_limit`. Default is 500.
 
