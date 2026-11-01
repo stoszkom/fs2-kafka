@@ -122,7 +122,7 @@ As in Java, `acknowledge` stages a decision in the consumer, and sends nothing. 
 
 - `record.accept`, `release`, `reject` and `renew` stage one decision, as does `acknowledge(AcknowledgeType)`. They are on the record and on its `offset`.
 
-- `acknowledgeChunks` stages the decisions of each chunk with one call per consumer, which saves work when processing is fast.
+- `acknowledgeChunks` stages the decisions of each chunk with one call per consumer. Use it after steps which keep the stream's chunks, such as `map` or `evalMapChunk`, where a chunk is a whole poll: acknowledging one record at a time there waits for the consumer on every record. After `parEvalMap`, chunks mostly hold one record, so acknowledge each record instead; the consumer already stages decisions arriving together in one call. To use `acknowledgeChunks` there anyway, group the decisions first with `groupWithin(n, d).unchunks`.
 
 - `KafkaShareConsumer#commitSync` sends every staged decision at once and waits for the result per partition, as a `Map[TopicPartition, Option[KafkaException]]`, as Java's `commitSync` does. It waits for the commit timeout, or for the timeout given to `commitSync(timeout)`. A partition the broker does not confirm in time has Kafka's `TimeoutException` as its result; a commit that times out before it is sent fails with a `ShareCommitTimeoutException`.
 
@@ -133,7 +133,7 @@ val chunked: IO[Unit] =
   KafkaShareConsumer.stream(settings)
     .subscribeTo("jobs")
     .records
-    .parEvalMapUnordered(32) { record =>
+    .evalMapChunk { record =>
       process(record.record).as(record.offset -> (AcknowledgeType.Accept: AcknowledgeType))
     }
     .through(acknowledgeChunks[IO])

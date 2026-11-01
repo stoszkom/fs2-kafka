@@ -13,6 +13,10 @@ import fs2.{Chunk, Pipe}
 /**
   * Stages the decisions in each chunk with one call per consumer, instead of one per record. A
   * decision for a record the consumer no longer holds is skipped, as the record is delivered again.
+  *
+  * It pays off after steps which keep the stream's chunks, such as `map` or `evalMapChunk`, where a
+  * chunk is a whole poll. After `parEvalMap`, chunks mostly hold one record; acknowledge each
+  * record there, or group the decisions first with `groupWithin(n, d).unchunks`.
   */
 object acknowledgeChunks {
 
