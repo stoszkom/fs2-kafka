@@ -93,6 +93,17 @@ final class ShareBenchmarkSpec extends ShareConsumerBaseKafkaSpec {
         }
     )
 
+  private def acknowledgeChunksPipe(
+    work: Option[IO[Unit]]
+  )(records: Records): fs2.Stream[IO, Unit] =
+    work
+      .fold(records.map(r => r.offset -> (AcknowledgeType.Accept: AcknowledgeType))) { w =>
+        records.parEvalMapUnordered(parallelism)(r =>
+          w.as(r.offset -> (AcknowledgeType.Accept: AcknowledgeType))
+        )
+      }
+      .through(acknowledgeChunks[IO])
+
   private def acknowledgePerRecord(work: Option[IO[Unit]])(records: Records): fs2.Stream[IO, Unit] =
     work.fold(records.evalMap(_.accept))(w =>
       records.parEvalMapUnordered(parallelism)(r => w *> r.accept)
@@ -149,7 +160,12 @@ final class ShareBenchmarkSpec extends ShareConsumerBaseKafkaSpec {
     time(s"java, $label", count)(
       javaConsumer(topic, count, work.map(d => () => Thread.sleep(d.toMillis)))
     )
-    time(s"fs2, $label", count)(fs2Consumer(topic, count)(acknowledgePerRecord(fs2Work)))
+    time(s"fs2 acknowledgeChunks, $label", count)(
+      fs2Consumer(topic, count)(acknowledgeChunksPipe(fs2Work))
+    )
+    time(s"fs2 acknowledge per record, $label", count)(
+      fs2Consumer(topic, count)(acknowledgePerRecord(fs2Work))
+    )
   }
 
   describe("throughput") {

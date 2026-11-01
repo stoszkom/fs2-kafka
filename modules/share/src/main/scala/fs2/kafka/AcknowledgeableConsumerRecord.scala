@@ -20,7 +20,8 @@ import cats.syntax.traverse.*
   * [[AcknowledgeableConsumerRecord]] is a Kafka record along with an instance of
   * [[AcknowledgeableOffset]], which stages a decision for the record in its consumer. In explicit
   * acknowledgement mode, the default in this library, every record of a poll needs a decision
-  * before its consumer can poll new records; the next poll sends the decisions.
+  * before its consumer can poll new records; the next poll sends the decisions. Decisions for many
+  * records can be staged together with [[acknowledgeChunks]].
   *
   * In implicit acknowledgement mode, records cannot be acknowledged. Instead, the consumer polls
   * again once every record of the previous poll has been emitted by the stream, and that poll

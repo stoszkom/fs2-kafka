@@ -254,8 +254,8 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
   /**
     * How long the consumer may hold a record without a decision, or `None` for no limit. A record
     * held longer is released and delivered again; its processing is not cancelled, and its later
-    * decision fails with a [[RecordNotInFlightException]], which can be ignored. It applies with
-    * explicit acknowledgement.<br><br>
+    * decision fails with a [[RecordNotInFlightException]], which [[acknowledgeChunks]] skips. It
+    * applies with explicit acknowledgement.<br><br>
     *
     * The time counts from when the stream took the record's poll, or from its latest `Renew` by the
     * user. Set it well above the time to process a whole poll: `max.poll.records` times the time

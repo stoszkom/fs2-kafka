@@ -327,8 +327,9 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
             .use { consumer =>
               consumer.subscribeTo(topic) *> consumer
                 .records
+                .map(_.offset -> (AcknowledgeType.Accept: AcknowledgeType))
                 .take(10)
-                .evalMap(_.accept)
+                .through(acknowledgeChunks[IO])
                 .compile
                 .drain
             }
@@ -337,25 +338,27 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         readUntil(topic, settings, "after") shouldBe Vector("after" -> 1)
       }
     }
-    // The second record stays undecided, so no poll sends the first's accept before its release.
-    it("should let the last of several decisions for a record win") {
+    it("should let the last of several decisions staged together for a record win") {
       withTopic { topic =>
         createCustomTopic(topic)
-        publish(topic, "0", "1")
-        val settings = shareConsumerSettings.withMaxPollRecords(2)
+        publish(topic, "0")
+        val settings = shareConsumerSettings
         run(
           KafkaShareConsumer
-            .resource(settings.withoutMaxAcknowledgementDelay)
+            .resource(settings)
             .use { consumer =>
               consumer.subscribeTo(topic) *> consumer
                 .records
-                .take(2)
+                .take(1)
+                .flatMap(r =>
+                  fs2.Stream(
+                    r.offset -> (AcknowledgeType.Accept: AcknowledgeType),
+                    r.offset -> (AcknowledgeType.Release: AcknowledgeType)
+                  )
+                )
+                .through(acknowledgeChunks[IO])
                 .compile
-                .toVector
-                .flatMap { records =>
-                  val (first, second) = (records(0), records(1))
-                  first.accept *> first.release *> second.accept *> consumer.commitSync
-                }
+                .drain *> consumer.commitSync
             }
         )
         // The release won, so the record is delivered again (this consumer may poll it once more).
@@ -440,6 +443,72 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       }
     }
 
+  }
+
+  describe("acknowledgeChunks") {
+    it("should settle every record once") {
+      withTopic { topic =>
+        createCustomTopic(topic, partitions = 2)
+        val produced = (0 until 30).map(_.toString)
+        publish(topic, produced*)
+        val consumed = run(
+          KafkaShareConsumer
+            .resource(shareConsumerSettings.withMaxPollRecords(5))
+            .use { consumer =>
+              Ref
+                .of[IO, Vector[(String, Int)]](Vector.empty)
+                .flatMap { seen =>
+                  consumer.subscribeTo(topic) *>
+                    consumer
+                      .records
+                      .parEvalMapUnordered(4) { r =>
+                        seen
+                          .updateAndGet(_ :+ (r.record.value -> r.offset.deliveryCount.toInt))
+                          .flatTap(s => consumer.stopConsuming.whenA(s.size >= produced.size))
+                          .as(r.offset -> (AcknowledgeType.Accept: AcknowledgeType))
+                      }
+                      .through(acknowledgeChunks[IO])
+                      .compile
+                      .drain *> seen.get
+                }
+            }
+        )
+        consumed.map(_._1) should contain theSameElementsAs produced
+        all(consumed.map(_._2)) shouldBe 1
+      }
+    }
+
+    it("should stage a chunk's decisions with each of its consumers") {
+      withTopic { topic =>
+        val other = topic + "-other"
+        createCustomTopic(topic)
+        createCustomTopic(other)
+        publish(topic, "a")
+        publish(other, "b")
+        val settings = shareConsumerSettings
+        run(
+          (KafkaShareConsumer.resource(settings), KafkaShareConsumer.resource(settings))
+            .tupled
+            .use { case (first, second) =>
+              first.subscribeTo(topic) *> second.subscribeTo(other) *>
+                (first.records.take(1).compile.toList, second.records.take(1).compile.toList)
+                  .parTupled
+                  .flatMap { case (a, b) =>
+                    fs2
+                      .Stream
+                      .emits((a ++ b).map(_.offset -> (AcknowledgeType.Accept: AcknowledgeType)))
+                      .through(acknowledgeChunks[IO])
+                      .compile
+                      .drain
+                  } *> first.commitSync *> second.commitSync
+            }
+        )
+        publish(topic, "after")
+        publish(other, "after")
+        readUntil(topic, settings, "after") shouldBe Vector("after" -> 1)
+        readUntil(other, settings, "after") shouldBe Vector("after" -> 1)
+      }
+    }
   }
 
   describe("implicit acknowledgement") {
