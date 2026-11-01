@@ -84,11 +84,13 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
       .flatMap {
         case true  => Stream.raiseError[F](StreamAlreadyStartedException())
         case false =>
+          // As in core, closing the consumer under the stream ends it normally.
           val failed = finished
             .get
             .flatMap {
-              case Left(error) => F.pure(error.asLeft[Unit])
-              case Right(_)    => F.never[Either[Throwable, Unit]]
+              case Left(_: ConsumerShutdownException) => F.pure(().asRight[Throwable])
+              case Left(error)                        => F.pure(error.asLeft[Unit])
+              case Right(_)                           => F.never[Either[Throwable, Unit]]
             }
           // The finalizer also covers an interruption right after Start.
           (Stream.exec(requests.offer(ShareRequest.Start())) ++

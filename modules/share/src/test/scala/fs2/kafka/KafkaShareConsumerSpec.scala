@@ -94,6 +94,29 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       )
     }
 
+    it("should end the record stream normally once the consumer is closed") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        val result = run(
+          KafkaShareConsumer
+            .resource(shareConsumerSettings)
+            .allocated
+            .flatMap { case (consumer, close) =>
+              consumer.subscribeTo(topic) *>
+                consumer
+                  .records
+                  .compile
+                  .drain
+                  .start
+                  .flatMap { stream =>
+                    IO.sleep(2.seconds) *> close *> stream.joinWithNever.attempt.timeout(10.seconds)
+                  }
+            }
+        )
+        result shouldBe Right(())
+      }
+    }
+
     it("should fail the record stream when not subscribed") {
       val result =
         run(KafkaShareConsumer.stream(shareConsumerSettings).records.compile.drain.attempt)

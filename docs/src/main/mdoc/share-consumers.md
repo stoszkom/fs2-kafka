@@ -272,7 +272,7 @@ The consumer logs with SLF4J, under `fs2.kafka.KafkaShareConsumer$<id>`, the sam
 
 - When the stream ends, records it never handed out are released. In explicit acknowledgement mode, the records of a poll are handed out as one chunk, so operators such as `take` or `prefetch` count the whole chunk as handed out; closing the consumer releases the records they skipped. Auto-renewal continues after the stream ends, as steps such as `parEvalMap` may still process records, until the consumer is closed or stopped.
 
-- Releasing the resource closes the Java consumer, which sends the staged decisions and releases the records it still holds without one; it never accepts them automatically. Later decisions and commits fail with a `ConsumerShutdownException`.
+- Releasing the resource closes the Java consumer, which sends the staged decisions and releases the records it still holds without one; it never accepts them automatically. A record stream still running ends normally, as in core, and later decisions and commits fail with a `ConsumerShutdownException`.
 
 [acknowledgeableoffset]: @API_BASE_URL@/AcknowledgeableOffset.html
 [acknowledgeablerecord]: @API_BASE_URL@/AcknowledgeableConsumerRecord.html
