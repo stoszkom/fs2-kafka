@@ -45,6 +45,32 @@ sealed abstract class AcknowledgeableConsumerRecord[F[_], +K, +V] { self =>
   def offset: AcknowledgeableOffset[F]
 
   /**
+    * Stages the decision for the record, see [[AcknowledgeableOffset.acknowledge]].
+    */
+  final def acknowledge(acknowledgeType: AcknowledgeType): F[Unit] =
+    offset.acknowledge(acknowledgeType)
+
+  /**
+    * Stages an `Accept`, see [[AcknowledgeableOffset.accept]].
+    */
+  final def accept: F[Unit] = offset.accept
+
+  /**
+    * Stages a `Release`, see [[AcknowledgeableOffset.release]].
+    */
+  final def release: F[Unit] = offset.release
+
+  /**
+    * Stages a `Reject`, see [[AcknowledgeableOffset.reject]].
+    */
+  final def reject: F[Unit] = offset.reject
+
+  /**
+    * Renews the record's lock, see [[AcknowledgeableOffset.renew]].
+    */
+  final def renew: F[Unit] = offset.renew
+
+  /**
     * Creates a new [[AcknowledgeableConsumerRecord]] in which the effect type has been changed
     * using the specified `FunctionK`.
     */

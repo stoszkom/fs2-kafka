@@ -25,14 +25,14 @@ private[kafka] object ShareTimeouts {
     if (lock.isPresent) Some(lock.get.intValue.millis) else None
   }
 
-  private[kafka] def renewalMargin(lock: FiniteDuration): FiniteDuration =
+  private[kafka] def safetyMargin(lock: FiniteDuration): FiniteDuration =
     (lock / 10).min(1.second)
 
   private[kafka] def latestRenewal(
     lock: FiniteDuration,
     commitTimeout: FiniteDuration
   ): FiniteDuration =
-    lock - commitTimeout - renewalMargin(lock)
+    lock - commitTimeout - safetyMargin(lock)
 
   /**
     * The commit timeout, rejected with automatic renewal when the lock leaves no time to renew
@@ -49,7 +49,7 @@ private[kafka] object ShareTimeouts {
           new ConfigException(
             s"commitTimeout (${settings.commitTimeout}) leaves no time to renew the broker's " +
               s"acquisition lock ($l): a renewal can wait behind one commit, so commitTimeout must " +
-              s"stay below the lock duration minus a safety margin of ${renewalMargin(l)}. Reduce " +
+              s"stay below the lock duration minus a safety margin of ${safetyMargin(l)}. Reduce " +
               "withCommitTimeout or increase the group's share.record.lock.duration.ms."
           )
         )

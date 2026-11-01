@@ -40,8 +40,9 @@ trait KafkaShareConsume[F[_], K, V] {
   /**
     * Stops consuming new messages from Kafka. In explicit acknowledgement mode, polled records can
     * still be acknowledged, and the stream ends once all of them are, after a final commit of the
-    * staged decisions. In implicit mode, the stream ends once it took the latest poll, which the
-    * final commit accepts.
+    * staged decisions; if the stream already ended, records still without a decision are released.
+    * In implicit mode, the stream ends once it took the latest poll, which the final commit
+    * accepts.
     */
   def stopConsuming: F[Unit]
 

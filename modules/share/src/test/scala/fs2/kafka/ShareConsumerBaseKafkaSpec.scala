@@ -101,11 +101,7 @@ abstract class ShareConsumerBaseKafkaSpec extends BaseKafkaSpec {
         .stream(settings)
         .subscribeTo(topic)
         .records
-        .evalMap(r =>
-          r.offset
-            .acknowledge(AcknowledgeType.Accept)
-            .as(r.record.value -> r.offset.deliveryCount.toInt)
-        )
+        .evalMap(r => r.accept.as(r.record.value -> r.offset.deliveryCount.toInt))
         .takeThrough(_._1 != marker)
         .compile
         .toVector

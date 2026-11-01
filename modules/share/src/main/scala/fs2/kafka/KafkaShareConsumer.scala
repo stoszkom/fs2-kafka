@@ -14,12 +14,12 @@ import cats.effect.{Async, Resource}
 import cats.effect.instances.spawn.*
 import cats.syntax.all.*
 import cats.Reducible
-import fs2.{Chunk, Stream}
 import fs2.kafka.consumer.*
 import fs2.kafka.internal.actor.{KafkaShareConsumerActor, ShareTimeouts}
 import fs2.kafka.internal.converters.collection.*
 import fs2.kafka.internal.syntax.*
 import fs2.kafka.internal.WithShareConsumer
+import fs2.Stream
 
 import org.apache.kafka.clients.consumer.ConsumerConfig
 import org.apache.kafka.common.{KafkaException, Metric, MetricName, TopicPartition, Uuid}
@@ -30,20 +30,19 @@ import org.apache.kafka.common.config.ConfigException
   * `KafkaShareConsumer`. It provides a single top-level [[stream]] of records, in the order they
   * were polled.<br><br>
   *
-  * Records come as [[AcknowledgeableConsumerRecord]]s. Acknowledging an [[AcknowledgeableOffset]]
-  * stages the decision in the Java consumer, as Java's `acknowledge` does, one record at a time or
-  * many at once with [[acknowledgeChunks]]. The next poll sends the staged decisions, so
-  * acknowledging every record is enough; [[commit]] sends them earlier and reports the
-  * result.<br><br>
+  * Records come as [[AcknowledgeableConsumerRecord]]s. Acknowledging one stages the decision in the
+  * Java consumer, as Java's `acknowledge` does, one record at a time or a chunk at once with
+  * [[acknowledgeChunks]]. Staged decisions are sent by the next poll, after the
+  * [[ShareConsumerSettings.maxAcknowledgementDelay]], or by [[commitSync]], which reports the
+  * result, or [[commitAsync]].<br><br>
   *
   * In explicit acknowledgement mode, the default, the consumer polls again once every record of the
   * previous poll has a decision. A record not acknowledged within its acquisition lock is delivered
   * again, unless it is renewed, see [[ShareConsumerSettings.withAutoRenewal]].<br><br>
   *
-  * In implicit acknowledgement mode, the next poll or commit accepts the records of the previous
-  * poll, and acknowledging fails with an [[ImplicitAcknowledgementException]]. The consumer polls
-  * again once the stream took a poll, so records may still be processing when they are accepted
-  * (at-most-once). Records are not renewed, and the max processing time does not apply.<br><br>
+  * In implicit acknowledgement mode, the next poll or commit accepts the previous poll, and
+  * acknowledging fails with an [[ImplicitAcknowledgementException]]. The consumer polls again once
+  * the stream took a poll, so this is at-most-once.<br><br>
   *
   * A second stream fails with a [[StreamAlreadyStartedException]]. To consume again, create a new
   * consumer. For several consumers in one share group, see [[KafkaShareConsumers]].<br><br>
@@ -62,14 +61,27 @@ sealed abstract class KafkaShareConsumer[F[_], K, V]
   def settings: ShareConsumerSettings[F, K, V]
 
   /**
-    * Sends every staged decision, as Java's `commitSync` does, and returns the result per
-    * partition. A decision for a record whose renewal was sent is staged only once a poll returns
-    * the record, and then sent at once, so it is not part of a commit made before that. In implicit
-    * mode, it accepts the latest poll once the stream took it; before that, that poll has already
-    * accepted the records handed out, and nothing is committed. Fails with a
-    * [[ShareCommitTimeoutException]] if the broker does not confirm it within the commit timeout.
+    * Sends every staged decision and waits for the result per partition, as Java's `commitSync`
+    * does, within [[ShareConsumerSettings.commitTimeout]]. Decisions waiting for a renewed record
+    * are not included. In implicit mode, it accepts the latest poll once the stream took it, which
+    * the next poll usually did already, giving an empty result. A partition the broker did not
+    * confirm in time has Kafka's `TimeoutException` as its result; a commit that times out before
+    * it is sent fails with a [[ShareCommitTimeoutException]].
     */
-  def commit: F[Map[TopicPartition, Option[KafkaException]]]
+  def commitSync: F[Map[TopicPartition, Option[KafkaException]]]
+
+  /**
+    * [[commitSync]] with the given timeout. With automatic renewal, a timeout longer than
+    * [[ShareConsumerSettings.commitTimeout]] can delay renewals past the lock.
+    */
+  def commitSync(timeout: FiniteDuration): F[Map[TopicPartition, Option[KafkaException]]]
+
+  /**
+    * Sends every staged decision without waiting for the broker, as Java's `commitAsync` does.
+    * Results are not reported: a decision the broker rejects shows as the record being delivered
+    * again.
+    */
+  def commitAsync: F[Unit]
 
   /**
     * Returns the broker's acquisition lock duration, or `None` until it is known.
@@ -88,10 +100,10 @@ sealed abstract class KafkaShareConsumer[F[_], K, V]
   def clientInstanceId(timeout: FiniteDuration): F[Uuid]
 
   /**
-    * Like [[stream]], but each poll comes as one chunk with the effect which hands it out, so that
-    * merged polls of several consumers are handed out after the merge.
+    * Like [[stream]], but one stream per poll, which hands the poll out, so that merged polls of
+    * several consumers are handed out after the merge.
     */
-  private[kafka] def polls: Stream[F, (Chunk[AcknowledgeableConsumerRecord[F, K, V]], F[Unit])]
+  private[kafka] def polls: Stream[F, Stream[F, AcknowledgeableConsumerRecord[F, K, V]]]
 
 }
 
@@ -107,10 +119,18 @@ object KafkaShareConsumer {
 
       override val settings: ShareConsumerSettings[F, K, V] = _settings
 
-      override def commit: F[Map[TopicPartition, Option[KafkaException]]] = actor.commit
+      override def commitSync: F[Map[TopicPartition, Option[KafkaException]]] =
+        actor.commitSync(settings.commitTimeout)
+
+      override def commitSync(
+        timeout: FiniteDuration
+      ): F[Map[TopicPartition, Option[KafkaException]]] =
+        actor.commitSync(timeout)
+
+      override def commitAsync: F[Unit] = actor.commitAsync
 
       override private[kafka] def polls
-        : Stream[F, (Chunk[AcknowledgeableConsumerRecord[F, K, V]], F[Unit])] =
+        : Stream[F, Stream[F, AcknowledgeableConsumerRecord[F, K, V]]] =
         actor.polls
 
       override def stream: Stream[F, AcknowledgeableConsumerRecord[F, K, V]] = actor.records

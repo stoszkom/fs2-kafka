@@ -22,16 +22,12 @@ import org.apache.kafka.clients.consumer.ConsumerConfig
   *   allow renewal
   * @param implicitMode
   *   whether Java accepts a poll's records on the next poll (`share.acknowledgement.mode`)
-  * @param batchOptimized
-  *   whether a poll may return more than `max.poll.records` records (`share.acquire.mode`)
   */
 final private[kafka] case class ShareActorConfig[F[_], K, V](
   settings: ShareConsumerSettings[F, K, V],
   maxPollInterval: FiniteDuration,
   apiTimeout: FiniteDuration,
-  implicitMode: Boolean,
-  batchOptimized: Boolean,
-  maxPollRecords: Int
+  implicitMode: Boolean
 )
 
 private[kafka] object ShareActorConfig {
@@ -41,11 +37,11 @@ private[kafka] object ShareActorConfig {
   )(implicit F: Sync[F]): F[ShareActorConfig[F, K, V]] =
     F.delay {
       def property[A](key: String, default: A)(parse: String => A): A =
-        settings.properties.get(key).fold(default)(parse)
+        settings.properties.get(key).fold(default)(v => parse(v.trim))
 
       val implicitMode =
         property(ConsumerConfig.SHARE_ACKNOWLEDGEMENT_MODE_CONFIG, true)(
-          _.equalsIgnoreCase("implicit")
+          _ == "implicit"
         )
 
       ShareActorConfig(
@@ -54,14 +50,7 @@ private[kafka] object ShareActorConfig {
           .millis,
         apiTimeout = property(ConsumerConfig.DEFAULT_API_TIMEOUT_MS_CONFIG, 60000L)(_.toLong)
           .millis,
-        implicitMode = implicitMode,
-        batchOptimized = property(ConsumerConfig.SHARE_ACQUIRE_MODE_CONFIG, true)(
-          _.equalsIgnoreCase("batch_optimized")
-        ),
-        maxPollRecords = property(
-          ConsumerConfig.MAX_POLL_RECORDS_CONFIG,
-          ConsumerConfig.DEFAULT_MAX_POLL_RECORDS
-        )(_.toInt)
+        implicitMode = implicitMode
       )
     }
 

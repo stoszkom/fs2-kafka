@@ -22,28 +22,24 @@ final class ShareActorConfigSpec extends BaseSpec {
   describe("ShareActorConfig") {
     it("should read the library's defaults") {
       val c = config(settings)
-      assert(!c.implicitMode && !c.batchOptimized && c.maxPollRecords == 500)
+      assert(!c.implicitMode)
       assert(c.maxPollInterval == 5.minutes && c.apiTimeout == 1.minute)
     }
 
-    it("should read the modes in any case, and turn renewal off in implicit mode") {
+    it("should read the mode as Java does, and turn renewal off in implicit mode") {
       val c = config(
-        settings
-          .withAutoRenewal(true)
-          .withProperty("share.acknowledgement.mode", "IMPLICIT")
-          .withProperty("share.acquire.mode", "Batch_Optimized")
+        settings.withAutoRenewal(true).withProperty("share.acknowledgement.mode", " implicit\n")
       )
-      assert(c.implicitMode && c.batchOptimized && !c.settings.autoRenewal)
+      assert(c.implicitMode && !c.settings.autoRenewal)
     }
 
     it("should read the poll and API timeouts") {
       val c = config(
         settings
-          .withMaxPollRecords(7)
-          .withProperty("max.poll.interval.ms", "1000")
+          .withProperty("max.poll.interval.ms", " 1000 ")
           .withProperty("default.api.timeout.ms", "2000")
       )
-      assert(c.maxPollRecords == 7 && c.maxPollInterval == 1.second && c.apiTimeout == 2.seconds)
+      assert(c.maxPollInterval == 1.second && c.apiTimeout == 2.seconds)
     }
   }
 

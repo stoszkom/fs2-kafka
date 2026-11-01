@@ -89,7 +89,7 @@ final class ShareBenchmarkSpec extends ShareConsumerBaseKafkaSpec {
           consumer.subscribeTo(topic) *>
             pipe(
               consumer.records.through(markFirst).through(distinct(count))
-            ).compile.drain *> consumer.commit *> IO { lastAt = System.nanoTime }
+            ).compile.drain *> consumer.commitSync *> IO { lastAt = System.nanoTime }
         }
     )
 
@@ -105,9 +105,7 @@ final class ShareBenchmarkSpec extends ShareConsumerBaseKafkaSpec {
       .through(acknowledgeChunks[IO])
 
   private def acknowledgePerRecord(work: IO[Unit])(records: Records): fs2.Stream[IO, Unit] =
-    records.parEvalMapUnordered(parallelism)(r =>
-      work *> r.offset.acknowledge(AcknowledgeType.Accept)
-    )
+    records.parEvalMapUnordered(parallelism)(r => work *> r.accept)
 
   // Java's equivalent: a pool processes each poll's records, then the poll thread acknowledges them.
   private def javaConsumer(topic: String, count: Int, work: Option[() => Unit]): Unit = {

@@ -20,7 +20,7 @@ final private[kafka] case class Decision(
   acknowledgeType: AcknowledgeType
 ) {
 
-  def position: TopicPartitionOffset = topicPartition -> offset
+  val position: TopicPartitionOffset = topicPartition -> offset
 
 }
 

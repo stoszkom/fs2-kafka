@@ -180,8 +180,9 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
   def withCloseTimeout(timeout: FiniteDuration): ShareConsumerSettings[F, K, V]
 
   /**
-    * The time to wait for the broker to confirm committed acknowledgements. If they are not
-    * confirmed within this time, a [[ShareCommitTimeoutException]] will be raised instead.<br><br>
+    * How long [[KafkaShareConsumer.commitSync]] waits for the broker to confirm. Unconfirmed
+    * partitions get Kafka's `TimeoutException` as their result; a commit timing out before it is
+    * sent fails with a [[ShareCommitTimeoutException]].<br><br>
     *
     * The default value is 15 seconds.
     */
@@ -200,7 +201,7 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
 
   /**
     * How long we should allow the `poll` call to block for in the Java `KafkaShareConsumer`. The
-    * consumer polls again as soon as the previous poll is settled and the stream has taken it, so
+    * consumer polls again as soon as the previous poll is decided and the stream has taken it, so
     * this is also how long an idle consumer waits between polls.<br><br>
     *
     * The default value is 50 milliseconds.
@@ -214,7 +215,7 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
 
   /**
     * Whether records without an acknowledgement are renewed automatically before their acquisition
-    * lock expires, at about half of the lock duration. Renewal does not apply in implicit
+    * lock expires, [[renewalMargin]] before it ends. Renewal does not apply in implicit
     * acknowledgement mode, where Java does not allow it.<br><br>
     *
     * The default value is `false`, as in Java's share consumer.
@@ -224,44 +225,45 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
   /**
     * Creates a new [[ShareConsumerSettings]] with the specified [[autoRenewal]].<br><br>
     *
-    * Without automatic renewal, a record which is neither acknowledged nor renewed in time is
-    * delivered again, possibly to another consumer, and its later acknowledgement fails. Only while
-    * an acknowledgement waits for a record you renewed are the other records renewed, so that the
-    * consumer can poll the renewed record again. Enable it when processing may outlast the lock. A
-    * record whose processing hangs is then renewed, and holds back the next poll of its consumer,
-    * until the stream ends or the [[maxProcessingTime]] passes.
+    * Without it, a record neither acknowledged nor renewed in time is delivered again, possibly to
+    * another consumer; the other records are renewed only while a decision waits for a record you
+    * renewed. Enable it when processing may outlast the lock. A hung record is then renewed until
+    * the stream ends or the [[maxProcessingTime]] passes.
     */
   def withAutoRenewal(enabled: Boolean): ShareConsumerSettings[F, K, V]
 
   /**
+    * How long before a record's lock ends [[autoRenewal]] renews it. A record's lock counts from
+    * the start of the poll which returned it, but Java may have fetched it earlier and kept it
+    * buffered, e.g. from a second broker while you processed the previous poll; a record buffered
+    * for longer than the margin can lose its lock before it is renewed. Renewal also happens early
+    * enough for a renewal waiting behind a commit, see [[withCommitTimeout]], and within half of
+    * `max.poll.interval.ms`. A margin of the whole lock or more renews at half of the lock.<br><br>
+    *
+    * The default value is 5 seconds.
+    */
+  def renewalMargin: FiniteDuration
+
+  /**
+    * Creates a new [[ShareConsumerSettings]] with the specified [[renewalMargin]].
+    */
+  def withRenewalMargin(margin: FiniteDuration): ShareConsumerSettings[F, K, V]
+
+  /**
     * How long the consumer may hold a record without a decision, or `None` for no limit. A record
-    * held longer is released, so it is delivered again, possibly to another consumer, and a later
-    * decision for it fails with a [[RecordNotInFlightException]]. Its processing is not cancelled.
-    * It applies with explicit acknowledgement, and not to records whose decision was already
-    * requested.<br><br>
+    * held longer is released and delivered again; its processing is not cancelled, and its later
+    * decision fails with a [[RecordNotInFlightException]], which [[acknowledgeChunks]] skips. It
+    * applies with explicit acknowledgement.<br><br>
     *
     * The time counts from when the stream took the record's poll, or from its latest `Renew` by the
-    * user, since the consumer cannot tell when processing starts: a poll is taken as one chunk, and
-    * its records may wait in the stream. Records of a poll the stream has not taken are not
-    * released. Set it well above the time to process a whole poll, that is `max.poll.records` times
-    * the time per record, divided by the parallelism, and above that with several consumers merged
-    * into one pipeline or with `batch_optimized` polls.<br><br>
-    *
-    * Without a limit, a record whose processing hangs is renewed with [[withAutoRenewal]] until the
-    * stream ends, and without automatic renewal it holds back its consumer, as in Java.<br><br>
-    *
-    * The release does not fail the stream, unless the consumer fails to send it, as for any release
-    * or renewal the consumer sends itself. The later `acknowledge` fails with a
-    * [[RecordNotInFlightException]], which [[acknowledgeChunks]] skips. The record is processed
-    * again after its redelivery, so ignoring the failure is usually enough:
+    * user. Set it well above the time to process a whole poll: `max.poll.records` times the time
+    * per record, divided by the parallelism, and more with merged consumers or `batch_optimized`
+    * polls. Ignoring the failure is usually enough, as the record is processed again:
     *
     * {{{
-    * records.evalMap { committable =>
-    *   process(committable.record) *>
-    *     committable
-    *       .offset
-    *       .acknowledge(AcknowledgeType.Accept)
-    *       .recover { case _: RecordNotInFlightException => () }
+    * records.evalMap { record =>
+    *   process(record.record) *>
+    *     record.accept.recover { case _: RecordNotInFlightException => () }
     * }
     * }}}
     *
@@ -279,6 +281,30 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
     */
   def withoutMaxProcessingTime: ShareConsumerSettings[F, K, V]
 
+  /**
+    * How long a staged decision may wait before the consumer sends it, or `None` to send decisions
+    * only with the next poll or commit, as Java does. The next poll waits for every record of the
+    * current one, so without a limit, decisions for fast records wait for the slowest record, and
+    * can be lost with their lock, or with the consumer, if it takes too long. Once the oldest
+    * unsent decision is this old, the consumer sends every staged decision with Java's
+    * `commitAsync`, without waiting for the result. It applies with explicit
+    * acknowledgement.<br><br>
+    *
+    * The default value is 1 second.
+    */
+  def maxAcknowledgementDelay: Option[FiniteDuration]
+
+  /**
+    * Creates a new [[ShareConsumerSettings]] with the specified [[maxAcknowledgementDelay]].
+    */
+  def withMaxAcknowledgementDelay(delay: FiniteDuration): ShareConsumerSettings[F, K, V]
+
+  /**
+    * Creates a new [[ShareConsumerSettings]] without a [[maxAcknowledgementDelay]], so that
+    * decisions are sent with the next poll or commit, as in Java.
+    */
+  def withoutMaxAcknowledgementDelay: ShareConsumerSettings[F, K, V]
+
 }
 
 object ShareConsumerSettings {
@@ -291,7 +317,9 @@ object ShareConsumerSettings {
     pollTimeout: FiniteDuration,
     commitTimeout: FiniteDuration,
     autoRenewal: Boolean,
-    maxProcessingTime: Option[FiniteDuration]
+    renewalMargin: FiniteDuration,
+    maxProcessingTime: Option[FiniteDuration],
+    maxAcknowledgementDelay: Option[FiniteDuration]
   ) extends ShareConsumerSettings[F, K, V] {
 
     override def withProperty(key: String, value: String): ShareConsumerSettings[F, K, V] =
@@ -318,6 +346,11 @@ object ShareConsumerSettings {
     override def withAutoRenewal(enabled: Boolean): ShareConsumerSettings[F, K, V] =
       copy(autoRenewal = enabled)
 
+    override def withRenewalMargin(margin: FiniteDuration): ShareConsumerSettings[F, K, V] = {
+      require(margin > Duration.Zero, "renewal margin must be positive")
+      copy(renewalMargin = margin)
+    }
+
     override def withMaxProcessingTime(time: FiniteDuration): ShareConsumerSettings[F, K, V] = {
       require(time > Duration.Zero, "max processing time must be positive")
       copy(maxProcessingTime = Some(time))
@@ -326,8 +359,18 @@ object ShareConsumerSettings {
     override def withoutMaxProcessingTime: ShareConsumerSettings[F, K, V] =
       copy(maxProcessingTime = None)
 
+    override def withMaxAcknowledgementDelay(
+      delay: FiniteDuration
+    ): ShareConsumerSettings[F, K, V] = {
+      require(delay >= Duration.Zero, "max acknowledgement delay must be non-negative")
+      copy(maxAcknowledgementDelay = Some(delay))
+    }
+
+    override def withoutMaxAcknowledgementDelay: ShareConsumerSettings[F, K, V] =
+      copy(maxAcknowledgementDelay = None)
+
     override def toString: String =
-      s"ShareConsumerSettings(closeTimeout = $closeTimeout, pollTimeout = $pollTimeout, commitTimeout = $commitTimeout, autoRenewal = $autoRenewal, maxProcessingTime = $maxProcessingTime)"
+      s"ShareConsumerSettings(closeTimeout = $closeTimeout, pollTimeout = $pollTimeout, commitTimeout = $commitTimeout, autoRenewal = $autoRenewal, renewalMargin = $renewalMargin, maxProcessingTime = $maxProcessingTime, maxAcknowledgementDelay = $maxAcknowledgementDelay)"
 
   }
 
@@ -347,15 +390,15 @@ object ShareConsumerSettings {
     Impl(
       keyDeserializer,
       valueDeserializer,
-      Map(
-        "share.acknowledgement.mode" -> "explicit",
-        "share.acquire.mode"         -> "record_limit"
-      ),
+      Map.empty,
       20.seconds,
       50.millis,
       15.seconds,
       autoRenewal = false,
-      maxProcessingTime = None
-    )
+      renewalMargin = 5.seconds,
+      maxProcessingTime = None,
+      maxAcknowledgementDelay = Some(1.second)
+    ).withAcknowledgementMode(ShareAcknowledgementMode.Explicit)
+      .withAcquireMode(ShareAcquireMode.RecordLimit)
 
 }

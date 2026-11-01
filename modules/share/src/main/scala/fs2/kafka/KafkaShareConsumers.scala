@@ -14,7 +14,6 @@ import cats.effect.Async
 import cats.syntax.all.*
 import cats.Reducible
 import fs2.kafka.consumer.{KafkaConsumerLifecycle, KafkaShareSubscription}
-import fs2.kafka.internal.actor.KafkaShareConsumerActor
 import fs2.Stream
 
 /**
@@ -93,11 +92,7 @@ object KafkaShareConsumers {
       override def subscription: F[SortedSet[String]] = values.head.subscription
 
       override def records: Stream[F, AcknowledgeableConsumerRecord[F, K, V]] =
-        Stream
-          .emits(values.toVector)
-          .map(_.polls)
-          .parJoin(values.length)
-          .flatMap(KafkaShareConsumerActor.handOut)
+        Stream.emits(values.toVector).map(_.polls).parJoin(values.length).flatten
 
       override def perConsumerRecords
         : Stream[F, Stream[F, AcknowledgeableConsumerRecord[F, K, V]]] =

@@ -22,12 +22,12 @@ import org.apache.kafka.common.TopicPartition
 sealed abstract class AcknowledgeableOffset[F[_]] { self =>
 
   /**
-    * The topic and partition for the offset and metadata.
+    * The topic and partition of the record.
     */
   def topicPartition: TopicPartition
 
   /**
-    * The offset for the topic and partition. Note there is no metadata for share consumer records
+    * The offset for the topic and partition.
     */
   def offset: Long
 
@@ -39,17 +39,35 @@ sealed abstract class AcknowledgeableOffset[F[_]] { self =>
   private[kafka] def stager: Stager[F]
 
   /**
-    * Stages the decision in the Java consumer, as Java's `acknowledge` does. A later decision for
-    * the record replaces it until the consumer sends it: with its next poll, with
-    * [[KafkaShareConsumer.commit]], or with a renewal or release it sends itself. The consumer
-    * polls as soon as every record of its latest poll has a decision, so a decision made after that
-    * fails with a [[RecordNotInFlightException]], as does one for a delivery the consumer no longer
-    * holds. A decision for a record being renewed waits until a poll returns it, and is dropped if
-    * the renewal fails first, as the record is delivered again. In implicit acknowledgement mode,
-    * it fails with an [[ImplicitAcknowledgementException]].
+    * Stages the decision in the Java consumer, as Java's `acknowledge` does. A later decision
+    * replaces it until it is sent, by the next poll, a commit, or after the
+    * [[ShareConsumerSettings.maxAcknowledgementDelay]]. Once sent, or for a delivery the consumer
+    * no longer holds, a decision fails with a [[RecordNotInFlightException]]. A decision for a
+    * record being renewed waits until a poll returns it. In implicit acknowledgement mode, it fails
+    * with an [[ImplicitAcknowledgementException]].
     */
   final def acknowledge(acknowledgeType: AcknowledgeType): F[Unit] =
     stager.stage(Chunk.singleton(decision(acknowledgeType)))
+
+  /**
+    * Stages an `Accept`: the record was processed. See [[acknowledge]].
+    */
+  final def accept: F[Unit] = acknowledge(AcknowledgeType.Accept)
+
+  /**
+    * Stages a `Release`: the record is delivered again. See [[acknowledge]].
+    */
+  final def release: F[Unit] = acknowledge(AcknowledgeType.Release)
+
+  /**
+    * Stages a `Reject`: the record is not delivered again. See [[acknowledge]].
+    */
+  final def reject: F[Unit] = acknowledge(AcknowledgeType.Reject)
+
+  /**
+    * Renews the record's acquisition lock; it needs another decision later. See [[acknowledge]].
+    */
+  final def renew: F[Unit] = acknowledge(AcknowledgeType.Renew)
 
   private[kafka] def decision(acknowledgeType: AcknowledgeType): Decision =
     Decision(topicPartition, offset, deliveryCount, acknowledgeType)
