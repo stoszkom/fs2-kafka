@@ -19,9 +19,10 @@ import org.apache.kafka.clients.consumer.ConsumerConfig
   * Unlike Java's share consumer, which defaults to `implicit` acknowledgement and `batch_optimized`
   * acquisition, these settings default to `explicit` acknowledgement, where every polled record
   * needs an acknowledgement before the next poll, and `record_limit` acquisition, where a poll
-  * returns at most `max.poll.records` records. Both modes can be changed with [[withProperty]], and
-  * behave as in Java's share consumer. As in Java, records are not renewed automatically unless
-  * enabled with [[withAutoRenewal]], except to let a renewed record be acknowledged.<br><br>
+  * returns at most `max.poll.records` records. Both modes can be changed with
+  * [[withAcknowledgementMode]] and [[withAcquireMode]], and behave as in Java's share consumer. As
+  * in Java, records are not renewed automatically unless enabled with [[withAutoRenewal]], except
+  * to let a renewed record be acknowledged.<br><br>
   *
   * Several convenience functions are provided so that you don't have to work with `String` values
   * and `ConsumerConfig` for configuration. It's still possible to specify `ConsumerConfig` values
@@ -100,6 +101,42 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
     withProperty(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, maxPollRecords.toString)
 
   /**
+    * Returns a new [[ShareConsumerSettings]] instance with the specified acknowledgement mode. This
+    * is equivalent to setting the following property using the [[withProperty]] function.
+    *
+    * {{{
+    * ConsumerConfig.SHARE_ACKNOWLEDGEMENT_MODE_CONFIG
+    * }}}
+    */
+  final def withAcknowledgementMode(
+    mode: ShareAcknowledgementMode
+  ): ShareConsumerSettings[F, K, V] =
+    withProperty(
+      ConsumerConfig.SHARE_ACKNOWLEDGEMENT_MODE_CONFIG,
+      mode match {
+        case ShareAcknowledgementMode.ExplicitAcknowledgement => "explicit"
+        case ShareAcknowledgementMode.ImplicitAcknowledgement => "implicit"
+      }
+    )
+
+  /**
+    * Returns a new [[ShareConsumerSettings]] instance with the specified acquire mode. This is
+    * equivalent to setting the following property using the [[withProperty]] function.
+    *
+    * {{{
+    * ConsumerConfig.SHARE_ACQUIRE_MODE_CONFIG
+    * }}}
+    */
+  final def withAcquireMode(mode: ShareAcquireMode): ShareConsumerSettings[F, K, V] =
+    withProperty(
+      ConsumerConfig.SHARE_ACQUIRE_MODE_CONFIG,
+      mode match {
+        case ShareAcquireMode.RecordLimitAcquire    => "record_limit"
+        case ShareAcquireMode.BatchOptimizedAcquire => "batch_optimized"
+      }
+    )
+
+  /**
     * Returns a new [[ShareConsumerSettings]] instance with the specified max poll interval. This is
     * equivalent to setting the following property using the [[withProperty]] function, except you
     * can specify it with a `FiniteDuration` instead of a `String`.
@@ -162,22 +199,9 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
   def withCommitTimeout(timeout: FiniteDuration): ShareConsumerSettings[F, K, V]
 
   /**
-    * How often we should attempt to call `poll` on the Java `KafkaShareConsumer`. It also limits
-    * the waits between checks for commit confirmations, and is the renewal interval until the
-    * broker reports its acquisition lock duration.<br><br>
-    *
-    * The default value is 50 milliseconds.
-    */
-  def pollInterval: FiniteDuration
-
-  /**
-    * Creates a new [[ShareConsumerSettings]] with the specified [[pollInterval]].
-    */
-  def withPollInterval(interval: FiniteDuration): ShareConsumerSettings[F, K, V]
-
-  /**
-    * How long we should allow the `poll` call to block for in the Java
-    * `KafkaShareConsumer`.<br><br>
+    * How long we should allow the `poll` call to block for in the Java `KafkaShareConsumer`. The
+    * consumer polls again as soon as the previous poll is settled and the stream has taken it, so
+    * this is also how long an idle consumer waits between polls.<br><br>
     *
     * The default value is 50 milliseconds.
     */
@@ -205,9 +229,55 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
     * an acknowledgement waits for a record you renewed are the other records renewed, so that the
     * consumer can poll the renewed record again. Enable it when processing may outlast the lock. A
     * record whose processing hangs is then renewed, and holds back the next poll of its consumer,
-    * until the stream ends.
+    * until the stream ends or the [[maxProcessingTime]] passes.
     */
   def withAutoRenewal(enabled: Boolean): ShareConsumerSettings[F, K, V]
+
+  /**
+    * How long the consumer may hold a record without a decision, or `None` for no limit. A record
+    * held longer is released, so it is delivered again, possibly to another consumer, and a later
+    * decision for it fails with a [[RecordNotInFlightException]]. Its processing is not cancelled.
+    * It applies with explicit acknowledgement, and not to records whose decision was already
+    * requested.<br><br>
+    *
+    * The time counts from when the stream took the record's poll, or from its latest `Renew` by the
+    * user, since the consumer cannot tell when processing starts: a poll is taken as one chunk, and
+    * its records may wait in the stream. Records of a poll the stream has not taken are not
+    * released. Set it well above the time to process a whole poll, that is `max.poll.records` times
+    * the time per record, divided by the parallelism, and above that with several consumers merged
+    * into one pipeline or with `batch_optimized` polls.<br><br>
+    *
+    * Without a limit, a record whose processing hangs is renewed with [[withAutoRenewal]] until the
+    * stream ends, and without automatic renewal it holds back its consumer, as in Java.<br><br>
+    *
+    * The release does not fail the stream, unless the consumer fails to send it, as for any release
+    * or renewal the consumer sends itself. The later `acknowledge` fails with a
+    * [[RecordNotInFlightException]], which [[acknowledgeChunks]] skips. The record is processed
+    * again after its redelivery, so ignoring the failure is usually enough:
+    *
+    * {{{
+    * records.evalMap { committable =>
+    *   process(committable.record) *>
+    *     committable
+    *       .offset
+    *       .acknowledge(AcknowledgeType.Accept)
+    *       .recover { case _: RecordNotInFlightException => () }
+    * }
+    * }}}
+    *
+    * The default value is `None`.
+    */
+  def maxProcessingTime: Option[FiniteDuration]
+
+  /**
+    * Creates a new [[ShareConsumerSettings]] with the specified [[maxProcessingTime]].
+    */
+  def withMaxProcessingTime(time: FiniteDuration): ShareConsumerSettings[F, K, V]
+
+  /**
+    * Creates a new [[ShareConsumerSettings]] without a [[maxProcessingTime]], the default.
+    */
+  def withoutMaxProcessingTime: ShareConsumerSettings[F, K, V]
 
 }
 
@@ -219,9 +289,9 @@ object ShareConsumerSettings {
     properties: Map[String, String],
     closeTimeout: FiniteDuration,
     pollTimeout: FiniteDuration,
-    pollInterval: FiniteDuration,
     commitTimeout: FiniteDuration,
-    autoRenewal: Boolean
+    autoRenewal: Boolean,
+    maxProcessingTime: Option[FiniteDuration]
   ) extends ShareConsumerSettings[F, K, V] {
 
     override def withProperty(key: String, value: String): ShareConsumerSettings[F, K, V] =
@@ -240,11 +310,6 @@ object ShareConsumerSettings {
       copy(pollTimeout = timeout)
     }
 
-    override def withPollInterval(interval: FiniteDuration): ShareConsumerSettings[F, K, V] = {
-      require(interval > Duration.Zero, "poll interval must be positive")
-      copy(pollInterval = interval)
-    }
-
     override def withCommitTimeout(timeout: FiniteDuration): ShareConsumerSettings[F, K, V] = {
       require(timeout > Duration.Zero, "commit timeout must be positive")
       copy(commitTimeout = timeout)
@@ -253,8 +318,16 @@ object ShareConsumerSettings {
     override def withAutoRenewal(enabled: Boolean): ShareConsumerSettings[F, K, V] =
       copy(autoRenewal = enabled)
 
+    override def withMaxProcessingTime(time: FiniteDuration): ShareConsumerSettings[F, K, V] = {
+      require(time > Duration.Zero, "max processing time must be positive")
+      copy(maxProcessingTime = Some(time))
+    }
+
+    override def withoutMaxProcessingTime: ShareConsumerSettings[F, K, V] =
+      copy(maxProcessingTime = None)
+
     override def toString: String =
-      s"ShareConsumerSettings(closeTimeout = $closeTimeout, pollTimeout = $pollTimeout, pollInterval = $pollInterval, commitTimeout = $commitTimeout, autoRenewal = $autoRenewal)"
+      s"ShareConsumerSettings(closeTimeout = $closeTimeout, pollTimeout = $pollTimeout, commitTimeout = $commitTimeout, autoRenewal = $autoRenewal, maxProcessingTime = $maxProcessingTime)"
 
   }
 
@@ -280,9 +353,9 @@ object ShareConsumerSettings {
       ),
       20.seconds,
       50.millis,
-      50.millis,
       15.seconds,
-      autoRenewal = false
+      autoRenewal = false,
+      maxProcessingTime = None
     )
 
 }

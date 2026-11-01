@@ -14,15 +14,15 @@ import cats.effect.{Async, Resource}
 import cats.effect.instances.spawn.*
 import cats.syntax.all.*
 import cats.Reducible
-import fs2.{Pipe, Stream}
+import fs2.{Chunk, Stream}
 import fs2.kafka.consumer.*
-import fs2.kafka.internal.actor.{KafkaShareConsumerActor, ShareCommits, ShareTimeouts}
+import fs2.kafka.internal.actor.{KafkaShareConsumerActor, ShareTimeouts}
 import fs2.kafka.internal.converters.collection.*
 import fs2.kafka.internal.syntax.*
 import fs2.kafka.internal.WithShareConsumer
 
 import org.apache.kafka.clients.consumer.ConsumerConfig
-import org.apache.kafka.common.{Metric, MetricName, TopicPartition, Uuid}
+import org.apache.kafka.common.{KafkaException, Metric, MetricName, TopicPartition, Uuid}
 import org.apache.kafka.common.config.ConfigException
 
 /**
@@ -30,17 +30,20 @@ import org.apache.kafka.common.config.ConfigException
   * `KafkaShareConsumer`. It provides a single top-level [[stream]] of records, in the order they
   * were polled.<br><br>
   *
-  * Records come as [[AcknowledgeableConsumerRecord]]s. Their [[AcknowledgeableOffset]]s are
-  * acknowledged and committed one at a time, in batches with [[AcknowledgedOffsetBatch]], or with
-  * pipes like [[commitPollWithin]].<br><br>
+  * Records come as [[AcknowledgeableConsumerRecord]]s. Acknowledging an [[AcknowledgeableOffset]]
+  * stages the decision in the Java consumer, as Java's `acknowledge` does, one record at a time or
+  * many at once with [[acknowledgeChunks]]. The next poll sends the staged decisions, so
+  * acknowledging every record is enough; [[commit]] sends them earlier and reports the
+  * result.<br><br>
   *
-  * In explicit acknowledgement mode, the default, every record of a poll needs an acknowledgement
-  * before the next poll. A record not acknowledged within its acquisition lock is delivered again,
-  * unless it is renewed, see [[ShareConsumerSettings.withAutoRenewal]].<br><br>
+  * In explicit acknowledgement mode, the default, the consumer polls again once every record of the
+  * previous poll has a decision. A record not acknowledged within its acquisition lock is delivered
+  * again, unless it is renewed, see [[ShareConsumerSettings.withAutoRenewal]].<br><br>
   *
-  * In implicit acknowledgement mode, the next poll accepts the records of the previous one, even
-  * while they are still processed (at-most-once), and acknowledging fails with an
-  * [[ImplicitAcknowledgementException]].<br><br>
+  * In implicit acknowledgement mode, the next poll or commit accepts the records of the previous
+  * poll, and acknowledging fails with an [[ImplicitAcknowledgementException]]. The consumer polls
+  * again once the stream took a poll, so records may still be processing when they are accepted
+  * (at-most-once). Records are not renewed, and the max processing time does not apply.<br><br>
   *
   * A second stream fails with a [[StreamAlreadyStartedException]]. To consume again, create a new
   * consumer. For several consumers in one share group, see [[KafkaShareConsumers]].<br><br>
@@ -50,7 +53,6 @@ import org.apache.kafka.common.config.ConfigException
 sealed abstract class KafkaShareConsumer[F[_], K, V]
     extends KafkaShareConsume[F, K, V]
     with KafkaShareSubscription[F]
-    with KafkaShareCommit[F]
     with KafkaMetrics[F]
     with KafkaConsumerLifecycle[F] {
 
@@ -60,9 +62,14 @@ sealed abstract class KafkaShareConsumer[F[_], K, V]
   def settings: ShareConsumerSettings[F, K, V]
 
   /**
-    * Returns the committer used by the [[AcknowledgeableOffset]]s of this consumer.
+    * Sends every staged decision, as Java's `commitSync` does, and returns the result per
+    * partition. A decision for a record whose renewal was sent is staged only once a poll returns
+    * the record, and then sent at once, so it is not part of a commit made before that. In implicit
+    * mode, it accepts the latest poll once the stream took it; before that, that poll has already
+    * accepted the records handed out, and nothing is committed. Fails with a
+    * [[ShareCommitTimeoutException]] if the broker does not confirm it within the commit timeout.
     */
-  def committer: KafkaShareCommitter[F]
+  def commit: F[Map[TopicPartition, Option[KafkaException]]]
 
   /**
     * Returns the broker's acquisition lock duration, or `None` until it is known.
@@ -81,21 +88,10 @@ sealed abstract class KafkaShareConsumer[F[_], K, V]
   def clientInstanceId(timeout: FiniteDuration): F[Uuid]
 
   /**
-    * Like [[stream]], but leaves marking each record as handed out to the caller.
+    * Like [[stream]], but each poll comes as one chunk with the effect which hands it out, so that
+    * merged polls of several consumers are handed out after the merge.
     */
-  private[kafka] def markableRecords: Stream[F, (AcknowledgeableConsumerRecord[F, K, V], F[Unit])]
-
-  /**
-    * Marks records as handed out as they leave the `Stream`. In explicit acknowledgement mode, a
-    * whole chunk is marked at once, which keeps a poll in one chunk; records a `take` skips are
-    * then released when the consumer closes. In implicit mode, where handing out a poll accepts it,
-    * each record is marked as it leaves.
-    */
-  private[kafka] def handOut: Pipe[
-    F,
-    (AcknowledgeableConsumerRecord[F, K, V], F[Unit]),
-    AcknowledgeableConsumerRecord[F, K, V]
-  ]
+  private[kafka] def polls: Stream[F, (Chunk[AcknowledgeableConsumerRecord[F, K, V]], F[Unit])]
 
 }
 
@@ -104,29 +100,20 @@ object KafkaShareConsumer {
   private def createKafkaShareConsumer[F[_], K, V](
     _settings: ShareConsumerSettings[F, K, V],
     actor: KafkaShareConsumerActor[F, K, V],
-    withConsumer: WithShareConsumer[F]
-  )(implicit F: Async[F]): KafkaShareConsumer[F, K, V] =
+    withConsumer: WithShareConsumer[F],
+    id: Int
+  ): KafkaShareConsumer[F, K, V] =
     new KafkaShareConsumer[F, K, V] {
 
       override val settings: ShareConsumerSettings[F, K, V] = _settings
 
-      override val committer: KafkaShareCommitter[F] = actor.committer
+      override def commit: F[Map[TopicPartition, Option[KafkaException]]] = actor.commit
 
-      override private[kafka] def markableRecords
-        : Stream[F, (AcknowledgeableConsumerRecord[F, K, V], F[Unit])] =
-        actor.entries
+      override private[kafka] def polls
+        : Stream[F, (Chunk[AcknowledgeableConsumerRecord[F, K, V]], F[Unit])] =
+        actor.polls
 
-      override private[kafka] def handOut: Pipe[
-        F,
-        (AcknowledgeableConsumerRecord[F, K, V], F[Unit]),
-        AcknowledgeableConsumerRecord[F, K, V]
-      ] =
-        if (actor.implicitAcknowledgement)
-          _.evalMap { case (record, markEmitted) => markEmitted.as(record) }
-        else _.evalMapChunk { case (record, markEmitted) => markEmitted.as(record) }
-
-      override def stream: Stream[F, AcknowledgeableConsumerRecord[F, K, V]] =
-        markableRecords.through(handOut)
+      override def stream: Stream[F, AcknowledgeableConsumerRecord[F, K, V]] = actor.records
 
       override def stopConsuming: F[Unit] = actor.stopConsuming
 
@@ -137,14 +124,6 @@ object KafkaShareConsumer {
 
       override def subscription: F[SortedSet[String]] =
         withConsumer.blocking(_.subscription().toSortedSet)
-
-      override def commitAsync(
-        offsets: Map[TopicPartition, Map[Long, AcknowledgeType]]
-      ): F[Unit] = actor.commit(ShareCommits.fromOffsets(offsets), sync = false)
-
-      override def commitSync(
-        offsets: Map[TopicPartition, Map[Long, AcknowledgeType]]
-      ): F[Unit] = actor.commit(ShareCommits.fromOffsets(offsets), sync = true)
 
       override def metrics: F[Map[MetricName, Metric]] =
         withConsumer.blocking(_.metrics().asScala.toMap)
@@ -159,7 +138,7 @@ object KafkaShareConsumer {
 
       override def awaitTermination: F[Unit] = actor.awaitTermination
 
-      override def toString: String = "KafkaShareConsumer$" + System.identityHashCode(this)
+      override def toString: String = "KafkaShareConsumer$" + id
 
     }
 
@@ -173,10 +152,16 @@ object KafkaShareConsumer {
     for {
       keyDeserializer   <- settings.keyDeserializer
       valueDeserializer <- settings.valueDeserializer
+      id                <- Resource.eval(F.delay(new Object().hashCode))
       withConsumer      <- WithShareConsumer(mk, settings)
-      actor             <-
-        KafkaShareConsumerActor.resource(settings, keyDeserializer, valueDeserializer, withConsumer)
-    } yield createKafkaShareConsumer(settings, actor, withConsumer)
+      actor             <- KafkaShareConsumerActor.resource(
+                 settings,
+                 keyDeserializer,
+                 valueDeserializer,
+                 withConsumer,
+                 id
+               )
+    } yield createKafkaShareConsumer(settings, actor, withConsumer, id)
 
   /**
     * Creates a new [[KafkaShareConsumer]] in the `Stream` context, using the specified

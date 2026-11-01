@@ -5,7 +5,7 @@ title: Share Consumers
 
 Share consumers read from a Kafka share group ([KIP-932](https://cwiki.apache.org/confluence/display/KAFKA/KIP-932%3A+Queues+for+Kafka)), using the [Java share consumer][java-share-consumer]. Instead of committing one offset per partition, we acknowledge each delivered record, and several consumers can process records from the same partition.
 
-> **Experimental.** The API may change in minor releases. It requires Kafka 4.x brokers with share groups enabled, and renewing acquisition locks requires [KIP-1222](https://cwiki.apache.org/confluence/display/KAFKA/KIP-1222%3A+Acquisition+lock+timeout+renewal+for+share+consumers).
+> **Experimental.** The API may change in minor releases.
 
 Share consumers are in a separate module, which depends on the core module.
 
@@ -13,11 +13,15 @@ Share consumers are in a separate module, which depends on the core module.
 libraryDependencies += "@ORGANIZATION@" %% "@SHARE_MODULE_NAME@" % "@LATEST_VERSION@"
 ```
 
+## Prerequisites
+
+- **Brokers with share groups enabled.** The module uses the Kafka @KAFKA_VERSION@ client and is tested against Kafka 4.3 brokers. Share groups are turned on by the `share.version` feature, which may be off on a new cluster: `kafka-features.sh --bootstrap-server <broker> upgrade --feature share.version=1`. Renewing locks needs a broker with [KIP-1222](https://cwiki.apache.org/confluence/display/KAFKA/KIP-1222%3A+Acquisition+lock+timeout+renewal+for+share+consumers).
+
+- **Where a new share group starts.** A new share group starts at the latest offset, so records published before it existed are not delivered. To start at the beginning, set the group's `share.auto.offset.reset` to `earliest`, for example with `kafka-configs.sh --bootstrap-server <broker> --alter --entity-type groups --entity-name share-workers --add-config share.auto.offset.reset=earliest`, or with `Admin#incrementalAlterConfigs`.
+
 The following imports are assumed throughout this page.
 
 ```scala mdoc:silent
-import scala.concurrent.duration._
-
 import cats.effect._
 import fs2._
 import fs2.kafka._
@@ -58,11 +62,11 @@ val settings = ShareConsumerSettings[IO, String, String]
   .withMaxPollRecords(100)
 ```
 
-The following settings differ from Java's share consumer defaults. Both are Java properties, set with `withProperty`; see [acknowledgement and acquire modes](#acknowledgement-and-acquire-modes).
+The following settings differ from Java's share consumer defaults. Both are Java properties, set with `withAcknowledgementMode` and `withAcquireMode`; see [acknowledgement and acquire modes](#acknowledgement-and-acquire-modes).
 
-- `share.acknowledgement.mode` is set to `explicit`, so every record needs an acknowledgement. Java's default is `implicit`.
+- `share.acknowledgement.mode` is set to `explicit` (`ShareAcknowledgementMode.Explicit`), so every record needs an acknowledgement. Java's default is `implicit`.
 
-- `share.acquire.mode` is set to `record_limit`, so a poll returns at most `max.poll.records` records. Java's default is `batch_optimized`.
+- `share.acquire.mode` is set to `record_limit` (`ShareAcquireMode.RecordLimit`), so a poll returns at most `max.poll.records` records. Java's default is `batch_optimized`.
 
 In addition, there are several settings specific to the library.
 
@@ -70,13 +74,13 @@ In addition, there are several settings specific to the library.
 
 - `withCloseTimeout` controls the timeout when waiting for consumer shutdown. Default is 20 seconds.
 
-- `withCommitTimeout` sets how long to wait for the broker to confirm a commit. Default is 15 seconds. With auto-renewal, it must leave time to renew behind a commit: when `lock - commitTimeout - margin <= 0`, where `margin = min(lock / 10, 1 second)`, the stream fails with a `ConfigException`. The default suits locks of about 17 seconds and longer.
+- `withCommitTimeout` sets how long to wait for the broker to confirm a commit. Default is 15 seconds. With auto-renewal, it must be shorter than the lock, with a small margin, or the stream fails with a `ConfigException`; the default suits locks of about 17 seconds and longer.
+
+- `withMaxProcessingTime` sets how long a record may be held without a decision before it is released, so a hung record does not hold back its consumer. No limit by default. See [renewal](#renewal).
 
 - `withMaxPollRecords` sets the records polled at once, and so held per consumer with `record_limit`. Default is 500.
 
-- `withPollInterval` alters how often `poll` takes place. It is also the renewal interval until the broker reports its lock duration, and caps the waits for commit confirmations. Default is 50 milliseconds.
-
-- `withPollTimeout` modifies for how long `poll` is allowed to block. Default is 50 milliseconds.
+- `withPollTimeout` modifies for how long `poll` is allowed to block. The consumer polls again as soon as the previous poll is settled and the stream has taken it, so there is no poll interval. Default is 50 milliseconds.
 
 ## Record Streaming
 
@@ -91,9 +95,8 @@ val program: IO[Unit] =
     .subscribeTo("jobs")
     .records
     .parEvalMapUnordered(32) { committable =>
-      process(committable.record).as(committable.offset.acknowledge(AcknowledgeType.Accept))
+      process(committable.record) *> committable.offset.acknowledge(AcknowledgeType.Accept)
     }
-    .through(commitPollWithin(1.second))
     .compile
     .drain
 ```
@@ -109,37 +112,40 @@ val program: IO[Unit] =
 
 The record stream of a consumer can be started only once, otherwise it fails with a `StreamAlreadyStartedException`. To consume again, create a new consumer. Unlike with `KafkaConsumer`, a new consumer does not hold back the others, as share groups do not assign partitions exclusively.
 
-## Offset Commits
+## Acknowledging
 
-As in Java, acknowledging and committing are separate steps.
+As in Java, `acknowledge` stages a decision in the consumer, and sends nothing. The consumer polls again once every record of its latest poll has a decision, and that poll sends the staged decisions, so acknowledging every record is enough.
 
-- `offset.acknowledge(AcknowledgeType)` returns an `AcknowledgedOffset` value, and sends nothing.
+- `offset.acknowledge(AcknowledgeType)` stages one decision.
 
-- `AcknowledgedOffset#commit` commits one offset. `AcknowledgedOffsetBatch#commit` commits several, with one call per consumer.
+- `acknowledgeChunks` stages the decisions of each chunk with one call per consumer, which saves work when processing is fast.
 
-- `commitPollWithin(maxDelay)` commits in batches, per consumer: as soon as the offsets cover the consumer's latest poll, so it can poll again, and at most `maxDelay` after the oldest offset arrived. Offsets waiting longer than the renewal interval, about half the lock, are renewed meanwhile, which costs a request and delays their commit. Without auto-renewal, keep `maxDelay` below the lock, or waiting offsets lose it.
+- `KafkaShareConsumer#commit` sends every staged decision at once, as Java's `commitSync` does, and returns the result per partition, as a `Map[TopicPartition, Option[KafkaException]]`. It fails with a `ShareCommitTimeoutException` if the broker does not confirm within the commit timeout.
 
-- `KafkaShareConsumer#commitAsync` and `commitSync` take offsets by topic and partition, with their acknowledge types.
+```scala mdoc:silent
+val chunked: IO[Unit] =
+  KafkaShareConsumer.stream(settings)
+    .subscribeTo("jobs")
+    .records
+    .parEvalMapUnordered(32) { committable =>
+      process(committable.record).as(committable.offset -> (AcknowledgeType.Accept: AcknowledgeType))
+    }
+    .through(acknowledgeChunks[IO])
+    .compile
+    .drain
+```
 
-A commit completes once the broker has confirmed it, and fails with the first error the broker reported. `AcknowledgedOffsetBatch#commitWithResults` returns the result per partition instead, as a `Map[TopicPartition, Option[KafkaException]]`. It still fails when the whole commit fails, for example with a `ShareCommitTimeoutException`. The consumer does not wait for one commit to be confirmed before sending the next, so commits from concurrent callers overlap, up to four groups of them at a time.
+As in Java, the last decision for a record wins until it is sent. Once sent, a later decision fails with a `RecordNotInFlightException`; so does a decision for a delivery the consumer no longer holds: its renewal failed, the consumer released it after the max processing time, or the offset belongs to an earlier delivery. `acknowledgeChunks` skips these, as the record is delivered again.
 
-Errors are reported per partition, so an error fails every acknowledgement of that partition in the same request, even ones that may have been applied.
-
-- `RecordNotInFlightException` means the consumer no longer holds the delivery: it was already acknowledged, its renewal failed, or the offset belongs to an earlier delivery.
-
-- `InvalidRecordStateException`, from the broker, means the record's lock has expired. The consumer does not track lock expiry itself.
-
-- `ShareCommitTimeoutException` means the broker did not confirm within the commit timeout. The acknowledgements may still have been applied.
-
-As in Java, the last decision for a record wins until it is sent. If you commit a `Release` and then an `Accept` for the same record before the consumer sends the first, only the `Accept` is sent, and both commits complete with its result. Whether two separate commits fall in the same window depends on timing: a commit you wait for has been sent, so a later decision for that record fails with `RecordNotInFlightException`.
+Staging succeeds without asking the broker, so a decision for a record whose lock has expired is only rejected when it is sent. The broker's `InvalidRecordStateException` then appears in the results of `commit`; a poll sends decisions without reporting results. Errors are reported per partition, so an error applies to every decision of that partition in the same request.
 
 Delivery is at-least-once, so processing must tolerate redelivery. A failed record can be released for another attempt.
 
 ```scala mdoc:silent
 def processOrRelease(committable: AcknowledgeableConsumerRecord[IO, String, String]): IO[Unit] =
   process(committable.record).attempt.flatMap {
-    case Right(_) => committable.offset.acknowledge(AcknowledgeType.Accept).commit
-    case Left(_)  => committable.offset.acknowledge(AcknowledgeType.Release).commit
+    case Right(_) => committable.offset.acknowledge(AcknowledgeType.Accept)
+    case Left(_)  => committable.offset.acknowledge(AcknowledgeType.Release)
   }
 ```
 
@@ -160,9 +166,9 @@ def processOrReject(
 ): IO[Unit] =
   committable.record.value match {
     case Right(value) =>
-      IO.println(value) *> committable.offset.acknowledge(AcknowledgeType.Accept).commit
+      IO.println(value) *> committable.offset.acknowledge(AcknowledgeType.Accept)
     case Left(_) =>
-      committable.offset.acknowledge(AcknowledgeType.Reject).commit
+      committable.offset.acknowledge(AcknowledgeType.Reject)
   }
 ```
 
@@ -170,13 +176,17 @@ def processOrReject(
 
 A record which is not acknowledged within its acquisition lock, 30 seconds by default, is delivered again, possibly to another consumer, and its later acknowledgement fails. As in Java, records are not renewed automatically, except to let a renewed record be acknowledged, see below. We can renew a record with `Renew`, any number of times before its final acknowledgement.
 
-With `withAutoRenewal(true)`, records without an acknowledgement are renewed at about half of the lock duration, or earlier when the commit timeout or half of `max.poll.interval.ms` requires it. Enable it when processing may outlast the lock. Note that a record whose processing hangs is then renewed, and holds back its consumer, until the stream ends.
+With `withAutoRenewal(true)`, records without an acknowledgement are renewed at about half of the lock duration, or earlier when the commit timeout or half of `max.poll.interval.ms` requires it. Enable it when processing may outlast the lock. Note that a record whose processing hangs is then renewed, and holds back its consumer, until the stream ends, unless you set a max processing time.
 
-- **A slow record holds back its consumer.** Renewing lets the consumer poll again, but Java then returns only the renewed records, and polls new ones only once every record is settled. No setting changes this. Use [several consumers](#several-consumers) to keep polling past slow records.
+- **A slow record holds back its consumer.** Renewing lets the consumer poll again, but Java then returns only the renewed records, and polls new ones only once every record is settled. Use [several consumers](#several-consumers) to keep polling past slow records; `withMaxProcessingTime` only lets go of records that take too long.
 
-- **A renewed record is acknowledged after the next poll.** Java returns it from that poll, and allows the poll only once every other record of the batch is acknowledged or renewed. So while an acknowledgement waits for a renewed record, the consumer renews the other records itself, also without auto-renewal: right away when the broker confirmed the renewal, otherwise at about half of the lock duration, until the renewal resolves. The other records are not handed out again.
+- **A renewed record is acknowledged after the next poll**, as Java lets you decide on it again only once a poll has returned it. A decision made before that waits in the consumer without holding back the caller, and is sent as soon as the poll returns the record. Until then, the consumer renews the other records of the poll so that it can poll, also without auto-renewal. If the renewal fails, the waiting decision is dropped, as the record is delivered again.
 
-- **Without auto-renewal, the consumer does not poll** while a record has no acknowledgement, so keep processing within `max.poll.interval.ms`.
+- **Without auto-renewal, the consumer does not poll** while a record has no acknowledgement, as in Java, so keep processing within the lock and `max.poll.interval.ms`. A record whose lock expired is delivered again, possibly to another consumer, but holds back this consumer until it is decided, or until the max processing time releases it.
+
+- **A record whose processing hangs** can be let go with `withMaxProcessingTime`. A record held without a decision for longer is released and delivered again, and the consumer can poll again once the stream has taken its previous poll. Records of a poll the stream has not taken yet are not released. The time counts from when the stream took the record's poll, or from your latest `Renew` of it, until its decision reaches the consumer, so set it well above the time to process a whole poll. With several consumers merged into one pipeline, or `batch_optimized` polls above `max.poll.records`, records wait behind more records, so allow for that too. Its processing is not cancelled.
+
+- **A late decision fails** with a `RecordNotInFlightException` once the consumer has released the record. One for a record whose lock has expired is rejected by the broker when it is sent, see [acknowledging](#acknowledging). Either way, the record is processed again after its redelivery.
 
 ## Acknowledgement and Acquire Modes
 
@@ -191,14 +201,14 @@ With `withAutoRenewal(true)`, records without an acknowledgement are renewed at 
 
 - **Explicit acknowledgement** is at-least-once when we acknowledge after processing, as above: a record which is not acknowledged is delivered again. Committing `Accept` before processing gives at-most-once.
 
-- **Implicit acknowledgement** is at-most-once here. In a Java poll loop, the next poll comes after processing. A stream polls in the background instead, once every record of the previous poll has been handed out, so records may still be processing, for example in `parEvalMapUnordered`, when they are accepted. A record whose processing fails is not delivered again, similar to `withEnableAutoCommit(true)` on `KafkaConsumer`. Use explicit acknowledgement for at-least-once.
+- **Implicit acknowledgement** is at-most-once here. In a Java poll loop, the next poll comes after processing. A stream polls in the background instead, once it has taken the previous poll, so records may still be processing, for example in `parEvalMapUnordered`, when they are accepted. A record whose processing fails is not delivered again, similar to `withEnableAutoCommit(true)` on `KafkaConsumer`. Use explicit acknowledgement for at-least-once.
 
-With implicit acknowledgement, records are not renewed, as Java does not allow it, and `commitPollWithin`, `AcknowledgedOffsetBatch`, `commitAsync` and `commitSync` fail with an `ImplicitAcknowledgementException`. After `stopConsuming`, the last records are accepted once handed out. When the stream ends before a poll was fully handed out, that poll is not accepted, and closing the consumer releases its records.
+With implicit acknowledgement, records are not renewed, as Java does not allow it, `acknowledge` and `acknowledgeChunks` fail with an `ImplicitAcknowledgementException`, and `commit` accepts the latest poll once the stream has taken it. After `stopConsuming`, the last poll is accepted once the stream has taken it. A poll the stream never took is not accepted, and closing the consumer releases its records; as a poll is taken as one chunk, records skipped by `take` within it are accepted if the consumer polls again before it closes, and released otherwise.
 
 ```scala mdoc:silent
 val atMostOnce: IO[Unit] =
   KafkaShareConsumer
-    .stream(settings.withProperty("share.acknowledgement.mode", "implicit"))
+    .stream(settings.withAcknowledgementMode(ShareAcknowledgementMode.Implicit))
     .subscribeTo("jobs")
     .records
     .parEvalMapUnordered(32)(committable => process(committable.record))
@@ -208,7 +218,7 @@ val atMostOnce: IO[Unit] =
 
 ### Acquisition
 
-The consumer polls again only once the previous poll is acknowledged (explicit) or handed out (implicit), so it never queues more than one poll.
+The consumer polls again only once the stream has taken the previous poll and, in explicit mode, every record of it has a decision, so it never queues more than one poll.
 
 - With `record_limit`, a poll returns at most `max.poll.records` records.
 
@@ -231,9 +241,8 @@ val parallelProgram: IO[Unit] =
       consumers
         .records
         .parEvalMapUnordered(32) { committable =>
-          process(committable.record).as(committable.offset.acknowledge(AcknowledgeType.Accept))
+          process(committable.record) *> committable.offset.acknowledge(AcknowledgeType.Accept)
         }
-        .through(commitPollWithin(1.second))
         .compile
         .drain
   }
@@ -247,22 +256,17 @@ val parallelProgram: IO[Unit] =
 
 When `client.id` is set, consumer `i` uses `client.id-i`.
 
+## Logging
+
+The consumer logs with SLF4J, under `fs2.kafka.KafkaShareConsumer$<id>`, the same id as the consumer's `toString`: polls that return records at debug level, and records released for exceeding the max processing time as warnings.
+
 ## Graceful Shutdown
 
+- `stopConsuming` stops polling. The stream ends once every polled record has a decision, after a final commit sends them; a decision that arrives later fails with a `RecordNotInFlightException`. If that final commit fails, the stream fails, and so does a later `commit`, with its error.
 
-- `stopConsuming` stops polling. The stream ends once every polled record is acknowledged.
+- When the stream ends, records it never handed out are released. In explicit acknowledgement mode, the records of a poll are handed out as one chunk, so operators such as `take` or `prefetch` count the whole chunk as handed out; closing the consumer releases the records they skipped. Auto-renewal stops once the stream ends.
 
-- When the stream ends, records it never handed out are released. In explicit acknowledgement mode, the records of a poll are handed out as one chunk, so operators such as `take` or `prefetch` count the whole chunk as handed out; closing the consumer releases the records they skipped. With auto-renewal, handed-out records are renewed until acknowledged.
-
-- Releasing the resource closes the Java consumer, which releases the records it still holds, and never accepts them automatically. Later commits fail with a `ConsumerShutdownException`.
-
-## Testing Against a Real Broker
-
-`KafkaShareConsumerSpec` starts a Kafka 4.3 broker with testcontainers and enables share groups on it. It needs Docker.
-
-```sh
-sbt 'share/testOnly fs2.kafka.KafkaShareConsumerSpec'
-```
+- Releasing the resource closes the Java consumer, which releases the records it still holds, and never accepts them automatically. Later decisions and commits fail with a `ConsumerShutdownException`.
 
 [acknowledgeableoffset]: @API_BASE_URL@/AcknowledgeableOffset.html
 [acknowledgeablerecord]: @API_BASE_URL@/AcknowledgeableConsumerRecord.html

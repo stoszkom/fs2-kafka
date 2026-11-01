@@ -48,7 +48,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
                 consumer
                   .records
                   .take(1)
-                  .evalMap(_.offset.acknowledge(AcknowledgeType.Accept).commit)
+                  .evalMap(_.offset.acknowledge(AcknowledgeType.Accept))
                   .compile
                   .drain *>
                 (consumer.subscription, consumer.acquisitionLockTimeout, consumer.metrics).tupled
@@ -75,7 +75,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
                   consumer
                     .records
                     .evalMap { r =>
-                      r.offset.acknowledge(AcknowledgeType.Accept).commit *>
+                      r.offset.acknowledge(AcknowledgeType.Accept) *>
                         (consumer.unsubscribe *> consumer.subscribeTo(second))
                           .whenA(r.record.value == "first")
                           .as(r.record.value)
@@ -112,7 +112,6 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
                     consumer.records.compile.drain.attempt <* r
                       .offset
                       .acknowledge(AcknowledgeType.Accept)
-                      .commit
                   )
                   .compile
                   .lastOrError
@@ -135,7 +134,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
             .subscribeTo(topic)
             .records
             .parEvalMapUnordered(4)(r =>
-              r.offset.acknowledge(AcknowledgeType.Accept).commit.as(r.record.value)
+              r.offset.acknowledge(AcknowledgeType.Accept).as(r.record.value)
             )
             .take(produced.size.toLong)
             .compile
@@ -157,8 +156,8 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
             .records
             .take(2)
             .evalMap(r =>
-              if (r.record.value == "0") r.offset.acknowledge(AcknowledgeType.Accept).commit
-              else r.offset.acknowledge(AcknowledgeType.Reject).commit
+              if (r.record.value == "0") r.offset.acknowledge(AcknowledgeType.Accept)
+              else r.offset.acknowledge(AcknowledgeType.Reject)
             )
             .compile
             .drain
@@ -180,8 +179,8 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
             .take(2)
             .zipWithIndex
             .evalMap { case (r, index) =>
-              (if (index == 0L) r.offset.acknowledge(AcknowledgeType.Release).commit
-               else r.offset.acknowledge(AcknowledgeType.Accept).commit).as(
+              (if (index == 0L) r.offset.acknowledge(AcknowledgeType.Release)
+               else r.offset.acknowledge(AcknowledgeType.Accept)).as(
                 r.offset.deliveryCount.toInt
               )
             }
@@ -215,7 +214,6 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
                         bothStarted.get *> r
                           .offset
                           .acknowledge(AcknowledgeType.Accept)
-                          .commit
                           .as(r.record.value)
                     }
                     .compile
@@ -230,70 +228,130 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
   }
 
   describe("acknowledging records") {
-    // A commit timeout far below a broker round trip, so the broker cannot confirm in time.
+    it("should commit staged decisions") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0", "1")
+        val settings = shareConsumerSettings
+        val results  = run(
+          KafkaShareConsumer
+            .resource(settings)
+            .use { consumer =>
+              consumer.subscribeTo(topic) *> consumer
+                .records
+                .zipWithIndex
+                .evalMap {
+                  case (r, 0) => r.offset.acknowledge(AcknowledgeType.Accept).as(None)
+                  case (r, _) => IO.pure(Some(r))
+                }
+                .unNone
+                .take(1)
+                .compile
+                .lastOrError
+                .flatMap(second =>
+                  consumer.commit <* second.offset.acknowledge(AcknowledgeType.Accept)
+                )
+            }
+        )
+        // Both records usually come in one poll, so the commit sends the first's decision; if not,
+        // the poll for the second sent it.
+        results.values.flatten shouldBe empty
+        publish(topic, "after")
+        readUntil(topic, settings, "after") shouldBe Vector("after" -> 1)
+      }
+    }
+    it("should send staged decisions with the next poll, and the last ones when closing") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, (0 until 10).map(_.toString)*)
+        val settings = shareConsumerSettings.withMaxPollRecords(5)
+        run(
+          KafkaShareConsumer
+            .resource(settings)
+            .use { consumer =>
+              consumer.subscribeTo(topic) *> consumer
+                .records
+                .map(_.offset -> (AcknowledgeType.Accept: AcknowledgeType))
+                .take(10)
+                .through(acknowledgeChunks[IO])
+                .compile
+                .drain
+            }
+        )
+        publish(topic, "after")
+        readUntil(topic, settings, "after") shouldBe Vector("after" -> 1)
+      }
+    }
+    it("should let the last of several decisions staged together for a record win") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0")
+        val settings = shareConsumerSettings
+        run(
+          KafkaShareConsumer
+            .resource(settings)
+            .use { consumer =>
+              consumer.subscribeTo(topic) *> consumer
+                .records
+                .take(1)
+                .flatMap(r =>
+                  fs2.Stream(
+                    r.offset -> (AcknowledgeType.Accept: AcknowledgeType),
+                    r.offset -> (AcknowledgeType.Release: AcknowledgeType)
+                  )
+                )
+                .through(acknowledgeChunks[IO])
+                .compile
+                .drain *> consumer.commit
+            }
+        )
+        // The release won, so the record is delivered again (this consumer may poll it once more).
+        val again = readUntil(topic, settings, "0")
+        again.map(_._1) shouldBe Vector("0")
+        again.head._2 should be >= 2
+      }
+    }
+    it("should fail a decision for a delivery whose decision was sent") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0")
+        val late = run(
+          KafkaShareConsumer
+            .resource(shareConsumerSettings)
+            .use { consumer =>
+              consumer.subscribeTo(topic) *> consumer
+                .records
+                .take(1)
+                .evalMap(r =>
+                  r.offset.acknowledge(AcknowledgeType.Accept) *> consumer.commit *>
+                    r.offset.acknowledge(AcknowledgeType.Reject).attempt
+                )
+                .compile
+                .lastOrError
+            }
+        )
+        late.swap.toOption.get shouldBe a[RecordNotInFlightException]
+      }
+    }
+    // A commit timeout far below a broker round trip, so the broker cannot confirm in time. The
+    // second record stays undecided, so that no poll sends the first's decision before the commit.
     it("should fail a commit which the broker does not confirm in time") {
       withTopic { topic =>
         createCustomTopic(topic)
-        publish(topic, "0")
+        publish(topic, "0", "1")
         val result = run(
           KafkaShareConsumer
-            .stream(shareConsumerSettings.withCommitTimeout(1.nano))
-            .subscribeTo(topic)
-            .records
-            .take(1)
-            .evalMap(_.offset.acknowledge(AcknowledgeType.Accept).commit.attempt)
-            .compile
-            .lastOrError
+            .resource(shareConsumerSettings.withCommitTimeout(1.nano).withMaxPollRecords(2))
+            .use { consumer =>
+              consumer.subscribeTo(topic) *> consumer
+                .records
+                .take(1)
+                .evalMap(_.offset.acknowledge(AcknowledgeType.Accept) *> consumer.commit.attempt)
+                .compile
+                .lastOrError
+            }
         )
         result.swap.toOption.get shouldBe a[ShareCommitTimeoutException]
-      }
-    }
-
-    it("should fail a second acknowledgement of a delivery") {
-      withTopic { topic =>
-        createCustomTopic(topic)
-        publish(topic, "0")
-        val (again, renew) = run(
-          KafkaShareConsumer
-            .stream(shareConsumerSettings)
-            .subscribeTo(topic)
-            .records
-            .take(1)
-            .evalMap(r =>
-              r.offset.acknowledge(AcknowledgeType.Accept).commit *> (
-                r.offset.acknowledge(AcknowledgeType.Accept).commit.attempt,
-                r.offset.acknowledge(AcknowledgeType.Renew).commit.attempt
-              ).tupled
-            )
-            .compile
-            .lastOrError
-        )
-        again.swap.toOption.get shouldBe a[RecordNotInFlightException]
-        renew.swap.toOption.get shouldBe a[RecordNotInFlightException]
-      }
-    }
-
-    it("should report a second acknowledgement of a delivery as a result of its partition") {
-      withTopic { topic =>
-        createCustomTopic(topic)
-        publish(topic, "0")
-        val (first, again) = run(
-          KafkaShareConsumer
-            .stream(shareConsumerSettings)
-            .subscribeTo(topic)
-            .records
-            .take(1)
-            .evalMap { r =>
-              val accept = AcknowledgedOffsetBatch
-                .fromFoldable(List(r.offset.acknowledge(AcknowledgeType.Accept)))
-                .commitWithResults
-              (accept, accept).tupled
-            }
-            .compile
-            .lastOrError
-        )
-        first.values.toList shouldBe List(None)
-        again.values.toList.flatten.head shouldBe a[RecordNotInFlightException]
       }
     }
 
@@ -309,12 +367,11 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
             .take(2)
             .evalMapAccumulate(Option.empty[AcknowledgeableOffset[IO]]) {
               case (None, r) =>
-                r.offset.acknowledge(AcknowledgeType.Release).commit.as(Some(r.offset) -> None)
+                r.offset.acknowledge(AcknowledgeType.Release).as(Some(r.offset) -> None)
               case (Some(earlier), r) =>
-                (earlier.acknowledge(AcknowledgeType.Accept).commit.attempt <* r
+                (earlier.acknowledge(AcknowledgeType.Accept).attempt <* r
                   .offset
-                  .acknowledge(AcknowledgeType.Accept)
-                  .commit).map(result => Some(earlier) -> Some(result))
+                  .acknowledge(AcknowledgeType.Accept)).map(result => Some(earlier) -> Some(result))
             }
             .map(_._2)
             .unNone
@@ -325,70 +382,9 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       }
     }
 
-    it("should commit offsets by topic and partition") {
-      withTopic { topic =>
-        createCustomTopic(topic)
-        publish(topic, "0")
-        val settings = shareConsumerSettings
-        val unknown  = run(
-          KafkaShareConsumer
-            .resource(settings)
-            .use { consumer =>
-              consumer.subscribeTo(topic) *>
-                consumer
-                  .records
-                  .take(1)
-                  .evalMap { r =>
-                    val partition = r.offset.topicPartition
-                    consumer
-                      .commitSync(
-                        Map(partition -> Map(r.offset.offset + 1 -> AcknowledgeType.Accept))
-                      )
-                      .attempt <*
-                      consumer.commitAsync(
-                        Map(partition -> Map(r.offset.offset -> AcknowledgeType.Accept))
-                      )
-                  }
-                  .compile
-                  .lastOrError
-            }
-        )
-        unknown.swap.toOption.get shouldBe a[RecordNotInFlightException]
-        publish(topic, "after")
-        readUntil(topic, settings, "after") shouldBe Vector("after" -> 1)
-      }
-    }
-
-    it("should commit a batch, including a renewal and an acceptance of one record") {
-      withTopic { topic =>
-        createCustomTopic(topic)
-        publish(topic, "0", "1", "2")
-        val settings = shareConsumerSettings.withMaxPollRecords(3)
-        run(
-          KafkaShareConsumer
-            .resource(settings)
-            .use { consumer =>
-              consumer.subscribeTo(topic) *>
-                consumer
-                  .records
-                  .take(3)
-                  .flatMap(r =>
-                    fs2
-                      .Stream(AcknowledgeType.Renew, AcknowledgeType.Accept)
-                      .map(r.offset.acknowledge)
-                  )
-                  .compile
-                  .toVector
-                  .flatMap(AcknowledgedOffsetBatch.fromFoldable(_).commit)
-            }
-        )
-        publish(topic, "after")
-        readUntil(topic, settings, "after") shouldBe Vector("after" -> 1)
-      }
-    }
   }
 
-  describe("commitPollWithin") {
+  describe("acknowledgeChunks") {
     it("should settle every record once") {
       withTopic { topic =>
         createCustomTopic(topic, partitions = 2)
@@ -406,13 +402,11 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
                       .records
                       .parEvalMapUnordered(4) { r =>
                         seen
-                          .update(_ :+ (r.record.value -> r.offset.deliveryCount.toInt))
-                          .as(r.offset.acknowledge(AcknowledgeType.Accept))
+                          .updateAndGet(_ :+ (r.record.value -> r.offset.deliveryCount.toInt))
+                          .flatTap(s => consumer.stopConsuming.whenA(s.size >= produced.size))
+                          .as(r.offset -> (AcknowledgeType.Accept: AcknowledgeType))
                       }
-                      .through(commitPollWithin(1.second))
-                      .evalMap(_ =>
-                        seen.get.flatMap(s => consumer.stopConsuming.whenA(s.size >= produced.size))
-                      )
+                      .through(acknowledgeChunks[IO])
                       .compile
                       .drain *> seen.get
                 }
@@ -423,48 +417,35 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       }
     }
 
-    it("should commit as soon as a poll is acknowledged, without waiting for maxDelay") {
+    it("should stage a chunk's decisions with each of its consumers") {
       withTopic { topic =>
+        val other = topic + "-other"
         createCustomTopic(topic)
-        publish(topic, (0 until 6).map(_.toString)*)
-        val elapsed = run(
-          Deferred[IO, FiniteDuration].flatMap { first =>
-            KafkaShareConsumer
-              .stream(shareConsumerSettings.withMaxPollRecords(3))
-              .subscribeTo(topic)
-              .records
-              .evalTap(_ => IO.monotonic.flatMap(first.complete))
-              .map(_.offset.acknowledge(AcknowledgeType.Accept))
-              .through(commitPollWithin(7.seconds))
-              .take(2)
-              .compile
-              .drain *> (IO.monotonic, first.get).mapN(_ - _)
-          }
-        )
-        elapsed should be < 3.seconds
-      }
-    }
-
-    // The unacknowledged record holds back the poll, so the other record's offset waits for
-    // maxDelay, past the renewal interval. It is renewed meanwhile, and committed once.
-    it("should commit an offset which waited past the renewal interval") {
-      withTopic { topic =>
-        createCustomTopic(topic)
-        publish(topic, "0", "1")
-        val settings = shareConsumerSettings.withMaxPollRecords(2).withAutoRenewal(true)
+        createCustomTopic(other)
+        publish(topic, "a")
+        publish(other, "b")
+        val settings = shareConsumerSettings
         run(
-          KafkaShareConsumer
-            .stream(settings)
-            .subscribeTo(topic)
-            .records
-            .filter(_.record.value == "0")
-            .map(_.offset.acknowledge(AcknowledgeType.Accept))
-            .through(commitPollWithin(lock))
-            .take(1)
-            .compile
-            .drain
+          (KafkaShareConsumer.resource(settings), KafkaShareConsumer.resource(settings))
+            .tupled
+            .use { case (first, second) =>
+              first.subscribeTo(topic) *> second.subscribeTo(other) *>
+                (first.records.take(1).compile.toList, second.records.take(1).compile.toList)
+                  .parTupled
+                  .flatMap { case (a, b) =>
+                    fs2
+                      .Stream
+                      .emits((a ++ b).map(_.offset -> (AcknowledgeType.Accept: AcknowledgeType)))
+                      .through(acknowledgeChunks[IO])
+                      .compile
+                      .drain
+                  } *> first.commit *> second.commit
+            }
         )
-        readUntil(topic, settings, "1") shouldBe Vector("1" -> 2)
+        publish(topic, "after")
+        publish(other, "after")
+        readUntil(topic, settings, "after") shouldBe Vector("after" -> 1)
+        readUntil(other, settings, "after") shouldBe Vector("after" -> 1)
       }
     }
   }
@@ -505,16 +486,6 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       }
     }
 
-    it("should not accept a poll whose records were not all handed out when the stream ends") {
-      withTopic { topic =>
-        createCustomTopic(topic)
-        publish(topic, "0", "1", "2")
-        val settings = implicitSettings
-        run(KafkaShareConsumer.stream(settings).subscribeTo(topic).records.take(1).compile.drain)
-        readUntil(topic, explicitly(settings), "2").map(_._2) shouldBe Vector(2, 2, 2)
-      }
-    }
-
     it("should fail acknowledgements with an ImplicitAcknowledgementException") {
       withTopic { topic =>
         createCustomTopic(topic)
@@ -524,12 +495,35 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
             .stream(implicitSettings)
             .subscribeTo(topic)
             .records
-            .evalMap(_.offset.acknowledge(AcknowledgeType.Accept).commit.attempt)
+            .evalMap(_.offset.acknowledge(AcknowledgeType.Accept).attempt)
             .take(1)
             .compile
             .lastOrError
         )
         result.swap.toOption.get shouldBe an[ImplicitAcknowledgementException]
+      }
+    }
+    it("should not check the commit timeout against the lock in implicit mode") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0")
+        val settings = shareConsumerSettings
+          .withAcknowledgementMode(ShareAcknowledgementMode.Implicit)
+          .withAutoRenewal(true)
+          .withCommitTimeout(lock)
+        val values = run(
+          KafkaShareConsumer
+            .resource(settings)
+            .use { consumer =>
+              consumer.subscribeTo(topic) *> consumer
+                .records
+                .evalTap(_ => consumer.stopConsuming)
+                .map(_.record.value)
+                .compile
+                .toList
+            }
+        )
+        values shouldBe List("0")
       }
     }
   }
@@ -552,7 +546,6 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
             .evalMap(r =>
               r.offset
                 .acknowledge(AcknowledgeType.Accept)
-                .commit
                 .as(r.record.value -> r.offset.deliveryCount.toInt)
             )
             .take(produced.size.toLong)
@@ -566,6 +559,104 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
   }
 
   describe("renewal") {
+    it("should stage a decision made right after a renewal once the record is returned") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0")
+        val settings = shareConsumerSettings
+        run(
+          KafkaShareConsumer
+            .resource(settings)
+            .use { consumer =>
+              consumer.subscribeTo(topic) *> consumer
+                .records
+                .take(1)
+                .evalMap(r =>
+                  r.offset.acknowledge(AcknowledgeType.Renew) *>
+                    r.offset.acknowledge(AcknowledgeType.Accept)
+                )
+                .compile
+                .drain *> IO.sleep(2.seconds) *> consumer.commit
+            }
+        )
+        publish(topic, "after")
+        readUntil(topic, settings, "after") shouldBe Vector("after" -> 1)
+      }
+    }
+    it("should send a decision for a renewed record while another record is slow") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0", "1")
+        val settings = shareConsumerSettings
+        run(
+          KafkaShareConsumer
+            .resource(settings)
+            .use { consumer =>
+              consumer.subscribeTo(topic) *> consumer
+                .records
+                .take(2)
+                .parEvalMapUnordered(2) { r =>
+                  if (r.record.value == "0")
+                    r.offset.acknowledge(AcknowledgeType.Renew) *> IO.sleep(1.second) *>
+                      r.offset.acknowledge(AcknowledgeType.Accept)
+                  else IO.sleep(lock * 4 / 3) *> r.offset.acknowledge(AcknowledgeType.Accept)
+                }
+                .compile
+                .drain *> consumer.commit
+            }
+        )
+        publish(topic, "after")
+        readUntil(topic, settings, "after") shouldBe Vector("after" -> 1)
+      }
+    }
+    it("should release a record held past the max processing time") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0")
+        val settings = shareConsumerSettings
+        val late     = run(
+          KafkaShareConsumer
+            .resource(settings.withMaxProcessingTime(3.seconds))
+            .use { consumer =>
+              consumer.subscribeTo(topic) *> consumer
+                .records
+                .take(1)
+                .evalMap(r =>
+                  IO.sleep(5.seconds) *> r.offset.acknowledge(AcknowledgeType.Accept).attempt
+                )
+                .compile
+                .lastOrError
+            }
+        )
+        late.swap.toOption.get shouldBe a[RecordNotInFlightException]
+        readUntil(topic, settings, "0").map(_._1) shouldBe Vector("0")
+      }
+    }
+    it("should count the max processing time from the user's latest renewal") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0")
+        val settings = shareConsumerSettings
+        val result   = run(
+          KafkaShareConsumer
+            .resource(settings.withMaxProcessingTime(3.seconds))
+            .use { consumer =>
+              consumer.subscribeTo(topic) *> consumer
+                .records
+                .take(1)
+                .evalMap(r =>
+                  IO.sleep(2.seconds) *> r.offset.acknowledge(AcknowledgeType.Renew) *>
+                    IO.sleep(2.seconds) *> r.offset.acknowledge(AcknowledgeType.Accept).attempt
+                )
+                .compile
+                .lastOrError <* consumer.commit
+            }
+        )
+        result shouldBe Right(())
+        publish(topic, "after")
+        readUntil(topic, settings, "after") shouldBe Vector("after" -> 1)
+      }
+    }
     it("should renew a record automatically while it is processed past its lock") {
       withTopic { topic =>
         createCustomTopic(topic)
@@ -581,7 +672,6 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
               IO.sleep(lock + 1.second) *> r
                 .offset
                 .acknowledge(AcknowledgeType.Accept)
-                .commit
                 .as(r.offset.deliveryCount.toInt)
             )
             .compile
@@ -605,8 +695,9 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
             .records
             .take(1)
             .evalMap(r =>
-              (IO.sleep(lock / 3) *> r.offset.acknowledge(AcknowledgeType.Renew).commit)
-                .replicateA_(4) *> r.offset.acknowledge(AcknowledgeType.Accept).commit
+              (IO.sleep(lock / 3) *> r.offset.acknowledge(AcknowledgeType.Renew)).replicateA_(
+                4
+              ) *> r.offset.acknowledge(AcknowledgeType.Accept)
             )
             .compile
             .drain
@@ -616,55 +707,32 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       }
     }
 
-    it("should lose a record past its lock without renewal") {
+    // The consumer does not track lock expiry itself, so the broker reports the error. The second
+    // record stays undecided, so that the commit sends the first's decision.
+    it("should lose a record past its lock without renewal, with the broker's error") {
       withTopic { topic =>
         createCustomTopic(topic)
-        publish(topic, "0")
-        val settings = shareConsumerSettings
-        val late     = run(
+        publish(topic, "0", "1")
+        val settings = shareConsumerSettings.withMaxPollRecords(2)
+        val results  = run(
           KafkaShareConsumer
-            .stream(settings.withAutoRenewal(false))
-            .subscribeTo(topic)
-            .records
-            .evalMap(r =>
-              IO.sleep(lock + 1.second) *> r
-                .offset
-                .acknowledge(AcknowledgeType.Accept)
-                .commit
-                .attempt
-            )
-            .take(1)
-            .compile
-            .lastOrError
-        )
-        late.swap.toOption.get shouldBe an[InvalidRecordStateException]
-        all(readUntil(topic, settings, "0").map(_._2)) should be >= 2
-      }
-    }
-
-    // The consumer does not track lock expiry itself, so the broker reports the error.
-    it("should report the broker's error for a record whose lock expired") {
-      withTopic { topic =>
-        createCustomTopic(topic)
-        publish(topic, "0")
-        val results = run(
-          KafkaShareConsumer
-            .stream(shareConsumerSettings.withAutoRenewal(false))
-            .subscribeTo(topic)
-            .records
-            .take(1)
-            .evalMap(r =>
-              IO.sleep(lock + 1.second) *>
-                AcknowledgedOffsetBatch
-                  .fromFoldable(List(r.offset.acknowledge(AcknowledgeType.Accept)))
-                  .commitWithResults
-            )
-            .compile
-            .lastOrError
+            .resource(settings.withAutoRenewal(false))
+            .use { consumer =>
+              consumer.subscribeTo(topic) *> consumer
+                .records
+                .take(1)
+                .evalMap(r =>
+                  IO.sleep(lock + 1.second) *> r.offset.acknowledge(AcknowledgeType.Accept) *>
+                    consumer.commit
+                )
+                .compile
+                .lastOrError
+            }
         )
         val error = results.values.toList.flatten.head
         error shouldBe an[InvalidRecordStateException]
         error should not be a[RecordNotInFlightException]
+        all(readUntil(topic, settings, "1").map(_._2)) should be >= 2
       }
     }
 
@@ -680,10 +748,9 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
               .records
               .evalTap(_ => IO.monotonic.flatMap(first.complete))
               .evalMap(r =>
-                r.offset.acknowledge(AcknowledgeType.Renew).commit *> r
+                r.offset.acknowledge(AcknowledgeType.Renew) *> r
                   .offset
                   .acknowledge(AcknowledgeType.Accept)
-                  .commit
               )
               .take(2)
               .compile
@@ -711,9 +778,9 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
                   if (r.record.value == "0")
                     IO.sleep(lock + 1.second) *> accepted
                       .get
-                      .flatTap(_ => r.offset.acknowledge(AcknowledgeType.Accept).commit)
+                      .flatTap(_ => r.offset.acknowledge(AcknowledgeType.Accept))
                   else
-                    r.offset.acknowledge(AcknowledgeType.Accept).commit *> accepted
+                    r.offset.acknowledge(AcknowledgeType.Accept) *> accepted
                       .update(_ :+ r.record.value)
                       .as(Vector.empty[String])
                 }
@@ -731,6 +798,51 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
   }
 
   describe("stopping") {
+    it("should release the records of a poll the stream never took") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, (0 until 4).map(_.toString)*)
+        // The stream ends after the first poll, so a second poll, if any, is never taken.
+        val settings          = shareConsumerSettings.withMaxPollRecords(2)
+        val (elapsed, others) = run(
+          KafkaShareConsumer
+            .resource(settings)
+            .use { consumer =>
+              consumer.subscribeTo(topic) *> consumer
+                .records
+                .take(2)
+                .evalMap(_.offset.acknowledge(AcknowledgeType.Accept))
+                .compile
+                .drain *> IO.delay(readUntil(topic, settings, "3")).timed
+            }
+        )
+        elapsed should be < lock
+        others.map(_._1).toSet shouldBe Set("2", "3")
+      }
+    }
+    it("should send the last decisions before finishing after stopping") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0")
+        val settings = shareConsumerSettings
+        val results  = run(
+          KafkaShareConsumer
+            .resource(settings)
+            .use { consumer =>
+              consumer.subscribeTo(topic) *> consumer
+                .records
+                .evalMap(r =>
+                  consumer.stopConsuming *> r.offset.acknowledge(AcknowledgeType.Accept)
+                )
+                .compile
+                .drain *> consumer.commit
+            }
+        )
+        results.values.flatten shouldBe empty
+        publish(topic, "after")
+        readUntil(topic, settings, "after") shouldBe Vector("after" -> 1)
+      }
+    }
     it("should drain the records already polled on stopConsuming") {
       withTopic { topic =>
         createCustomTopic(topic)
@@ -747,7 +859,6 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
                     consumer.stopConsuming *> r
                       .offset
                       .acknowledge(AcknowledgeType.Accept)
-                      .commit
                       .as(r.record.value)
                   )
                   .compile
@@ -772,7 +883,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
             .subscribeTo(topic)
             .records
             .take(1)
-            .evalMap(_.offset.acknowledge(AcknowledgeType.Accept).commit)
+            .evalMap(_.offset.acknowledge(AcknowledgeType.Accept))
             .compile
             .drain
         )
@@ -819,7 +930,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
                 consumers
                   .records
                   .parEvalMapUnordered(8)(r =>
-                    r.offset.acknowledge(AcknowledgeType.Accept).commit.as(r.record.value)
+                    r.offset.acknowledge(AcknowledgeType.Accept).as(r.record.value)
                   )
                   .take(produced.size.toLong)
                   .compile
@@ -846,7 +957,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
                   .perConsumerRecords
                   .map(
                     _.parEvalMapUnordered(4)(r =>
-                      r.offset.acknowledge(AcknowledgeType.Accept).commit.as(r.record.value)
+                      r.offset.acknowledge(AcknowledgeType.Accept).as(r.record.value)
                     )
                   )
                   .parJoinUnbounded

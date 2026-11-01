@@ -18,11 +18,10 @@ import cats.syntax.traverse.*
 
 /**
   * [[AcknowledgeableConsumerRecord]] is a Kafka record along with an instance of
-  * [[AcknowledgeableOffset]], which can be used to acknowledge this record offset. Once an offset
-  * is acknowledged it can be committed. In explicit acknowledgement mode, the default in this
-  * library, every record of a poll needs to be acknowledged and committed before its consumer can
-  * poll new records. [[AcknowledgedOffset]]s are normally committed in batches, either using
-  * [[AcknowledgedOffsetBatch]] or via pipes like [[commitPollWithin]].
+  * [[AcknowledgeableOffset]], which stages a decision for the record in its consumer. In explicit
+  * acknowledgement mode, the default in this library, every record of a poll needs a decision
+  * before its consumer can poll new records; the next poll sends the decisions. Decisions for many
+  * records can be staged together with [[acknowledgeChunks]].
   *
   * In implicit acknowledgement mode, records cannot be acknowledged. Instead, the consumer polls
   * again once every record of the previous poll has been emitted by the stream, and that poll
@@ -41,8 +40,7 @@ sealed abstract class AcknowledgeableConsumerRecord[F[_], +K, +V] { self =>
   def record: ConsumerRecord[K, V]
 
   /**
-    * An [[AcknowledgeableOffset]] instance, providing a way to acknowledge the [[record]] offset.
-    * The acknowledgement gives us an [[AcknowledgedOffset]], which can be committed to Kafka.
+    * An [[AcknowledgeableOffset]] instance, providing a way to acknowledge the [[record]].
     */
   def offset: AcknowledgeableOffset[F]
 

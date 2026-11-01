@@ -31,13 +31,33 @@ final class ShareConsumerSettingsSpec extends BaseSpec {
       )
       settings.autoRenewal shouldBe false
       settings.withAutoRenewal(true).autoRenewal shouldBe true
+      settings.maxProcessingTime shouldBe None
+      settings.withMaxProcessingTime(1.minute).maxProcessingTime shouldBe Some(1.minute)
+      settings
+        .withMaxProcessingTime(1.minute)
+        .withoutMaxProcessingTime
+        .maxProcessingTime shouldBe None
+    }
+
+    it("should set the acknowledgement and acquire modes") {
+      settings
+        .withAcknowledgementMode(ShareAcknowledgementMode.Implicit)
+        .withAcquireMode(ShareAcquireMode.BatchOptimized)
+        .properties shouldBe Map(
+        "share.acknowledgement.mode" -> "implicit",
+        "share.acquire.mode"         -> "batch_optimized"
+      )
+      settings
+        .withAcknowledgementMode(ShareAcknowledgementMode.Explicit)
+        .withAcquireMode(ShareAcquireMode.RecordLimit)
+        .properties shouldBe settings.properties
     }
 
     it("should reject invalid timeouts") {
       intercept[IllegalArgumentException](settings.withCloseTimeout((-1).second))
       intercept[IllegalArgumentException](settings.withPollTimeout(Duration.Zero))
-      intercept[IllegalArgumentException](settings.withPollInterval(Duration.Zero))
       intercept[IllegalArgumentException](settings.withCommitTimeout(Duration.Zero))
+      intercept[IllegalArgumentException](settings.withMaxProcessingTime(Duration.Zero))
     }
 
     it("should use a 15 second commit timeout while the lock is unknown") {

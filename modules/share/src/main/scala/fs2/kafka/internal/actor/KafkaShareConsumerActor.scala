@@ -6,6 +6,8 @@
 
 package fs2.kafka.internal.actor
 
+import java.util.concurrent.ConcurrentLinkedQueue
+
 import scala.concurrent.duration.*
 
 import cats.effect.{Async, Deferred, Outcome, Ref, Resource}
@@ -17,108 +19,76 @@ import fs2.kafka.internal.converters.collection.*
 import fs2.kafka.internal.syntax.*
 import fs2.kafka.internal.WithShareConsumer
 
-import org.apache.kafka.clients.consumer.ConsumerConfig
+import org.apache.kafka.clients.consumer.AcknowledgementCommitCallback
+import org.apache.kafka.common.{KafkaException, TopicIdPartition, TopicPartition}
 import org.apache.kafka.common.errors.TimeoutException
-import org.apache.kafka.common.TopicPartition
 
 /**
-  * [[KafkaShareConsumerActor]] wraps a Java `KafkaShareConsumer` and works like a traditional
-  * actor: it receives requests one-at-a-time via a queue. It hands out each poll as one chunk and
-  * commits acknowledgements as they arrive.
+  * Polls a Java share consumer in explicit acknowledgement mode, and stages each decision in it as
+  * it arrives. Java sends staged decisions with the next poll, or with a commit, and lets the last
+  * staged decision for a record win until then, so the actor mostly tracks which records of the
+  * latest poll have a decision: it polls again once all do.
   *
-  * ==Polling==
-  *
-  * In explicit mode, the actor polls once every record of the previous poll is acknowledged.
-  * Records polled after stopping, or never handed out before the stream ended, are released.
-  *
-  * ==Commit flow==
-  *
-  * Commits run in rounds, see [[processCommits]]. A round is sent without waiting for its results,
-  * which Java reports to one callback during later consumer calls; up to `maxSentRounds` rounds of
-  * commit requests wait for results at once. Only a failure to send the actor's own renewals and
-  * releases fails the stream.
-  *
-  * ==Renewal flow==
-  *
-  * With automatic renewal, unacknowledged records are renewed before their lock expires, so the
-  * actor can poll; Java returns them from the next poll. Each step, the actor does one of two
-  * things: renew records whose time has come, or process the commits users requested. A timed-out
-  * renewal may still complete, so its record is kept.
-  *
-  * ==Implicit acknowledgement==
-  *
-  * See [[implicitStep]].
+  * Renewals are the exception, as Java lets a renewed record be decided again only once a poll has
+  * returned it. A renewal is sent at once, so the lock is extended while other records are still
+  * processed; a decision for a renewed record waits in the actor until a poll returns the record,
+  * without holding back its caller, and the returned record is not handed out again.
   */
-final private[kafka] class KafkaShareConsumerActor[F[_], K, V] private (
-  settings: ShareConsumerSettings[F, K, V],
+final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
+  config: ShareActorConfig[F, K, V],
   keyDeserializer: KeyDeserializer[F, K],
   valueDeserializer: ValueDeserializer[F, V],
   withConsumer: WithShareConsumer[F],
-  requests: Queue[F, ShareRequest[F]],
-  output: Queue[F, Option[Chunk[KafkaShareConsumerActor.Entry[F, K, V]]]],
-  pendingRef: Ref[F, Int],
+  requests: Queue[F, KafkaShareConsumerActor.Request[F]],
+  output: Queue[F, Option[(Long, Chunk[AcknowledgeableConsumerRecord[F, K, V]])]],
   readerStarted: Ref[F, Boolean],
   shutdown: Deferred[F, Unit],
   finished: Deferred[F, Either[Throwable, Unit]],
-  maxPollInterval: FiniteDuration,
-  apiTimeout: FiniteDuration,
-  implicitMode: Boolean,
-  batchOptimized: Boolean,
-  maxPollRecords: Int
-)(implicit F: Async[F]) {
+  drained: Ref[F, Option[Either[Throwable, Map[TopicPartition, Option[KafkaException]]]]]
+)(implicit F: Async[F], logging: ShareLogging[F])
+    extends Stager[F] {
 
   import KafkaShareConsumerActor.*
-  import ShareCommits.*
-  import ShareTimeouts.*
+  import config.{
+    apiTimeout,
+    batchOptimized,
+    implicitMode,
+    maxPollInterval,
+    maxPollRecords,
+    settings
+  }
 
-  private type State = ShareState[F]
-
-  private val client = new ShareCommitClient[F](withConsumer)
-
-  // Whether Java accepts a poll's records once they are handed out.
-  private[kafka] val implicitAcknowledgement: Boolean = implicitMode
-
-  val committer: KafkaShareCommitter[F] =
-    KafkaShareCommitter(
-      commitOffsets = offsets => commit(fromOffsets(offsets), sync = false),
-      commitDeliveries = offsets => commit(fromAcknowledged(offsets), sync = false),
-      commitDeliveriesWithResults =
-        offsets => commitWithResults(fromAcknowledged(offsets), sync = false),
-      pendingRecords = pendingRef.get
-    )
-
-  /**
-    * Commits the acknowledgements, failing with the first error. See [[commitWithResults]].
-    */
-  def commit(acknowledgements: Chunk[ShareRequest.Ack], sync: Boolean): F[Unit] =
-    commitWithResults(acknowledgements, sync).flatMap(firstError(_).traverse_(F.raiseError[Unit]))
-
-  /**
-    * Commits the acknowledgements, completing with the result per partition. Fails when the whole
-    * request fails or the actor ends first.
-    */
-  def commitWithResults(
-    acknowledgements: Chunk[ShareRequest.Ack],
-    sync: Boolean
-  ): F[CommitResult] =
-    if (acknowledgements.isEmpty) F.pure(Map.empty)
+  // Once the actor has finished after stopping, it holds no records, so a decision is for a record
+  // not in flight.
+  override def stage(decisions: Chunk[Decision]): F[Unit] =
+    if (decisions.isEmpty) F.unit
+    else if (implicitMode) F.raiseError(ImplicitAcknowledgementException())
     else
-      Deferred[F, Either[Throwable, CommitResult]].flatMap { done =>
-        requests.offer(ShareRequest.Commit(acknowledgements, sync, done.complete(_).void)) *>
-          F.race(finished.get, done.get)
-            .flatMap {
-              case Right(result)     => result.liftTo[F]
-              case Left(termination) =>
-                val ended = termination.fold(identity, _ => ConsumerShutdownException())
-                done.tryGet.flatMap(_.fold(F.raiseError[CommitResult](ended))(_.liftTo[F]))
-            }
-      }
+      ask[Unit](
+        Request.Stage(decisions, _),
+        _ =>
+          Left(
+            RecordNotInFlightException(decisions.head.get.topicPartition, decisions.head.get.offset)
+          )
+      )
+
+  // Commits every staged decision, as Java's `commitSync` does, with the result per partition.
+  // Decisions waiting for a renewed record are staged once a poll returns it, so they are not
+  // included. After the actor finished, it is the result of its final commit.
+  def commit: F[Map[TopicPartition, Option[KafkaException]]] =
+    ask(Request.Commit(_), identity)
+
+  def stopConsuming: F[Unit] = finished
+    .tryGet
+    .flatMap(_.fold(requests.offer(Request.Stop()))(_ => F.unit))
+
+  def records: Stream[F, AcknowledgeableConsumerRecord[F, K, V]] = polls.flatMap(handOut[F, K, V])
 
   /**
-    * Emits the records, each with an action marking it as handed out, so a merge of several
-    * consumers marks records only once they leave it.
+    * The polls, each with the effect which hands it out. A poll counts as handed out once the
+    * stream takes its chunk, so merged polls of several consumers are handed out after the merge.
     */
-  def entries: Stream[F, (AcknowledgeableConsumerRecord[F, K, V], F[Unit])] =
+  def polls: Stream[F, (Chunk[AcknowledgeableConsumerRecord[F, K, V]], F[Unit])] =
     Stream
       .eval(readerStarted.getAndSet(true))
       .flatMap {
@@ -127,56 +97,444 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V] private (
           val failed = finished
             .get
             .flatMap(_.fold(e => F.pure(e.asLeft[Unit]), _ => F.never[Either[Throwable, Unit]]))
-          Stream.exec(requests.offer(ShareRequest.Start())) ++
+          Stream.exec(requests.offer(Request.Start())) ++
             Stream
               .fromQueueNoneTerminated(output)
-              .flatMap(Stream.chunk)
-              .map(entry =>
-                entry.record -> (entry.emitted.set(true) *> requests
-                  .offer(ShareRequest.HandedOut())
-                  .whenA(implicitMode))
-              )
-              .onFinalize(requests.offer(ShareRequest.ReaderClosed()))
+              .map { case (id, chunk) => chunk -> requests.offer(Request.HandedOut(id)) }
+              .onFinalize(requests.offer(Request.ReaderClosed()))
               .interruptWhen(failed)
       }
-
-  def stopConsuming: F[Unit] = requests.offer(ShareRequest.Stop())
 
   def awaitTermination: F[Unit] = finished.get.rethrow
 
   def terminate: F[Unit] = shutdown.complete(()) *> finished.get.void
 
-  private def receive(state: State, request: ShareRequest[F]): F[State] =
+  // Sends a request and waits for its answer, or for the actor to end: then the answer comes from
+  // `afterDrain` with the final commit's result if it finished after stopping, or else it is the
+  // reason it ended.
+  private def ask[A](
+    request: (Either[Throwable, A] => F[Unit]) => Request[F],
+    afterDrain: Either[Throwable, Map[TopicPartition, Option[KafkaException]]] => Either[
+      Throwable,
+      A
+    ]
+  ): F[A] = {
+    def afterEnd(ended: Either[Throwable, Unit]): F[A] =
+      drained
+        .get
+        .flatMap {
+          // Also after a failed final commit, which `drained` holds.
+          case Some(last) => afterDrain(last).liftTo[F]
+          case _          =>
+            F.raiseError[A](ended.fold(identity, _ => ConsumerShutdownException()))
+        }
+    // Once the actor ended, nothing takes requests, so they are not queued.
+    finished
+      .tryGet
+      .flatMap {
+        case Some(ended) => afterEnd(ended)
+        case None        =>
+          Deferred[F, Either[Throwable, A]].flatMap { done =>
+            requests.offer(request(done.complete(_).void)) *>
+              F.race(finished.get, done.get)
+                .flatMap {
+                  case Right(result) => result.liftTo[F]
+                  case Left(ended)   =>
+                    done.tryGet.flatMap(_.fold(afterEnd(ended))(_.liftTo[F]))
+                }
+          }
+      }
+  }
+
+  // --- Renewal results ---
+
+  private val failedRenewals = new ConcurrentLinkedQueue[(TopicPartition, Set[Long])]()
+
+  // Java reports the results of sent decisions to this callback during consumer calls. Only a
+  // failed renewal matters to the actor: its record lost its lock, so it is no longer held.
+  private val callback: AcknowledgementCommitCallback = (offsets, error) =>
+    if (error != null)
+      offsets
+        .asScala
+        .foreach { case (partition, values) =>
+          failedRenewals.add(partition.topicPartition -> values.asScala.map(_.longValue).toSet)
+        }
+
+  // A renewal whose result Java never reported, so its record never came back, is given up once
+  // its lock and Kafka's API timeout have passed: the record is delivered again.
+  private def withoutUnreported(
+    state: State,
+    lock: Option[FiniteDuration],
+    now: FiniteDuration
+  ): State = {
+    val limit = lock.fold(apiTimeout)(_.max(apiTimeout))
+    state.withoutRenewing(state.renewing.filter(p => state.held(p).lockedSince + limit <= now))
+  }
+
+  private def dropFailedRenewals(state: State): F[State] =
+    F.delay(Iterator.continually(failedRenewals.poll()).takeWhile(_ != null).toVector)
+      .map(_.foldLeft(state) { case (s, (partition, offsets)) =>
+        s.withoutRenewing(offsets.map(partition -> _))
+      })
+
+  // --- Requests ---
+
+  private def receive(state: State, request: Request[F]): F[State] =
     request match {
-      case ShareRequest.Start() if state.started => F.pure(state)
-      case ShareRequest.Start()                  =>
+      case Request.Start() =>
         withConsumer
           .blocking(_.subscription().isEmpty)
-          .ifM(F.raiseError(NotSubscribedException()), F.pure(state.withStarted))
-      case ShareRequest.Stop()                   => F.pure(state.withStopping)
-      case ShareRequest.HandedOut()              => F.pure(state)
-      case ShareRequest.ReaderClosed()           => F.pure(state.withReaderClosed)
-      case commit @ ShareRequest.Commit(_, _, _) => F.pure(state.withCommit(commit))
+          .ifM(F.raiseError(NotSubscribedException()), F.pure(state.copy(started = true)))
+      case Request.Stop()                 => F.pure(state.copy(stopping = true))
+      case Request.HandedOut(id)          => F.monotonic.map(state.withHandedOut(id, _))
+      case Request.ReaderClosed()         => releaseUnpulled(state.copy(readerClosed = true))
+      case Request.Stage(decisions, done) =>
+        stageAll(state, Vector(decisions -> done), send = false, byUser = true)
+      case Request.Commit(done) => commit(state, done)
     }
 
-  private def awaitRequest(state: State): F[State] =
-    requests.take.flatMap(receive(state, _))
+  // Records of a poll the stream never took are released, so other consumers get them; renewing
+  // ones once a poll returns them. Java can't release them in implicit mode, where the poll stays
+  // unpulled, so that it is not accepted; closing the consumer releases it.
+  private def releaseUnpulled(state: State): F[State] = {
+    val undecided = state.undecided.map(_._1).toSet
+    val unpulled  = state.unpulled.filter(undecided).toVector
+    val renewing  = state.unpulled.filter(state.renewing)
+    val next      = state.copy(
+      unpulled = Set.empty,
+      deferred = state.deferred ++ renewing.map(_ -> AcknowledgeType.Release)
+    )
+    if (implicitMode) F.pure(state)
+    else if (unpulled.isEmpty) F.pure(next)
+    else
+      internal(
+        next,
+        Chunk.from(unpulled.map(p => decision(state, p, AcknowledgeType.Release))),
+        send = true,
+        byUser = false
+      )
+  }
 
-  private def awaitRequestOrTimeout(state: State, timeout: Option[FiniteDuration]): F[State] =
-    timeout.fold(awaitRequest(state)) { duration =>
-      takeWithin(duration).flatMap(_.fold(F.pure(state))(receive(state, _)))
-    }
+  private def decision(state: State, position: Position, kind: AcknowledgeType): Decision =
+    Decision(position._1, position._2, state.held(position).deliveryCount, kind)
+
+  // Stages the actor's own decisions, which fail the actor if they cannot be staged.
+  private def internal(
+    state: State,
+    decisions: Chunk[Decision],
+    send: Boolean,
+    byUser: Boolean
+  ): F[State] =
+    stageAll(
+      state,
+      Vector(decisions -> ((result: Either[Throwable, Unit]) => result.liftTo[F])),
+      send,
+      byUser
+    )
 
   /**
-    * Takes a request, or `None` after the duration. A plain race would drop a request taken just as
-    * the timer wins, so a taker which lost is cancelled and its request kept, if it got one.
+    * Stages the decisions of several requests, in one call to Java, for deliveries the consumer
+    * holds, and fails the others. A decision for a record whose renewal was sent waits for the poll
+    * which returns it. Renewals are sent at once with the other staged decisions, as is everything
+    * when `send` is set.
     */
-  private def takeWithin(duration: FiniteDuration): F[Option[ShareRequest[F]]] =
+  private def stageAll(
+    state: State,
+    batch: Vector[(Chunk[Decision], Either[Throwable, Unit] => F[Unit])],
+    send: Boolean,
+    byUser: Boolean
+  ): F[State] = {
+    def isHeld(d: Decision) = state.held.get(d.position).exists(_.deliveryCount == d.deliveryCount)
+    // Each request's decisions to stage now, and those waiting for a renewed record.
+    val split = batch.map { case (own, done) =>
+      val (waiting, now) = own.toVector.filter(isHeld).partition(d => state.renewing(d.position))
+      (own, done, waiting, now)
+    }
+    val now     = split.flatMap(_._4)
+    val sending = send || now.exists(_.acknowledgeType == AcknowledgeType.Renew)
+    // Each request is staged on its own, so an error is only that request's: how many of its
+    // decisions Java staged, and the error. Whatever was staged is sent, if anything is.
+    val calls: F[Vector[(Int, Option[Throwable])]] =
+      if (now.isEmpty && !send) F.pure(split.map(_ => (0, None)))
+      else
+        withConsumer.blocking { consumer =>
+          val staged = split.map { case (_, _, _, own) =>
+            var count   = 0
+            val staging = scala
+              .util
+              .Try(own.foreach { d =>
+                consumer.acknowledge(state.held(d.position).record, d.acknowledgeType.asJava)
+                count += 1
+              })
+            (count, staging.failed.toOption)
+          }
+          // A failed send means the consumer failed, so it fails the actor.
+          if (sending) consumer.commitAsync()
+          staged
+        }
+    (F.monotonic, calls.attempt)
+      .tupled
+      .flatMap {
+        case (at, Right(results)) =>
+          // What Java staged is tracked also for a request that failed part-way, so the actor's
+          // view stays that of Java. The last decision for each record wins, as in Java.
+          val outcomes = split.zip(results)
+          val last     = outcomes
+            .flatMap { case ((_, _, _, own), (count, _)) => own.take(count) }
+            .foldLeft(Map.empty[Position, AcknowledgeType])((m, d) =>
+              m.updated(d.position, d.acknowledgeType)
+            )
+          val waiting = outcomes.collect { case ((_, _, waiting, _), (_, None)) => waiting }.flatten
+          val staged  = state.withStaged(last, waiting, at, byUser)
+          outcomes
+            .traverse_ { case ((own, done, _, _), (_, error)) =>
+              done(
+                error
+                  .orElse(
+                    own
+                      .find(d => !isHeld(d))
+                      .map(d => RecordNotInFlightException(d.topicPartition, d.offset))
+                  )
+                  .toLeft(())
+              )
+            }
+            .as(if (sending) staged.withoutDecided else staged)
+        case (_, Left(error)) =>
+          batch.traverse_(_._2(Left(error))) *> F.raiseError[State](error)
+      }
+  }
+
+  // Java commits every staged decision, which it then no longer holds.
+  private def commit(
+    state: State,
+    done: Either[Throwable, Map[TopicPartition, Option[KafkaException]]] => F[Unit]
+  ): F[State] =
+    commitSync(state)
+      .attempt
+      .flatTap(done)
+      .map {
+        // A commit which failed before sending leaves the decisions staged in Java.
+        case Left(error) if !error.isInstanceOf[ShareCommitTimeoutException] => state
+        case _                                                               => state.withoutDecided
+      }
+
+  // In implicit mode, a poll the stream did not take accepted the records handed out before it,
+  // and committing would accept that poll as well, so nothing is committed.
+  private def commitSync(state: State): F[Map[TopicPartition, Option[KafkaException]]] =
+    if (implicitMode && state.unpulled.nonEmpty) F.pure(Map.empty)
+    else
+      withConsumer
+        .blocking(consumer => commitResult(consumer.commitSync(settings.commitTimeout.toJava)))
+        .adaptError { case error: TimeoutException =>
+          ShareCommitTimeoutException(settings.commitTimeout, error)
+        }
+
+  // --- Polling ---
+
+  private def poll(state: State): F[State] =
+    F.monotonic
+      .flatMap(start =>
+        withConsumer
+          .blocking { consumer =>
+            if (consumer.subscription().isEmpty) None
+            else
+              Some(
+                consumer.poll(settings.pollTimeout.toJava).iterator().asScala.toVector ->
+                  ShareTimeouts.acquisitionLock(consumer)
+              )
+          }
+          .flatMap {
+            // No fetch is sent while unsubscribed, so the next poll's records are acquired by it.
+            // Requests are received while waiting to check the subscription again.
+            case None =>
+              val idle = state.copy(lastPoll = None)
+              takeWithin(idleInterval).flatMap(_.fold(F.pure(idle))(receive(idle, _)))
+            case Some((records, reported)) =>
+              val lock = reported.orElse(state.lock)
+              // With automatic renewal, the commit timeout must leave time to renew behind a commit.
+              // Failed renewals are applied first, so a redelivery in this poll is a new delivery.
+              ShareTimeouts.effectiveCommitTimeout(settings, lock).liftTo[F] *>
+                (F.monotonic, dropFailedRenewals(state))
+                  .tupled
+                  .flatMap { case (now, current) =>
+                    val acquiredAt = acquisitionTime(current, now)
+                    polled(current, records, lock, acquiredAt, now).map(next =>
+                      withoutUnreported(next, lock, now).copy(lastPoll =
+                        Some(LastPoll(start, records.size, acquiredAt))
+                      )
+                    )
+                  }
+          }
+      )
+
+  // Renewed records come back from the poll without being handed out again; their waiting
+  // decisions are staged. New records are handed out, or released once consuming has stopped.
+  private def polled(
+    state: State,
+    records: Vector[KafkaByteConsumerRecord],
+    lock: Option[FiniteDuration],
+    acquiredAt: FiniteDuration,
+    now: FiniteDuration
+  ): F[State] = {
+    def position(r: KafkaByteConsumerRecord): Position =
+      new TopicPartition(r.topic, r.partition) -> r.offset
+    val (returned, fresh) = records.partition(r =>
+      state.renewing.contains(position(r)) &&
+        state.held.get(position(r)).exists(_.deliveryCount == deliveryCountOf(r))
+    )
+    // A poll made before the stream took the latest one returns only renewed records, so new ones
+    // are released in that case too, should Java ever return some.
+    val admitting = !state.stopping && !state.readerClosed && state.unpulled.isEmpty
+    for {
+      admitted <-
+        if (admitting) fresh.traverse(admit(_, acquiredAt, now)) else F.pure(Vector.empty)
+      next = state.polled(
+               // A renewed record's lock runs from when its renewal was sent.
+               returned.map(r => position(r) -> state.held(position(r)).copy(record = r)),
+               admitted.map(_._1),
+               fresh.map(position),
+               lock
+             )
+      _ <- logging
+             .log(ShareLogEntry.Polled(records.size, returned.size, next.held.size))
+             .whenA(records.nonEmpty)
+      _ <-
+        output.offer(Some(next.pollId -> Chunk.from(admitted.map(_._2)))).whenA(admitted.nonEmpty)
+      // Records not admitted are released at once, as nothing will decide them.
+      released <-
+        if (admitting || fresh.isEmpty) F.pure(next)
+        else
+          withConsumer
+            .blocking { c =>
+              fresh.foreach(c.acknowledge(_, AcknowledgeType.Release.asJava))
+              c.commitAsync()
+            }
+            .as(next)
+      waiting = returned.flatMap(r => next.deferred.get(position(r)).map(position(r) -> _))
+      // Decisions which waited for a renewal are sent at once, as their records may otherwise wait
+      // for the slowest record of the poll.
+      staged <-
+        if (waiting.isEmpty) F.pure(released)
+        else
+          internal(
+            released.copy(deferred = released.deferred -- waiting.map(_._1)),
+            Chunk.from(waiting.map { case (p, kind) => decision(released, p, kind) }),
+            send = true,
+            // They are the user's decisions, so a renewal restarts the time held.
+            byUser = true
+          )
+    } yield staged
+  }
+
+  // The previous poll's fetch may have acquired the records: an empty poll's fetch can complete
+  // after it returns, and a full batch_optimized poll can leave records in Java's buffer, also those
+  // acquired before it, if the poll before it was full too.
+  private def acquisitionTime(state: State, now: FiniteDuration): FiniteDuration =
+    state
+      .lastPoll
+      .collect {
+        case LastPoll(start, 0, _)                                           => start
+        case LastPoll(start, n, at) if batchOptimized && n >= maxPollRecords => start.min(at)
+      }
+      .getOrElse(now)
+
+  private def deliveryCountOf(record: KafkaByteConsumerRecord): Short =
+    if (record.deliveryCount().isPresent) record.deliveryCount().get.shortValue else 1
+
+  private def admit(
+    record: KafkaByteConsumerRecord,
+    acquiredAt: FiniteDuration,
+    now: FiniteDuration
+  ): F[((Position, Held), AcknowledgeableConsumerRecord[F, K, V])] = {
+    val deliveryCount = deliveryCountOf(record)
+    val partition     = new TopicPartition(record.topic, record.partition)
+    ConsumerRecord
+      .fromJava(record, keyDeserializer, valueDeserializer)
+      .map(decoded =>
+        (partition -> record.offset, Held(deliveryCount, record, acquiredAt, now)) ->
+          AcknowledgeableConsumerRecord(
+            decoded,
+            AcknowledgeableOffset(partition, record.offset, deliveryCount, this)
+          )
+      )
+  }
+
+  // --- Automatic renewal ---
+
+  // Records without a decision are renewed at half the lock, when automatic renewal is on, or
+  // while a decision waits for a renewed record, so that the consumer can poll it.
+  private def nextRenewal(state: State): Option[FiniteDuration] =
+    if (!(settings.autoRenewal && !state.readerClosed || state.deferred.nonEmpty)) None
+    else {
+      val undecided = state.undecided.map(_._2.lockedSince)
+      // While a decision waits for a renewed record, the others are renewed promptly, so that the
+      // consumer can poll it. While the broker has not reported the lock, records are renewed at
+      // the idle interval.
+      if (undecided.isEmpty) None
+      else if (state.deferred.nonEmpty) Some(undecided.min + idleInterval)
+      else Some(undecided.min + state.lock.fold(idleInterval)(renewalInterval))
+    }
+
+  // Early enough that a renewal waiting behind a commit still beats the lock, and that the
+  // consumer, which polls once the renewal is sent, stays within `max.poll.interval.ms`.
+  private def renewalInterval(lock: FiniteDuration): FiniteDuration = {
+    val latest = ShareTimeouts.latestRenewal(lock, settings.commitTimeout)
+    val bound  = if (latest > Duration.Zero) (lock / 2).min(latest) else lock / 2
+    bound.min(maxPollInterval / 2)
+  }
+
+  private def renew(state: State): F[State] =
+    internal(
+      state,
+      Chunk.from(state.undecided.map { case (p, _) => decision(state, p, AcknowledgeType.Renew) }),
+      send = false,
+      byUser = false
+    )
+
+  // --- Max processing time ---
+
+  // Records without a decision held for longer than the max processing time, counted from when
+  // the stream took them or from the user's latest renewal.
+  private def overdueRecords(state: State, now: FiniteDuration): Vector[Position] =
+    settings
+      .maxProcessingTime
+      .fold(Vector.empty[Position])(max =>
+        state
+          .undecided
+          .collect {
+            case (p, h) if !state.unpulled(p) && h.heldSince + max <= now => p
+          }
+      )
+
+  private def nextLimit(state: State): Option[FiniteDuration] =
+    settings
+      .maxProcessingTime
+      .flatMap { max =>
+        val held = state.undecided.collect { case (p, h) if !state.unpulled(p) => h.heldSince }
+        if (held.isEmpty) None else Some(held.min + max)
+      }
+
+  // Overdue records are released at once, so they are delivered again and the consumer can poll.
+  private def releaseOverdue(state: State, records: Vector[Position]): F[State] =
+    settings
+      .maxProcessingTime
+      .traverse_(max => logging.log(ShareLogEntry.ReleasingOverdue(records, max))) *>
+      internal(
+        state,
+        Chunk.from(records.map(decision(state, _, AcknowledgeType.Release))),
+        send = true,
+        byUser = false
+      )
+
+  // --- Running ---
+
+  // Takes a request, or returns `None` after the duration, without losing a request taken as the
+  // timer fires.
+  private def takeWithin(duration: FiniteDuration): F[Option[Request[F]]] =
     F.racePair(requests.take, F.sleep(duration))
       .flatMap {
-        case Left((taken, timer)) =>
-          timer.cancel *> taken.embedNever.map(Some(_))
-        case Right((taker, _)) =>
+        case Left((taken, timer)) => timer.cancel *> taken.embedNever.map(Some(_))
+        case Right((taker, _))    =>
           taker.cancel *> taker
             .join
             .flatMap {
@@ -186,522 +544,52 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V] private (
             }
       }
 
+  // Requests taken together are received in order, with consecutive decisions staged in one call.
+  private def receiveAll(state: State, taken: List[Request[F]]): F[State] =
+    taken match {
+      case Nil                        => F.pure(state)
+      case (_: Request.Stage[F]) :: _ =>
+        val (stages, rest) = taken.span(_.isInstanceOf[Request.Stage[F]])
+        val batch          = stages.collect { case Request.Stage(d, done) => d -> done }.toVector
+        stageAll(state, batch, send = false, byUser = true).flatMap(receiveAll(_, rest))
+      case request :: rest => receive(state, request).flatMap(receiveAll(_, rest))
+    }
+
   private def loop(state: State): F[Unit] =
-    pendingRef.set(state.pending) *> requests
+    requests
       .tryTakeN(None)
-      .flatMap(_.foldM(state)(receive))
-      .flatMap(confirm)
-      .flatMap(state => if (state.isFinished) F.unit else step(state).flatMap(loop))
-
-  private def step(state: State): F[State] =
-    if (implicitMode) implicitStep(state) else explicitStep(state)
-
-  /**
-    * Steps the actor in implicit acknowledgement mode, where Java accepts a poll's records on the
-    * next poll or commit, and commit requests fail.
-    *
-    * The actor polls again once the previous poll is handed out, so records may still be processing
-    * when accepted. After stopping, the last records are accepted once handed out. If the stream
-    * ends first, closing the consumer releases them.
-    */
-  private def implicitStep(state: State): F[State] =
-    if (state.commits.nonEmpty)
-      state
-        .commits
-        .traverse_(_.callback(Left(ImplicitAcknowledgementException())))
-        .as(state.copy(commits = Vector.empty))
-    else
-      state
-        .inFlight
-        .values
-        .toVector
-        .forallM(handedOut)
-        .flatMap { allHandedOut =>
-          if (state.readerClosed)
-            if (allHandedOut && state.inFlight.nonEmpty) acceptImplicitly(state)
-            else F.pure(state.copy(inFlight = Map.empty))
-          else if (!state.started || !allHandedOut) awaitRequest(state)
-          else if (state.admitting) poll(state)
-          else if (state.inFlight.nonEmpty) acceptImplicitly(state)
-          else awaitRequest(state)
-        }
-
-  private def handedOut(record: InFlightRecord[F]): F[Boolean] =
-    record.emitted.fold(F.pure(false))(_.get)
-
-  // In implicit acknowledgement mode, a commit accepts the records of the latest poll.
-  private def acceptImplicitly(state: State): F[State] =
-    effectiveCommitTimeout(settings, state.lock)
-      .liftTo[F]
-      .flatMap(client.commitSync(Vector.empty, _))
-      .flatMap(firstError(_).traverse_(F.raiseError[Unit]))
-      .as(state.copy(inFlight = Map.empty))
-
-  private def explicitStep(state: State): F[State] =
-    F.monotonic
-      .flatMap(now => expire(state, now).tupleRight(now))
-      .flatMap { case (state, now) =>
-        val renewal      = nextRenewal(state, now)
-        val renewalFirst = !(state.renewedLast && state.commits.nonEmpty)
-        renewal match {
-          case Some(at) if at <= now && renewalFirst =>
-            renew(state).map(_.copy(renewedLast = true))
-          case _ if state.commits.nonEmpty && state.sent.size < maxSentRounds =>
-            processCommits(state).map(_.copy(renewedLast = false))
-          case _ =>
-            unemitted(state).flatMap { toRelease =>
-              if (toRelease.nonEmpty) release(state, toRelease)
-              else if (state.canPoll) poll(state)
-              else if (state.sent.nonEmpty) awaitResults(state, renewal, now)
-              else awaitRequestOrTimeout(state, renewal.map(_ - now))
-            }
-        }
-      }
-
-  /**
-    * Waits for a request, or else asks Java for the results of the sent rounds, as Java reports
-    * them only during consumer calls. The wait grows while no results arrive.
-    */
-  private def awaitResults(
-    state: State,
-    renewal: Option[FiniteDuration],
-    now: FiniteDuration
-  ): F[State] = {
-    val wakeUp = (state.nudgeBackoff :: (state.sent.map(_.deadline) ++ renewal).map(_ - now).toList)
-      .min
-      .max(Duration.Zero)
-    val nudge = client
-      .nudge
-      .as(state.copy(nudgeBackoff = (state.nudgeBackoff * 2).min(settings.pollInterval)))
-    // Commits waiting only for room among the sent rounds would win every race, so the results
-    // which make room would never be asked for.
-    if (state.commits.nonEmpty) F.sleep(wakeUp) *> nudge
-    else takeWithin(wakeUp).flatMap(_.fold(nudge)(receive(state, _)))
-  }
-
-  /**
-    * A decision waiting for a renewed record needs the next poll, which Java allows only once the
-    * other records are acknowledged or renewed. So the actor renews them, even without automatic
-    * renewal: at once when the broker confirmed the renewal, so the poll returns the record, and
-    * otherwise at the renewal interval, until the renewal resolves.
-    */
-  private def nextRenewal(state: State, now: FiniteDuration): Option[FiniteDuration] =
-    if (state.awaitsConfirmedRenewal && state.commits.isEmpty && state.unacknowledged.nonEmpty)
-      Some(now)
-    else if (settings.autoRenewal || state.deferred.nonEmpty) state.nextRenewal
-    else None
-
-  private def unemitted(state: State): F[Vector[ShareState.Id]] =
-    state
-      .unacknowledged
-      .toVector
-      .filterA { case (_, record) =>
-        record
-          .emitted
-          .fold(F.pure(true)) { emitted =>
-            if (state.readerClosed) emitted.get.map(!_) else F.pure(false)
-          }
-      }
-      .map(_.map(_._1))
-
-  private def release(state: State, ids: Vector[ShareState.Id]): F[State] =
-    internalCommit(state, ids, AcknowledgeType.Release)
-
-  private def renew(state: State): F[State] =
-    internalCommit(state, state.unacknowledged.keys.toVector, AcknowledgeType.Renew)
-
-  private def internalCommit(
-    state: State,
-    ids: Vector[ShareState.Id],
-    acknowledgeType: AcknowledgeType
-  ): F[State] = {
-    val staged = ids.flatMap(id =>
-      state
-        .inFlight
-        .get(id)
-        .map(record =>
-          ShareRequest.Ack(id._1, id._2, Some(record.deliveryCount), acknowledgeType) -> record
-        )
-    )
-    // Records whose renewal or release failed are dropped, so their lock expires, and a timed-out
-    // renewal is kept; only a failure to send fails the stream.
-    sendRound(
-      state,
-      Vector(Part(staged, (_: Either[Throwable, CommitResult]) => F.unit)),
-      viaPoll = false
-    ).flatMap {
-      case (next, None)     => F.pure(next)
-      case (_, Some(error)) => F.raiseError[State](error)
-    }
-  }
-
-  /**
-    * Commits one round: the first request if it is synchronous, or else the asynchronous requests
-    * up to the next synchronous one. Each acknowledgement is staged, deferred while its record is
-    * renewing, or failed with a [[RecordNotInFlightException]]. As in Java, the last decision for a
-    * record in a round wins; the requests whose decisions it replaced get the result of its
-    * partition.
-    */
-  private def processCommits(state: State): F[State] = {
-    val (commits, rest) =
-      if (state.commits.headOption.exists(_.sync)) state.commits.splitAt(1)
-      else state.commits.span(!_.sync)
-
-    commits
-      .foldLeftM(Round[F]())((round, commit) => addToRound(state, round, commit))
-      .flatMap { round =>
-        val next =
-          state.copy(commits = rest, deferred = state.deferred ++ round.deferred)
-        if (round.staged.isEmpty) F.pure(next)
-        else if (commits.headOption.exists(_.sync)) commitSyncRound(next, round.staged)
-        else sendRound(next, round.staged, viaPoll = ridesWithPoll(next, round.staged)).map(_._1)
-      }
-  }
-
-  /**
-    * Whether the acknowledgements of a round can go with the next poll, as Java sends them, instead
-    * of in a request of their own: they settle the latest poll, nothing else waits, and the latest
-    * poll was full. On a quiet topic, the broker may hold a fetch while it waits for records, which
-    * would delay the confirmation, so they are committed on their own.
-    */
-  private def ridesWithPoll(state: State, parts: Vector[Part[F]]): Boolean = {
-    val staged = parts.flatMap(_.staged)
-    val ids    = staged.iterator.map(_._1.id).toSet
-    state.admitting && state.commits.isEmpty && state.lastPollRecords >= maxPollRecords &&
-    staged.forall(_._1.acknowledgeType != AcknowledgeType.Renew) &&
-    state.unacknowledged.keysIterator.forall(ids.contains)
-  }
-
-  private def addToRound(
-    state: State,
-    round: Round[F],
-    commit: ShareRequest.Commit[F]
-  ): F[Round[F]] = {
-    val parts = split(state, commit.acknowledgements)
-    // The last decision for a record in a round wins, as in Java, replacing earlier ones.
-    val decided  = parts.staged.map(_._1.id).toSet
-    val replaced = decided.filter(round.claimed.contains)
-    val earlier  =
-      if (replaced.isEmpty) round.staged
-      else
-        round
-          .staged
-          .map(part => part.copy(staged = part.staged.filterNot(s => replaced.contains(s._1.id))))
-    def retry(acks: Vector[ShareRequest.Ack], callback: Callback[F]) =
-      ShareRequest.Commit[F](Chunk.from(acks), commit.sync, callback)
-
-    joinCallbacks(commit.callback, parts.count).flatMap { callbacks =>
-      val next     = callbacks.iterator
-      val staged   = when(parts.staged.nonEmpty)(Part(parts.staged, next.next()))
-      val deferred = when(parts.deferred.nonEmpty)(retry(parts.deferred, next.next()))
-      val invalid  = when(parts.invalid.nonEmpty)(next.next())
-      invalid
-        .traverse_(_(Right(notInFlight(parts.invalid))))
-        .as(Round(round.claimed ++ decided, earlier ++ staged, round.deferred ++ deferred))
-    }
-  }
-
-  private def split(state: State, acknowledgements: Chunk[ShareRequest.Ack]): Split[F] = {
-    val split = acknowledgements.foldLeft(Split[F]()) { (split, ack) =>
-      val record =
-        state.inFlight.get(ack.id).filter(r => ack.deliveryCount.forall(_ == r.deliveryCount))
-      record match {
-        case Some(r) if r.renewing => split.copy(deferred = split.deferred :+ ack)
-        case Some(r)               => split.copy(staged = split.staged :+ (ack -> r))
-        case None                  => split.copy(invalid = split.invalid :+ ack)
-      }
-    }
-    split.copy(staged = lastDecisions(split.staged))
-  }
-
-  /**
-    * Sends a round, with `commitAsync` or with the next poll, without waiting for its results,
-    * which [[confirm]] applies later. Returns the failure if the round could not be sent, in which
-    * case it is already completed with it.
-    */
-  private def sendRound(
-    state: State,
-    parts: Vector[Part[F]],
-    viaPoll: Boolean
-  ): F[(State, Option[Throwable])] = {
-    val staged = parts.flatMap(_.staged)
-    for {
-      timeout <- effectiveCommitTimeout(settings, state.lock).liftTo[F]
-      start   <- F.monotonic
-      sent    <-
-        (if (viaPoll) client.pollWithAcknowledgements(staged, settings.pollTimeout)
-         else client.commitAsync(staged).as(None)).attempt
-      marked = markSent(state, staged, start)
-      next  <- sent match {
-                case Left(error) =>
-                  confirmRound(
-                    marked,
-                    SentRound(parts, Set.empty, Map.empty, start, timeout),
-                    Left(error)
-                  ).map(_ -> Some(error))
-                case Right(records) =>
-                  val round     = SentRound(parts, staged.map(_._1.id).toSet, Map.empty, start, timeout)
-                  val withRound =
-                    marked.copy(sent = marked.sent :+ round, nudgeBackoff = ShareState.initialNudge)
-                  records
-                    .fold(F.pure(withRound)) { case (polledRecords, lock) =>
-                      polled(withRound, start, polledRecords, lock.orElse(withRound.lock))
-                    }
-                    .map(_ -> None)
-              }
-    } yield next
-  }
-
-  // Commits a synchronous round with Java's `commitSync`, which waits for its results.
-  private def commitSyncRound(state: State, parts: Vector[Part[F]]): F[State] = {
-    val staged = parts.flatMap(_.staged)
-    for {
-      timeout     <- effectiveCommitTimeout(settings, state.lock).liftTo[F]
-      submittedAt <- F.monotonic
-      result      <- client.commitSync(staged, timeout).attempt
-      round        = SentRound(parts, Set.empty, Map.empty, submittedAt, timeout)
-      next        <- confirmRound(markSent(state, staged, submittedAt), round, result)
-    } yield next
-  }
-
-  /**
-    * Records with a final decision stop being tracked once it is sent, so later decisions for them
-    * fail. Renewed records wait for the renewal's result, as their lock may still be extended.
-    */
-  private def markSent(
-    state: State,
-    staged: Vector[Staged[F]],
-    submittedAt: FiniteDuration
-  ): State =
-    staged.foldLeft(state) { case (s, (ack, record)) =>
-      if (ack.acknowledgeType == AcknowledgeType.Renew)
-        s.copy(inFlight =
-          s.inFlight
-            .updated(
-              ack.id,
-              record.copy(renewing = true, lockedSince = submittedAt, renewalConfirmed = false)
-            )
-        )
-      else s.copy(inFlight = s.inFlight - ack.id)
-    }
-
-  /**
-    * Applies the results Java reported to the sent rounds, oldest first, and completes the rounds
-    * whose results are all known.
-    */
-  private def confirm(state: State): F[State] =
-    client
-      .drain
-      .flatMap { reported =>
-        if (reported.isEmpty) F.pure(state)
-        else {
-          val sent = reported.foldLeft(state.sent) { case (rounds, (partition, offsets, error)) =>
-            offsets.foldLeft(rounds) { (rounds, offset) =>
-              val id = partition -> offset
-              rounds.indexWhere(_.remaining.contains(id)) match {
-                case -1    => rounds
-                case index =>
-                  val round = rounds(index)
-                  rounds.updated(
-                    index,
-                    round.copy(
-                      remaining = round.remaining - id,
-                      results = mergeResults(round.results, Map(partition -> error))
-                    )
-                  )
-              }
-            }
-          }
-          val (done, open) = sent.partition(_.remaining.isEmpty)
-          done.foldLeftM(state.copy(sent = open, nudgeBackoff = ShareState.initialNudge)) {
-            (s, round) => confirmRound(s, round, Right(round.results))
-          }
-        }
-      }
-
-  // Fails the sent rounds whose results did not all arrive within the commit timeout.
-  private def expire(state: State, now: FiniteDuration): F[State] = {
-    val (expired, open) = state.sent.partition(_.deadline <= now)
-    expired.foldLeftM(state.copy(sent = open)) { (s, round) =>
-      confirmRound(
-        s,
-        round,
-        Left(ShareCommitTimeoutException(round.timeout, offsetsOf(round.staged, None)))
-      )
-    }
-  }
-
-  /**
-    * Completes a round with its result: a renewal is confirmed, kept unconfirmed if it timed out,
-    * or else its record is dropped, so its lock expires. Each callback gets its partitions'
-    * results.
-    */
-  private def confirmRound(
-    state: State,
-    round: SentRound[F],
-    result: Either[Throwable, CommitResult]
-  ): F[State] = {
-    val next = round
-      .staged
-      .foldLeft(state) { case (s, (ack, record)) =>
-        val renewing = s
-          .inFlight
-          .get(ack.id)
-          .filter(r => r.renewing && r.deliveryCount == record.deliveryCount)
-        (ack.acknowledgeType, renewing) match {
-          case (AcknowledgeType.Renew, Some(r)) =>
-            failure(ack, result) match {
-              case None =>
-                s.copy(inFlight = s.inFlight.updated(ack.id, r.copy(renewalConfirmed = true)))
-              case Some(_: TimeoutException) => s
-              case Some(_)                   => s.copy(inFlight = s.inFlight - ack.id)
-            }
-          case _ => s
-        }
-      }
-    pendingRef.set(next.pending) *>
-      round
-        .parts
-        .traverse_ { part =>
-          part.callback(
-            result.map(results => part.partitions.map(p => p -> results.get(p).flatten).toMap)
-          )
-        }
-        .as(next)
-  }
-
-  private def failure(
-    ack: ShareRequest.Ack,
-    result: Either[Throwable, CommitResult]
-  ): Option[Throwable] =
-    result.fold(Some(_), _.get(ack.topicPartition).flatten)
-
-  /**
-    * Polls once, tracks new and renewed records, and retries deferred commits.
-    */
-  private def poll(state: State): F[State] =
-    F.monotonic
-      .flatMap { start =>
-        withConsumer
-          .blocking { consumer =>
-            if (consumer.subscription().isEmpty) None
-            else {
-              val records = consumer.poll(settings.pollTimeout.toJava)
-              Some(
-                records.iterator().asScala.toVector -> acquisitionLock(consumer).orElse(state.lock)
-              )
-            }
-          }
-          .flatMap {
-            case None                  => F.sleep(settings.pollInterval).as(state)
-            case Some((records, lock)) => polled(state, start, records, lock)
+      .flatMap(receiveAll(state, _))
+      .flatMap(dropFailedRenewals)
+      .flatMap { current =>
+        F.monotonic
+          .flatMap { now =>
+            val renewal = nextRenewal(current)
+            val overdue = overdueRecords(current, now)
+            val wakeAt  = (renewal.toList ++ nextLimit(current)).reduceOption(_ min _)
+            // The last decisions are sent before finishing, so a later commit is not needed.
+            if (current.isFinished)
+              // A failed final commit fails the stream, as its decisions may not have been sent.
+              commitSync(current)
+                .attempt
+                .flatMap(result => drained.set(Some(result)) *> result.liftTo[F].void)
+            else if (overdue.nonEmpty) releaseOverdue(current, overdue).flatMap(loop)
+            else if (renewal.exists(_ <= now)) renew(current).flatMap(loop)
+            else if (current.canPoll) poll(current).flatMap(loop)
+            else
+              wakeAt
+                .fold(requests.take.map(Option(_)))(at => takeWithin(at - now))
+                .flatMap(_.fold(F.pure(current))(receive(current, _)))
+                .flatMap(loop)
           }
       }
 
-  private def polled(
-    state: State,
-    start: FiniteDuration,
-    records: Vector[KafkaByteConsumerRecord],
-    lock: Option[FiniteDuration]
-  ): F[State] = {
-    val identified: Vector[((TopicPartition, Long), KafkaByteConsumerRecord)] = records.map(
-      record => (new TopicPartition(record.topic, record.partition) -> record.offset) -> record
-    )
-    // Any record the actor did not renew is a new delivery.
-    def renewed(id: ShareState.Id): Option[InFlightRecord[F]] =
-      state.inFlight.get(id).filter(_.renewing)
-    val admitted = identified.count { case (id, _) => renewed(id).isEmpty }
-    // Records may have been acquired by an earlier poll's fetch.
-    val acquiredAt =
-      if (state.lastPollRecords == 0) state.lastPollStart
-      else if (batchOptimized && state.lastPollRecords >= maxPollRecords) state.lastAcquiredAt
-      else start
-    // Renewing records the poll did not return lost their lock, unless their renewal timed out.
-    val unresolved = state
-      .inFlight
-      .filter { case (_, record) =>
-        record.renewing && !record.renewalConfirmed && admitted == 0 &&
-        start < record.lockedSince + lock.fold(apiTimeout)(_.max(apiTimeout))
-      }
-    for {
-      renewAfter <- renewalInterval(lock)
-      tracked    <-
-        identified.foldLeftM((unresolved, Vector.empty[Entry[F, K, V]])) {
-          case ((inFlight, entries), (id, record)) =>
-            renewed(id) match {
-              case Some(again) =>
-                F.pure(
-                  inFlight.updated(id, again.copy(renewing = false, renewalConfirmed = true)) ->
-                    entries
-                )
-              case None =>
-                admit(state, record, acquiredAt).map { case (admitted, entry) =>
-                  (inFlight.updated(id, admitted), entries ++ entry)
-                }
-            }
-        }
-      (inFlight, entries) = tracked
-      next                = state.copy(
-               inFlight = inFlight,
-               commits = state.deferred ++ state.commits,
-               deferred = Vector.empty,
-               lock = lock,
-               renewAfter = renewAfter,
-               lastPollStart = start,
-               lastPollRecords = records.size,
-               lastAcquiredAt = acquiredAt
-             )
-      // Updated before the records are handed out, so committers see the new count.
-      _ <- pendingRef.set(next.pending)
-      _ <- output.offer(Some(Chunk.from(entries))).whenA(entries.nonEmpty)
-    } yield next
-  }
-
-  private def admit(
-    state: State,
-    record: KafkaByteConsumerRecord,
-    acquiredAt: FiniteDuration
-  ): F[(InFlightRecord[F], Option[Entry[F, K, V]])] = {
-    val deliveryCount: Short =
-      if (record.deliveryCount().isPresent) record.deliveryCount().get.shortValue else 1
-    def inFlight(emitted: Option[Ref[F, Boolean]]) =
-      InFlightRecord[F](record, deliveryCount, emitted, renewing = false, acquiredAt)
-
-    if (!state.admitting) F.pure(inFlight(None) -> None)
-    else
-      for {
-        decoded  <- ConsumerRecord.fromJava(record, keyDeserializer, valueDeserializer)
-        emitted  <- Ref.of[F, Boolean](false)
-        partition = new TopicPartition(record.topic, record.partition)
-        offset    = AcknowledgeableOffset(partition, record.offset, deliveryCount, committer)
-      } yield inFlight(Some(emitted)) ->
-        Some(Entry(AcknowledgeableConsumerRecord(decoded, offset), emitted))
-  }
-
-  /**
-    * Renews early enough that a renewal behind one commit still beats the lock and
-    * `max.poll.interval.ms`, or at the poll interval without a known lock.
-    */
-  private def renewalInterval(lock: Option[FiniteDuration]): F[FiniteDuration] =
-    lock match {
-      case None           => F.pure(settings.pollInterval.min(maxPollInterval / 2))
-      case Some(duration) =>
-        effectiveCommitTimeout(settings, lock)
-          .liftTo[F]
-          .map(timeout =>
-            (duration / 2).min(latestRenewal(duration, timeout)).min(maxPollInterval / 2)
-          )
-    }
-
+  // Terminating ends the stream without draining, so later requests fail.
   private[actor] def run: F[Unit] =
-    F.monotonic
-      .flatMap { now =>
-        F.race(
-          shutdown.get,
-          client.install *>
-            loop(ShareState.empty[F](now, settings.pollInterval.min(maxPollInterval / 2)))
-        )
-      }
+    F.race(
+        shutdown.get,
+        withConsumer.blocking(_.setAcknowledgementCommitCallback(callback)) *>
+          loop(State(implicitMode = implicitMode))
+      )
       .attempt
       .flatMap {
         case Right(_)    => output.offer(None) *> finished.complete(Right(())).void
@@ -712,77 +600,241 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V] private (
 
 private[kafka] object KafkaShareConsumerActor {
 
-  // The most rounds of commit requests sent to Java and awaiting their results at once.
-  private[actor] val maxSentRounds: Int = 4
+  type Position = TopicPartitionOffset
 
-  final private[actor] case class Entry[F[_], K, V](
-    record: AcknowledgeableConsumerRecord[F, K, V],
-    emitted: Ref[F, Boolean]
-  )
+  // Hands out a poll as the stream takes its chunk.
+  def handOut[F[_], K, V](
+    poll: (Chunk[AcknowledgeableConsumerRecord[F, K, V]], F[Unit])
+  ): Stream[F, AcknowledgeableConsumerRecord[F, K, V]] =
+    Stream.exec(poll._2) ++ Stream.chunk(poll._1)
+
+  // How long the actor waits before checking for a subscription again after `unsubscribe`.
+  val idleInterval: FiniteDuration = 50.millis
+
+  private def commitResult(
+    results: java.util.Map[TopicIdPartition, java.util.Optional[KafkaException]]
+  ): Map[TopicPartition, Option[KafkaException]] =
+    results
+      .asScala
+      .iterator
+      .map { case (partition, error) =>
+        partition.topicPartition -> (if (error.isPresent) Some(error.get) else None)
+      }
+      .toMap
 
   /**
-    * Creates the actor from the settings, reading the Java configuration it needs.
+    * A delivery of a record held by the consumer.
+    *
+    * @param record
+    *   the Java record to acknowledge it by, from the poll which last returned it
+    * @param lockedSince
+    *   when its lock started as far as the consumer can tell: when a poll returned it, or the
+    *   previous poll started if that poll's fetch may have acquired it, or when its latest renewal
+    *   was sent
+    * @param heldSince
+    *   when its processing started as far as the consumer can tell: when the stream took its poll,
+    *   or when the user last renewed it; the max processing time counts from it
     */
+  final case class Held(
+    deliveryCount: Short,
+    record: KafkaByteConsumerRecord,
+    lockedSince: FiniteDuration,
+    heldSince: FiniteDuration
+  )
+
+  final case class LastPoll(start: FiniteDuration, records: Int, acquiredAt: FiniteDuration)
+
+  sealed abstract class Request[F[_]]
+
+  object Request {
+
+    final case class Start[F[_]]() extends Request[F]
+
+    final case class Stop[F[_]]() extends Request[F]
+
+    final case class ReaderClosed[F[_]]() extends Request[F]
+
+    final case class HandedOut[F[_]](pollId: Long) extends Request[F]
+
+    final case class Stage[F[_]](
+      decisions: Chunk[Decision],
+      done: Either[Throwable, Unit] => F[Unit]
+    ) extends Request[F]
+
+    final case class Commit[F[_]](
+      done: Either[Throwable, Map[TopicPartition, Option[KafkaException]]] => F[Unit]
+    ) extends Request[F]
+
+  }
+
+  /**
+    * @param implicitMode
+    *   whether Java accepts a poll's records with the next poll or commit
+    * @param held
+    *   the records the consumer holds: those of the latest poll Java has not sent a decision for,
+    *   and renewed records it has not returned yet
+    * @param decided
+    *   held records with a staged decision, sent by the next poll or commit
+    * @param renewing
+    *   held records whose renewal was sent, which Java returns from a later poll
+    * @param deferred
+    *   decisions for renewing records, staged once a poll returns them
+    * @param lock
+    *   the acquisition lock last reported by the broker
+    * @param unpulled
+    *   the records of the latest poll while the stream has not taken it
+    * @param pollId
+    *   the id of the latest poll offered to the stream, so that a late hand-out of an earlier one
+    *   is told apart
+    * @param lastPoll
+    *   when the previous poll started, how many records it returned, and when they were acquired as
+    *   far as the consumer can tell
+    */
+  final case class State(
+    implicitMode: Boolean,
+    held: Map[Position, Held] = Map.empty,
+    decided: Set[Position] = Set.empty,
+    renewing: Set[Position] = Set.empty,
+    deferred: Map[Position, AcknowledgeType] = Map.empty,
+    lock: Option[FiniteDuration] = None,
+    unpulled: Set[Position] = Set.empty,
+    pollId: Long = 0L,
+    lastPoll: Option[LastPoll] = None,
+    started: Boolean = false,
+    stopping: Boolean = false,
+    readerClosed: Boolean = false
+  ) {
+
+    // Held records without a decision or a renewal.
+    lazy val undecided: Vector[(Position, Held)] =
+      held.iterator.filterNot { case (p, _) => decided(p) || renewing(p) }.toVector
+
+    private def settled: Boolean = undecided.isEmpty
+
+    // Java polls once the stream took the latest poll, and every record of it has a decision or a
+    // renewal; in implicit mode, the poll accepts them. Renewed records come back only from a
+    // poll, so the consumer also polls for them after stopping, or before the stream took the
+    // latest poll, as Java returns no new records while a renewal is pending.
+    def canPoll: Boolean =
+      started && settled && (unpulled.isEmpty || renewing.nonEmpty) &&
+        (!stopping && !readerClosed || renewing.nonEmpty)
+
+    // After stopping, the stream ends once every record is decided, or in implicit mode, once it
+    // took the latest poll, which the final commit accepts, or ended without taking it. After the
+    // stream ends on its own, the actor keeps staging and committing decisions until the consumer
+    // closes, which releases records without one.
+    def isFinished: Boolean =
+      stopping && held.keySet.subsetOf(decided) &&
+        (!implicitMode || unpulled.isEmpty || readerClosed)
+
+    // Renewals restart the records' locks at `at`, when they are sent, and a renewal by the user
+    // also restarts the time they are held for.
+    def withStaged(
+      last: Map[Position, AcknowledgeType],
+      waiting: Vector[Decision],
+      at: FiniteDuration,
+      byUser: Boolean
+    ): State = {
+      val (renewed, final_) = last.partition(_._2 == AcknowledgeType.Renew)
+      copy(
+        held = held ++ renewed
+          .keySet
+          .map { p =>
+            p -> held(p).copy(lockedSince = at, heldSince = if (byUser) at else held(p).heldSince)
+          },
+        decided = decided ++ final_.keySet -- renewed.keySet,
+        renewing = renewing ++ renewed.keySet,
+        deferred = deferred ++ waiting.map(d => d.position -> d.acknowledgeType)
+      )
+    }
+
+    // A poll sent the staged decisions: held are the renewed records it returned, the renewing
+    // records it did not return yet, and its admitted new records.
+    def polled(
+      returned: Vector[(Position, Held)],
+      admitted: Vector[(Position, Held)],
+      fresh: Vector[Position],
+      reportedLock: Option[FiniteDuration]
+    ): State = {
+      // Java returns new records only once no renewal is pending, so renewed records a poll with
+      // new records did not return lost their lock.
+      val stillRenewing =
+        if (fresh.nonEmpty) Set.empty[Position] else renewing -- returned.map(_._1)
+      val lost = renewing -- returned.map(_._1) -- stillRenewing
+      copy(
+        // In implicit mode, records are accepted rather than decided, so none are held.
+        held = held.filter { case (p, _) => stillRenewing(p) } ++ returned ++
+          (if (implicitMode) Vector.empty else admitted),
+        decided = Set.empty,
+        renewing = stillRenewing,
+        deferred = deferred -- fresh -- lost,
+        lock = reportedLock,
+        unpulled = if (admitted.isEmpty) unpulled else admitted.map(_._1).toSet,
+        pollId = if (admitted.isEmpty) pollId else pollId + 1
+      )
+    }
+
+    // The stream took the poll's chunk; a late hand-out of an earlier poll changes nothing.
+    // Records are held, for the max processing time, from when the stream took them.
+    def withHandedOut(id: Long, at: FiniteDuration): State =
+      if (id != pollId) this
+      else
+        copy(
+          held = held ++ unpulled.flatMap(p => held.get(p).map(h => p -> h.copy(heldSince = at))),
+          unpulled = Set.empty
+        )
+
+    // A commit sent the staged decisions.
+    def withoutDecided: State = copy(held = held -- decided, decided = Set.empty)
+
+    // The renewal failed, so the records lost their lock.
+    def withoutRenewing(positions: Set[Position]): State = {
+      val lost = positions.intersect(renewing)
+      if (lost.isEmpty) this
+      else copy(held = held -- lost, renewing = renewing -- lost, deferred = deferred -- lost)
+    }
+
+  }
+
   def resource[F[_], K, V](
     settings: ShareConsumerSettings[F, K, V],
     keyDeserializer: KeyDeserializer[F, K],
     valueDeserializer: ValueDeserializer[F, V],
-    withConsumer: WithShareConsumer[F]
-  )(implicit F: Async[F]): Resource[F, KafkaShareConsumerActor[F, K, V]] = {
-    def property[A](key: String, default: A)(parse: String => A): F[A] =
-      F.delay(settings.properties.get(key).fold(default)(parse))
-
+    withConsumer: WithShareConsumer[F],
+    id: Int
+  )(implicit F: Async[F]): Resource[F, KafkaShareConsumerActor[F, K, V]] =
     for {
-      maxPollInterval <- Resource.eval(
-                           property(ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG, 300000L)(_.toLong)
-                         )
-      apiTimeout <- Resource.eval(
-                      property(ConsumerConfig.DEFAULT_API_TIMEOUT_MS_CONFIG, 60000L)(_.toLong)
-                    )
-      implicitMode <- Resource.eval(
-                        property(ConsumerConfig.SHARE_ACKNOWLEDGEMENT_MODE_CONFIG, true)(
-                          _.equalsIgnoreCase("implicit")
-                        )
-                      )
-      batchOptimized <- Resource.eval(
-                          property(ConsumerConfig.SHARE_ACQUIRE_MODE_CONFIG, true)(
-                            _.equalsIgnoreCase("batch_optimized")
-                          )
-                        )
-      maxPollRecords <- Resource.eval(
-                          property(
-                            ConsumerConfig.MAX_POLL_RECORDS_CONFIG,
-                            ConsumerConfig.DEFAULT_MAX_POLL_RECORDS
-                          )(_.toInt)
-                        )
-      requests      <- Resource.eval(Queue.unbounded[F, ShareRequest[F]])
-      output        <- Resource.eval(Queue.unbounded[F, Option[Chunk[Entry[F, K, V]]]])
-      pending       <- Resource.eval(Ref.of[F, Int](0))
+      logging  <- Resource.eval(ShareLogging.create[F]("fs2.kafka.KafkaShareConsumer$" + id))
+      requests <- Resource.eval(Queue.unbounded[F, Request[F]])
+      output   <-
+        Resource.eval(
+          Queue.unbounded[F, Option[(Long, Chunk[AcknowledgeableConsumerRecord[F, K, V]])]]
+        )
       readerStarted <- Resource.eval(Ref.of[F, Boolean](false))
       shutdown      <- Resource.eval(Deferred[F, Unit])
       finished      <- Resource.eval(Deferred[F, Either[Throwable, Unit]])
-      // Java does not allow renewal in implicit acknowledgement mode.
-      actor = new KafkaShareConsumerActor(
-                settings = if (implicitMode) settings.withAutoRenewal(false) else settings,
-                keyDeserializer = keyDeserializer,
-                valueDeserializer = valueDeserializer,
-                withConsumer = withConsumer,
-                requests = requests,
-                output = output,
-                pendingRef = pending,
-                readerStarted = readerStarted,
-                shutdown = shutdown,
-                finished = finished,
-                maxPollInterval = maxPollInterval.millis,
-                apiTimeout = apiTimeout.millis,
-                implicitMode = implicitMode,
-                batchOptimized = batchOptimized,
-                maxPollRecords = maxPollRecords
-              )
+      drained       <-
+        Resource.eval(
+          Ref.of[F, Option[Either[Throwable, Map[TopicPartition, Option[KafkaException]]]]](None)
+        )
+      config <- Resource.eval(ShareActorConfig.from(settings))
+      actor   = new KafkaShareConsumerActor(
+                config,
+                keyDeserializer,
+                valueDeserializer,
+                withConsumer,
+                requests,
+                output,
+                readerStarted,
+                shutdown,
+                finished,
+                drained
+              )(F, logging)
+      // Once closed, requests fail with ConsumerShutdownException, also after draining.
       _ <- Resource.make(F.start(actor.run))(fiber =>
-             fiber.cancel *> finished.complete(Left(ConsumerShutdownException())).void
+             fiber.cancel *> drained.set(None) *>
+               finished.complete(Left(ConsumerShutdownException())).void
            )
     } yield actor
-  }
 
 }

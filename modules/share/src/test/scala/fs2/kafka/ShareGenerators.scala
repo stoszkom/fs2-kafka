@@ -7,29 +7,26 @@
 package fs2.kafka
 
 import cats.ApplicativeThrow
+import fs2.kafka.internal.actor.{Decision, Stager}
+import fs2.Chunk
 
 import org.scalacheck.{Arbitrary, Cogen, Gen}
 import org.scalacheck.rng.Seed
 
 trait ShareGenerators extends BaseGenerators {
 
-  def genKafkaShareCommitter[F[_]: ApplicativeThrow]: Gen[KafkaShareCommitter[F]] =
-    Gen.const(
-      KafkaShareCommitter[F](
-        _ => ApplicativeThrow[F].unit,
-        _ => ApplicativeThrow[F].unit,
-        _ => ApplicativeThrow[F].pure(Map.empty),
-        ApplicativeThrow[F].pure(0)
-      )
-    )
+  def genStager[F[_]: ApplicativeThrow]: Gen[Stager[F]] =
+    Gen.const(new Stager[F] {
+      override def stage(decisions: Chunk[Decision]): F[Unit] = ApplicativeThrow[F].unit
+    })
 
   def genAcknowledgeableOffset[F[_]: ApplicativeThrow]: Gen[AcknowledgeableOffset[F]] =
     for {
       topicPartition <- genTopicPartition
       offset         <- Gen.posNum[Long]
       deliveryCount  <- Gen.choose[Short](1, 10)
-      committer      <- genKafkaShareCommitter[F]
-    } yield AcknowledgeableOffset[F](topicPartition, offset, deliveryCount, committer)
+      stager         <- genStager[F]
+    } yield AcknowledgeableOffset[F](topicPartition, offset, deliveryCount, stager)
 
   implicit def arbAcknowledgeableOffset[F[_]: ApplicativeThrow]
     : Arbitrary[AcknowledgeableOffset[F]] =

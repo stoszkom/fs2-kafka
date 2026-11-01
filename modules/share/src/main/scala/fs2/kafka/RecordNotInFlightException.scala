@@ -11,8 +11,10 @@ import org.apache.kafka.common.TopicPartition
 
 /**
   * [[RecordNotInFlightException]] indicates that an acknowledgement was for a delivery which the
-  * share consumer no longer holds: it was already acknowledged, its lock renewal failed, or the
-  * acknowledgement belongs to an earlier delivery of the same record.
+  * share consumer no longer holds: it was already acknowledged, its lock renewal failed, the
+  * consumer released it after its max processing time passed, or the acknowledgement belongs to an
+  * earlier delivery of the same record. Unless it was already decided, the record is delivered
+  * again, so the decision can usually be dropped.
   */
 sealed abstract class RecordNotInFlightException(topicPartition: TopicPartition, offset: Long)
     extends KafkaException(

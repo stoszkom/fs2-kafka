@@ -14,6 +14,7 @@ import cats.effect.Async
 import cats.syntax.all.*
 import cats.Reducible
 import fs2.kafka.consumer.{KafkaConsumerLifecycle, KafkaShareSubscription}
+import fs2.kafka.internal.actor.KafkaShareConsumerActor
 import fs2.Stream
 
 /**
@@ -32,8 +33,8 @@ sealed abstract class KafkaShareConsumers[F[_], K, V]
 
   /**
     * `Stream` of the records of all consumers, merged into a single `Stream` of
-    * [[AcknowledgeableConsumerRecord]]s. A record counts as handed out only once it leaves the
-    * merge, so records still buffered in the merge when this `Stream` ends are released.<br><br>
+    * [[AcknowledgeableConsumerRecord]]s. A poll counts as handed out only once it leaves the merge,
+    * so polls still buffered in the merge when this `Stream` ends are released.<br><br>
     *
     * If you want to process the records of each consumer in its own pipeline, use
     * [[perConsumerRecords]] instead.
@@ -94,9 +95,9 @@ object KafkaShareConsumers {
       override def records: Stream[F, AcknowledgeableConsumerRecord[F, K, V]] =
         Stream
           .emits(values.toVector)
-          .map(_.markableRecords)
+          .map(_.polls)
           .parJoin(values.length)
-          .through(values.head.handOut)
+          .flatMap(KafkaShareConsumerActor.handOut)
 
       override def perConsumerRecords
         : Stream[F, Stream[F, AcknowledgeableConsumerRecord[F, K, V]]] =
