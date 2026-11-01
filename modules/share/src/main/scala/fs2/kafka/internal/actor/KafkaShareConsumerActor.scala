@@ -123,17 +123,19 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
   def terminate: F[Unit] = shutdown.complete(()).void
 
   // Sends a request and waits for its answer. Once the actor ended, the answer comes from
-  // `afterDrain` if it drained, or else it is the reason it ended.
+  // `afterDrain` if it drained, or else it is the reason it ended; once shut down, the consumer
+  // is.
   private def ask[A](
     request: (Either[Throwable, A] => F[Unit]) => ShareRequest[F],
     afterDrain: Either[Throwable, CommitResult] => Either[Throwable, A]
   ): F[A] = {
     def afterEnd(ended: Either[Throwable, Unit]): F[A] =
-      drained
-        .get
+      (shutdown.tryGet, drained.get)
+        .tupled
         .flatMap {
-          case Some(last) => afterDrain(last).liftTo[F]
-          case _          =>
+          case (Some(_), _)    => F.raiseError[A](ConsumerShutdownException())
+          case (_, Some(last)) => afterDrain(last).liftTo[F]
+          case _               =>
             F.raiseError[A](ended.fold(identity, _ => ConsumerShutdownException()))
         }
     // Nothing takes requests once the actor ended.
@@ -724,7 +726,7 @@ private[kafka] object KafkaShareConsumerActor {
               )(F, logging)
       // Once closed, requests fail with ConsumerShutdownException.
       _ <- Resource.make(F.start(actor.run))(fiber =>
-             fiber.cancel *> drained.set(None) *>
+             fiber.cancel *> shutdown.complete(()) *>
                finished.complete(Left(ConsumerShutdownException())).void
            )
     } yield actor

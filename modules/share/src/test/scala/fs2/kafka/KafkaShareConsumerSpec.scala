@@ -117,6 +117,29 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       }
     }
 
+    it("should fail with ConsumerShutdownException once closed after a failure") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0")
+        val settings = ShareConsumerSettings(
+          Deserializer[IO, String],
+          Deserializer.fail[IO, String](new RuntimeException("failed"))
+        ).withProperties(shareConsumerSettings.properties)
+        val (failure, afterClose) = run(
+          KafkaShareConsumer
+            .resource(settings)
+            .allocated
+            .flatMap { case (consumer, close) =>
+              (consumer.subscribeTo(topic) *> consumer.records.compile.drain.attempt).flatMap(
+                failure => close *> consumer.commitSync.attempt.tupleLeft(failure)
+              )
+            }
+        )
+        failure.swap.toOption.get.getMessage shouldBe "failed"
+        afterClose.swap.toOption.get shouldBe a[ConsumerShutdownException]
+      }
+    }
+
     it("should fail the record stream when not subscribed") {
       val result =
         run(KafkaShareConsumer.stream(shareConsumerSettings).records.compile.drain.attempt)
