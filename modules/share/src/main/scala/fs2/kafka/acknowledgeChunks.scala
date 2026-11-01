@@ -26,14 +26,14 @@ object acknowledgeChunks {
     _.chunks
       .evalMap { chunk =>
         val decisions = chunk.toVector
-        val consumer  = decisions.headOption.map(_._1.stager.consumer)
-        // Usually a chunk goes to one consumer.
-        if (decisions.forall(d => consumer.contains(d._1.stager.consumer))) stage(decisions)
+        val stager    = decisions.headOption.map(_._1.stager)
+        // Usually a chunk goes to one consumer. Offsets mapped with different `mapK` functions are
+        // staged through each.
+        if (decisions.forall(d => stager.contains(d._1.stager))) stage(decisions)
         else {
-          val byConsumer = decisions.groupBy(_._1.stager.consumer).values.toList
-          // Consumers are staged concurrently, and the first error is raised as is.
-          F.parTraverseN(byConsumer.size)(byConsumer)(stage(_).attempt)
-            .flatMap(_.sequence_.liftTo[F])
+          val byStager = decisions.groupBy(_._1.stager).values.toList
+          // Stagers are called concurrently, and the first error is raised as is.
+          F.parTraverseN(byStager.size)(byStager)(stage(_).attempt).flatMap(_.sequence_.liftTo[F])
         }
       }
 

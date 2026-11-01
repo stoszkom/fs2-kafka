@@ -24,14 +24,11 @@ final private[kafka] case class Decision(
 
 }
 
-// Stages decisions in the Java consumer of the records they are for.
+// Stages decisions in the Java consumer of the records they are for. `acknowledgeChunks` groups
+// offsets by stager: a consumer's actor by reference, a mapped one by its stager and function.
 private[kafka] trait Stager[F[_]] {
 
   def stage(decisions: Chunk[Decision]): F[Unit]
-
-  // The consumer the decisions go to, so that `acknowledgeChunks` groups offsets by consumer, also
-  // after `mapK`.
-  def consumer: AnyRef = this
 
 }
 
@@ -40,8 +37,6 @@ private[kafka] object Stager {
   final private case class Mapped[F[_], G[_]](underlying: Stager[F], f: F ~> G) extends Stager[G] {
 
     override def stage(decisions: Chunk[Decision]): G[Unit] = f(underlying.stage(decisions))
-
-    override def consumer: AnyRef = underlying.consumer
 
   }
 

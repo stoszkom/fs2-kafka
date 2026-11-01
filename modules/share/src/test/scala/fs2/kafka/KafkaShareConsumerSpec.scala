@@ -9,6 +9,7 @@ package fs2.kafka
 import scala.collection.immutable.SortedSet
 import scala.concurrent.duration.*
 
+import cats.~>
 import cats.effect.{Deferred, IO, Ref}
 import cats.syntax.all.*
 
@@ -492,6 +493,38 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
   }
 
   describe("acknowledgeChunks") {
+    it("should stage offsets mapped with different functions through each") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0", "1")
+        val calls = run(
+          Ref
+            .of[IO, Set[String]](Set.empty)
+            .flatMap { called =>
+              def tagged(tag: String): IO ~> IO = new (IO ~> IO) {
+                def apply[A](io: IO[A]): IO[A] = called.update(_ + tag) *> io
+              }
+              val (first, second) = (tagged("first"), tagged("second"))
+              KafkaShareConsumer
+                .resource(shareConsumerSettings)
+                .use { consumer =>
+                  consumer.subscribeTo(topic) *> consumer
+                    .records
+                    .take(2)
+                    .map { r =>
+                      val f = if (r.record.value == "0") first else second
+                      r.offset.mapK(f) -> (AcknowledgeType.Accept: AcknowledgeType)
+                    }
+                    .through(acknowledgeChunks[IO])
+                    .compile
+                    .drain
+                } *> called.get
+            }
+        )
+        calls shouldBe Set("first", "second")
+      }
+    }
+
     it("should settle every record once") {
       withTopic { topic =>
         createCustomTopic(topic, partitions = 2)
