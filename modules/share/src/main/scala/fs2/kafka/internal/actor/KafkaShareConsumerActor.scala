@@ -324,8 +324,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
           val gone     = outcomes.flatMap { case (_, (_, gone, _)) => gone.map(_.position) }.toSet
           val waiting  = outcomes.collect { case (request, (_, _, None)) => request.waiting }.flatten
           val withLast = state.withStaged(last, waiting, at, byUser)
-          val staged   =
-            withLast.copy(decided = withLast.decided ++ gone, renewing = withLast.renewing -- gone)
+          val staged   = withLast.copy(decided = withLast.decided ++ gone)
           outcomes
             .traverse_ { case (request, (_, gone, error)) =>
               val result = error
@@ -352,19 +351,14 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
     timeout: FiniteDuration,
     done: Either[Throwable, CommitResult] => F[Unit]
   ): F[ShareState] =
-    commitSync(state, timeout)
-      .attempt
-      .flatTap(done)
-      .map {
-        // A commit failing before sending leaves the decisions staged.
-        case Left(error) if !error.isInstanceOf[ShareCommitTimeoutException] => state
-        case _                                                               => state.withoutDecided
-      }
+    commitStaged(state, timeout).attempt.flatTap(done).as(state.withoutDecided)
 
-  // In implicit mode, an untaken poll already accepted the earlier records, and a commit would
-  // accept it too.
-  private def commitSync(state: ShareState, timeout: FiniteDuration): F[CommitResult] =
-    if (config.implicitMode && state.unpulled.nonEmpty) F.pure(Map.empty)
+  // In implicit mode, a commit would accept a poll the stream has not taken.
+  private def holdsUntakenPoll(state: ShareState): Boolean =
+    config.implicitMode && state.unpulled.nonEmpty
+
+  private def commitStaged(state: ShareState, timeout: FiniteDuration): F[CommitResult] =
+    if (holdsUntakenPoll(state)) F.pure(Map.empty)
     else
       withConsumer
         .blocking(consumer => commitResult(consumer.commitSync(timeout.toJava)))
@@ -523,10 +517,9 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
   private def nextSend(state: ShareState): Option[FiniteDuration] =
     (state.stagedSince, config.settings.maxAcknowledgementDelay).mapN(_ + _)
 
-  // Java's `commitAsync`, which sends every staged decision. In implicit mode, it would accept an
-  // untaken poll.
+  // Java's `commitAsync`, which sends every staged decision.
   private def sendStaged(state: ShareState): F[ShareState] =
-    if (config.implicitMode && state.unpulled.nonEmpty) F.pure(state)
+    if (holdsUntakenPoll(state)) F.pure(state)
     else withConsumer.blocking(_.commitAsync()).as(state.withoutDecided)
 
   // --- Max processing time ---
@@ -587,7 +580,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
             val wakeAt  = (renewal.toList ++ send ++ limit.map(_._2)).reduceOption(_ min _)
             if (current.isFinished)
               // A failed final commit fails the stream.
-              commitSync(current, config.settings.commitTimeout)
+              commitStaged(current, config.settings.commitTimeout)
                 .attempt
                 .flatMap(result => drained.set(Some(result)) *> result.liftTo[F].void)
             else if (overdue.nonEmpty) releaseOverdue(current, overdue).flatMap(loop)

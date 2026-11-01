@@ -123,7 +123,8 @@ final private[kafka] case class ShareState(
       decided = Set.empty,
       stagedSince = None,
       renewing = stillRenewing,
-      deferred = deferred -- fresh -- lost,
+      // A renewed record returned as a new delivery is among the lost.
+      deferred = deferred -- lost,
       lock = reportedLock,
       unpulled = if (admitted.isEmpty) unpulled -- lost else admitted.map(_._1).toSet,
       pollId = if (admitted.isEmpty) pollId else pollId + 1
