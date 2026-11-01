@@ -72,7 +72,8 @@ sealed abstract class KafkaShareConsumer[F[_], K, V]
 
   /**
     * [[commitSync]] with the given timeout, which must be positive. With automatic renewal, a
-    * timeout longer than [[ShareConsumerSettings.commitTimeout]] can delay renewals past the lock.
+    * commit waiting longer than [[ShareConsumerSettings.renewalMargin]] can delay renewals past the
+    * lock.
     */
   def commitSync(timeout: FiniteDuration): F[Map[TopicPartition, Option[KafkaException]]]
 

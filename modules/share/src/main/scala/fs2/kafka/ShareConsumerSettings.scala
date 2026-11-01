@@ -189,13 +189,12 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
   def commitTimeout: FiniteDuration
 
   /**
-    * Creates a new [[ShareConsumerSettings]] with the specified [[commitTimeout]]. The value is
-    * used exactly as given.<br><br>
+    * Creates a new [[ShareConsumerSettings]] with the specified [[commitTimeout]].<br><br>
     *
-    * With [[withAutoRenewal]] enabled, the timeout must leave time to renew locks behind a commit:
-    * it must stay below the acquisition lock duration minus a safety margin of
-    * `min(lock / 10, 1 second)`, or the stream fails with a `ConfigException` once the broker
-    * reports the lock duration.
+    * A commit blocks the consumer while it waits, so with [[withAutoRenewal]] enabled, a commit
+    * waiting longer than the [[renewalMargin]] can delay renewals past the lock, and those records
+    * are delivered again. A healthy broker confirms within milliseconds; if slow commits are a
+    * concern, keep the timeout below the margin, or raise the margin.
     */
   def withCommitTimeout(timeout: FiniteDuration): ShareConsumerSettings[F, K, V]
 
@@ -236,11 +235,11 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
     * How long before a record's lock ends [[autoRenewal]] renews it. A record's lock counts from
     * the start of the poll which returned it, but Java may have fetched it earlier and kept it
     * buffered, e.g. from a second broker while you processed the previous poll; a record buffered
-    * for longer than the margin can lose its lock before it is renewed. Renewal also happens early
-    * enough for a renewal waiting behind a commit, see [[withCommitTimeout]], and within half of
-    * `max.poll.interval.ms`. Renewal repeats every lock duration minus the margin, so a margin
-    * close to the lock renews often; a margin of the whole lock or more renews at half of the
-    * lock.<br><br>
+    * for longer than the margin can lose its lock before it is renewed. A commit waiting longer
+    * than the margin can delay renewals too, see [[withCommitTimeout]]. Renewal also happens within
+    * half of `max.poll.interval.ms`. Renewal repeats every lock duration minus the margin, so a
+    * margin close to the lock renews often; a margin of the whole lock or more renews at half of
+    * the lock.<br><br>
     *
     * The default value is 5 seconds.
     */

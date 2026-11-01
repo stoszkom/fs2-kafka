@@ -395,12 +395,11 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
             case Some((records, reported)) =>
               val lock = reported.orElse(state.lock)
               // Failed renewals are applied first, so their redelivery here is a new delivery.
-              ShareTimeouts.effectiveCommitTimeout(config.settings, lock).liftTo[F] *>
-                (F.monotonic, dropFailedRenewals(state))
-                  .tupled
-                  .flatMap { case (now, current) =>
-                    polled(current, records, lock, start, now).map(withoutUnreported(_, now))
-                  }
+              (F.monotonic, dropFailedRenewals(state))
+                .tupled
+                .flatMap { case (now, current) =>
+                  polled(current, records, lock, start, now).map(withoutUnreported(_, now))
+                }
           }
       )
 
@@ -503,14 +502,12 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
     else None
   }
 
-  // The renewal margin before the lock ends, early enough to beat the lock behind a commit, and
-  // `max.poll.interval.ms`.
+  // The renewal margin before the lock ends, or half the lock, early enough for
+  // `max.poll.interval.ms`. A commit blocks renewals while it waits.
   private def renewalInterval(lock: FiniteDuration): FiniteDuration = {
     val byMargin =
       if (config.settings.renewalMargin < lock) lock - config.settings.renewalMargin else lock / 2
-    val latest = ShareTimeouts.latestRenewal(lock, config.settings.commitTimeout)
-    val bound  = if (latest > Duration.Zero) byMargin.min(latest) else byMargin
-    bound.min(config.maxPollInterval / 2)
+    byMargin.min(config.maxPollInterval / 2)
   }
 
   private def renew(state: ShareState): F[ShareState] =

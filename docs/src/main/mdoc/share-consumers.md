@@ -76,7 +76,7 @@ In addition, there are several settings specific to the library.
 
 - `withCloseTimeout` controls the timeout when waiting for consumer shutdown. Default is 20 seconds.
 
-- `withCommitTimeout` sets how long to wait for the broker to confirm a commit. Default is 15 seconds. With auto-renewal, it must be shorter than the lock, with a small margin, or the stream fails with a `ConfigException`; the default suits locks of about 17 seconds and longer.
+- `withCommitTimeout` sets how long to wait for the broker to confirm a commit. Default is 15 seconds. A commit blocks the consumer while it waits, so with auto-renewal, a commit waiting longer than the renewal margin delays renewals and can let locks expire. A healthy broker confirms within milliseconds; if slow commits are a concern, keep the commit timeout below the margin, or raise the margin.
 
 - `withMaxProcessingTime` sets how long a record may be held without a decision before it is released, so a hung record does not hold back its consumer. No limit by default, or with `withoutMaxProcessingTime`; a limit can be at most 365 days. See [renewal](#renewal).
 
@@ -182,7 +182,7 @@ def processOrReject(
 
 A record which is not acknowledged within its acquisition lock, 30 seconds by default, is delivered again, possibly to another consumer, and its later acknowledgement fails. As in Java, records are not renewed automatically, except to let a renewed record be acknowledged, see below. We can renew a record with `Renew`, any number of times before its final acknowledgement.
 
-With `withAutoRenewal(true)`, records without an acknowledgement are renewed `withRenewalMargin` (5 seconds by default) before their lock ends, or earlier when the commit timeout or half of `max.poll.interval.ms` requires it. A record's lock counts from the start of the poll which returned it. Java can fetch records earlier and keep them buffered, for example from a second broker while you process the previous poll; a record buffered for longer than the margin can lose its lock before it is renewed, so raise the margin if polls take long to process. Enable it when processing may outlast the lock. Note that a record whose processing hangs is then renewed, and holds back its consumer, until the consumer is closed or stopped, unless you set a max processing time.
+With `withAutoRenewal(true)`, records without an acknowledgement are renewed `withRenewalMargin` (5 seconds by default) before their lock ends, or earlier when half of `max.poll.interval.ms` requires it. A commit blocks renewals while it waits, see `withCommitTimeout`. A record's lock counts from the start of the poll which returned it. Java can fetch records earlier and keep them buffered, for example from a second broker while you process the previous poll; a record buffered for longer than the margin can lose its lock before it is renewed, so raise the margin if polls take long to process. Enable it when processing may outlast the lock. Note that a record whose processing hangs is then renewed, and holds back its consumer, until the consumer is closed or stopped, unless you set a max processing time.
 
 - **A slow record holds back its consumer.** Renewing lets the consumer poll again, but Java then returns only the renewed records, and polls new ones only once every record is settled. Use [several consumers](#several-consumers) to keep polling past slow records; `withMaxProcessingTime` only lets go of records that take too long.
 
