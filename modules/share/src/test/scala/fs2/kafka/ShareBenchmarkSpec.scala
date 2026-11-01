@@ -93,19 +93,10 @@ final class ShareBenchmarkSpec extends ShareConsumerBaseKafkaSpec {
         }
     )
 
-  private def acknowledgeChunksPipe(
-    work: Option[IO[Unit]]
-  )(records: Records): fs2.Stream[IO, Unit] =
-    work
-      .fold(records.map(r => r.offset -> (AcknowledgeType.Accept: AcknowledgeType))) { w =>
-        records.parEvalMapUnordered(parallelism)(r =>
-          w.as(r.offset -> (AcknowledgeType.Accept: AcknowledgeType))
-        )
-      }
-      .through(acknowledgeChunks[IO])
-
-  private def acknowledgePerRecord(work: IO[Unit])(records: Records): fs2.Stream[IO, Unit] =
-    records.parEvalMapUnordered(parallelism)(r => work *> r.accept)
+  private def acknowledgePerRecord(work: Option[IO[Unit]])(records: Records): fs2.Stream[IO, Unit] =
+    work.fold(records.evalMap(_.accept))(w =>
+      records.parEvalMapUnordered(parallelism)(r => w *> r.accept)
+    )
 
   // Java's equivalent: a pool processes each poll's records, then the poll thread acknowledges them.
   private def javaConsumer(topic: String, count: Int, work: Option[() => Unit]): Unit = {
@@ -158,14 +149,7 @@ final class ShareBenchmarkSpec extends ShareConsumerBaseKafkaSpec {
     time(s"java, $label", count)(
       javaConsumer(topic, count, work.map(d => () => Thread.sleep(d.toMillis)))
     )
-    time(s"fs2 acknowledgeChunks, $label", count)(
-      fs2Consumer(topic, count)(acknowledgeChunksPipe(fs2Work))
-    )
-    fs2Work.foreach { w =>
-      time(s"fs2 acknowledge per record, $label", count)(
-        fs2Consumer(topic, count)(acknowledgePerRecord(w))
-      )
-    }
+    time(s"fs2, $label", count)(fs2Consumer(topic, count)(acknowledgePerRecord(fs2Work)))
   }
 
   describe("throughput") {

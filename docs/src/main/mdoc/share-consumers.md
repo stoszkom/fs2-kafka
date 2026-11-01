@@ -122,26 +122,11 @@ As in Java, `acknowledge` stages a decision in the consumer, and sends nothing. 
 
 - `record.accept`, `release`, `reject` and `renew` stage one decision, as does `acknowledge(AcknowledgeType)`. They are on the record and on its `offset`.
 
-- `acknowledgeChunks` stages the decisions of each chunk with one call per consumer, which saves work when processing is fast.
-
 - `KafkaShareConsumer#commitSync` sends every staged decision at once and waits for the result per partition, as a `Map[TopicPartition, Option[KafkaException]]`, as Java's `commitSync` does. It waits for the commit timeout, or for the timeout given to `commitSync(timeout)`. A partition the broker does not confirm in time has Kafka's `TimeoutException` as its result; a commit that times out before it is sent fails with a `ShareCommitTimeoutException`.
 
 - `KafkaShareConsumer#commitAsync` sends every staged decision without waiting, as Java's `commitAsync` does, and reports no results.
 
-```scala mdoc:silent
-val chunked: IO[Unit] =
-  KafkaShareConsumer.stream(settings)
-    .subscribeTo("jobs")
-    .records
-    .parEvalMapUnordered(32) { record =>
-      process(record.record).as(record.offset -> (AcknowledgeType.Accept: AcknowledgeType))
-    }
-    .through(acknowledgeChunks[IO])
-    .compile
-    .drain
-```
-
-As in Java, the last decision for a record wins until it is sent. Once sent, a later decision fails with a `RecordNotInFlightException`; so does a decision for a delivery the consumer no longer holds: its renewal failed, the consumer released it after the max processing time, or the offset belongs to an earlier delivery. `acknowledgeChunks` skips these, as the record is delivered again.
+As in Java, the last decision for a record wins until it is sent. Once sent, a later decision fails with a `RecordNotInFlightException`; so does a decision for a delivery the consumer no longer holds: its renewal failed, the consumer released it after the max processing time, or the offset belongs to an earlier delivery. Ignoring it is usually enough, as the record is delivered again.
 
 Staging succeeds without asking the broker, so a decision for a record whose lock has expired is only rejected when it is sent. The broker's `InvalidRecordStateException` then appears in the results of `commitSync`; a poll, `commitAsync`, or a send after the max acknowledgement delay, sends decisions without reporting results. Errors are reported per partition, so an error applies to every decision of that partition in the same request.
 
@@ -209,7 +194,7 @@ With `withAutoRenewal(true)`, records without an acknowledgement are renewed `wi
 
 - **Implicit acknowledgement** is at-most-once here. In a Java poll loop, the next poll comes after processing. A stream polls in the background instead, once it has taken the previous poll, so records may still be processing, for example in `parEvalMapUnordered`, when they are accepted. A record whose processing fails is not delivered again, similar to `withEnableAutoCommit(true)` on `KafkaConsumer`. Use explicit acknowledgement for at-least-once.
 
-With implicit acknowledgement, records are not renewed, as Java does not allow it, `acknowledge` and `acknowledgeChunks` fail with an `ImplicitAcknowledgementException`, and `commitSync` and `commitAsync` accept the latest poll once the stream has taken it. As the consumer polls again once the stream took a poll, and that poll accepts the one before, a commit usually finds nothing to accept, and `commitSync` returns an empty result. After `stopConsuming`, the last poll is accepted once the stream has taken it. A poll the stream never took is not accepted, and closing the consumer releases its records; a poll counts as taken once the stream asks for the records after it, so records skipped by `take` are not accepted.
+With implicit acknowledgement, records are not renewed, as Java does not allow it, acknowledging fails with an `ImplicitAcknowledgementException`, and `commitSync` and `commitAsync` accept the latest poll once the stream has taken it. As the consumer polls again once the stream took a poll, and that poll accepts the one before, a commit usually finds nothing to accept, and `commitSync` returns an empty result. After `stopConsuming`, the last poll is accepted once the stream has taken it. A poll the stream never took is not accepted, and closing the consumer releases its records; a poll counts as taken once the stream asks for the records after it, so records skipped by `take` are not accepted.
 
 ```scala mdoc:silent
 val atMostOnce: IO[Unit] =

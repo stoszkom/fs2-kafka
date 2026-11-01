@@ -62,7 +62,9 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
 
   // Java's `commitSync`; after the actor finished, the result of its final commit.
   def commitSync(timeout: FiniteDuration): F[CommitResult] =
-    ask(ShareRequest.CommitSync(timeout, _), identity)
+    if (timeout <= Duration.Zero)
+      F.raiseError(new IllegalArgumentException("commit timeout must be positive"))
+    else ask(ShareRequest.CommitSync(timeout, _), identity)
 
   // Java's `commitAsync`; after the actor finished, fails only if its final commit failed.
   def commitAsync: F[Unit] =
@@ -196,9 +198,9 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
       case ShareRequest.Stage(decisions, done) =>
         stageAll(state, Vector(decisions -> done), send = false, byUser = true)
       case ShareRequest.CommitSync(timeout, done) => commit(state, timeout, done)
-      // A failure is the caller's, and leaves the decisions staged.
+      // A failed send fails the actor, as Java's `commitAsync` fails only on a broken consumer.
       case ShareRequest.CommitAsync(done) =>
-        sendStaged(state).attempt.flatTap(r => done(r.void)).map(_.getOrElse(state))
+        sendStaged(state).attempt.flatTap(r => done(r.void)).flatMap(_.liftTo[F])
     }
 
   // Releases a poll the stream never took; renewing records once a poll returns them. In implicit
@@ -249,30 +251,33 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
     val stagings = batch.map { case (own, done) => Staging(state, own, done) }
     val now      = stagings.flatMap(_.now)
     val sending  = send || now.exists(_.acknowledgeType == AcknowledgeType.Renew)
-    // Per request: how many decisions Java staged, and its error.
-    val calls: F[Vector[(Int, Option[Throwable])]] =
-      if (now.isEmpty && !send) F.pure(stagings.as((0, None)))
+    // Per request: the decisions Java staged, those it no longer holds, and its error.
+    val calls: F[Vector[(Vector[Decision], Vector[Decision], Option[Throwable])]] =
+      if (now.isEmpty && !send) F.pure(stagings.as((Vector.empty, Vector.empty, None)))
       else
         withConsumer.blocking { consumer =>
           val staged = stagings.map { request =>
-            var count   = 0
-            val staging = scala
+            val done  = Vector.newBuilder[Decision]
+            val gone  = Vector.newBuilder[Decision]
+            val error = scala
               .util
               .Try(
                 request
                   .now
                   .foreach { d =>
-                    try
+                    try {
                       consumer.acknowledge(state.held(d.position).record, d.acknowledgeType.asJava)
-                    catch {
+                      done += d
+                    } catch {
                       // Java no longer holds it, e.g. after a commit failed once sent.
-                      case _: IllegalStateException =>
-                        throw RecordNotInFlightException(d.topicPartition, d.offset)
+                      case e: IllegalStateException if e.getMessage == notAcknowledgeable =>
+                        gone += d
                     }
-                    count += 1
                   }
               )
-            (count, staging.failed.toOption)
+              .failed
+              .toOption
+            (done.result(), gone.result(), error)
           }
           // A failed send fails the actor.
           if (sending) consumer.commitAsync()
@@ -283,19 +288,25 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
       .flatMap {
         case (at, Right(results)) =>
           // Tracks what Java staged, also of a request that failed part-way. The last one wins.
+          // Records Java no longer holds count as decided, so that they are dropped once sent.
           val outcomes = stagings.zip(results)
           val last     = outcomes
-            .flatMap { case (request, (count, _)) => request.now.take(count) }
+            .flatMap { case (_, (done, _, _)) => done }
             .map(d => d.position -> d.acknowledgeType)
             .toMap
-          val waiting = outcomes.collect { case (request, (_, None)) => request.waiting }.flatten
-          val staged  = state.withStaged(last, waiting, at, byUser)
+          val gone     = outcomes.flatMap { case (_, (_, gone, _)) => gone.map(_.position) }.toSet
+          val waiting  = outcomes.collect { case (request, (_, _, None)) => request.waiting }.flatten
+          val withLast = state.withStaged(last, waiting, at, byUser)
+          val staged   =
+            withLast.copy(decided = withLast.decided ++ gone, renewing = withLast.renewing -- gone)
           outcomes
-            .traverse_ { case (request, (_, error)) =>
+            .traverse_ { case (request, (_, gone, error)) =>
               request.done(
                 error
                   .orElse(
-                    request.notHeld.map(d => RecordNotInFlightException(d.topicPartition, d.offset))
+                    (gone ++ request.notHeld)
+                      .headOption
+                      .map(d => RecordNotInFlightException(d.topicPartition, d.offset))
                   )
                   .toLeft(())
               )
@@ -614,9 +625,11 @@ private[kafka] object KafkaShareConsumerActor {
 
   }
 
-  // How long the actor waits between checks of the subscription, and between prompt renewals.
   // How often an unsubscribed consumer checks for a subscription.
   val subscriptionCheckInterval: FiniteDuration = 50.millis
+
+  // Java's error for a record it no longer holds.
+  val notAcknowledgeable = "The record cannot be acknowledged."
 
   // Half of the shortest lock a broker allows, while the broker has not reported the lock.
   val unknownLockRenewalInterval: FiniteDuration = 500.millis

@@ -238,7 +238,9 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
     * buffered, e.g. from a second broker while you processed the previous poll; a record buffered
     * for longer than the margin can lose its lock before it is renewed. Renewal also happens early
     * enough for a renewal waiting behind a commit, see [[withCommitTimeout]], and within half of
-    * `max.poll.interval.ms`. A margin of the whole lock or more renews at half of the lock.<br><br>
+    * `max.poll.interval.ms`. Renewal repeats every lock duration minus the margin, so a margin
+    * close to the lock renews often; a margin of the whole lock or more renews at half of the
+    * lock.<br><br>
     *
     * The default value is 5 seconds.
     */
@@ -252,8 +254,8 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
   /**
     * How long the consumer may hold a record without a decision, or `None` for no limit. A record
     * held longer is released and delivered again; its processing is not cancelled, and its later
-    * decision fails with a [[RecordNotInFlightException]], which [[acknowledgeChunks]] skips. It
-    * applies with explicit acknowledgement.<br><br>
+    * decision fails with a [[RecordNotInFlightException]], which can be ignored. It applies with
+    * explicit acknowledgement.<br><br>
     *
     * The time counts from when the stream took the record's poll, or from its latest `Renew` by the
     * user. Set it well above the time to process a whole poll: `max.poll.records` times the time
