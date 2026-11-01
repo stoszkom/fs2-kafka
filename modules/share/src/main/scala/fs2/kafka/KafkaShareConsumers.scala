@@ -31,6 +31,12 @@ sealed abstract class KafkaShareConsumers[F[_], K, V]
   def consumers: NonEmptyVector[KafkaShareConsumer[F, K, V]]
 
   /**
+    * Returns the topics any of the consumers is subscribed to. The consumers are subscribed one
+    * after another, so they differ only after a `subscribe` or `unsubscribe` failed part-way.
+    */
+  override def subscription: F[SortedSet[String]]
+
+  /**
     * `Stream` of the records of all consumers, merged into a single `Stream` of
     * [[AcknowledgeableConsumerRecord]]s. A poll counts as handed out only once it leaves the merge,
     * so polls still buffered in the merge when this `Stream` ends are released.<br><br>
@@ -89,7 +95,8 @@ object KafkaShareConsumers {
 
       override def unsubscribe: F[Unit] = values.traverse_(_.unsubscribe)
 
-      override def subscription: F[SortedSet[String]] = values.head.subscription
+      override def subscription: F[SortedSet[String]] =
+        values.traverse(_.subscription).map(_.reduceLeft(_ ++ _))
 
       override def records: Stream[F, AcknowledgeableConsumerRecord[F, K, V]] =
         Stream.emits(values.toVector).map(_.polls).parJoin(values.length).flatten

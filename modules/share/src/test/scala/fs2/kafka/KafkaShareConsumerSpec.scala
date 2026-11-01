@@ -1107,6 +1107,20 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
   }
 
   describe("several consumers") {
+    it("should return the union of the consumers' subscriptions") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        val subscription = run(
+          KafkaShareConsumer
+            .resource(shareConsumerSettings, 2)
+            .use { consumers =>
+              consumers.consumers.last.subscribeTo(topic) *> consumers.subscription
+            }
+        )
+        subscription shouldBe SortedSet(topic)
+      }
+    }
+
     it("should settle every record once across merged records, with suffixed client ids") {
       withTopic { topic =>
         createCustomTopic(topic, partitions = 3)
