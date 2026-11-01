@@ -90,14 +90,13 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
               case Left(error) => F.pure(error.asLeft[Unit])
               case Right(_)    => F.never[Either[Throwable, Unit]]
             }
-          Stream.exec(requests.offer(ShareRequest.Start())) ++
+          // The finalizer also covers an interruption right after Start.
+          (Stream.exec(requests.offer(ShareRequest.Start())) ++
             Stream
               .fromQueueNoneTerminated(output)
               .map { case (id, chunk) =>
                 handOut(chunk, requests.offer(ShareRequest.HandedOut(id)))
-              }
-              .onFinalize(requests.offer(ShareRequest.ReaderClosed()))
-              .interruptWhen(failed)
+              }).onFinalize(requests.offer(ShareRequest.ReaderClosed())).interruptWhen(failed)
       }
 
   // A poll counts as handed out as the stream takes its chunk. In implicit mode, where that
