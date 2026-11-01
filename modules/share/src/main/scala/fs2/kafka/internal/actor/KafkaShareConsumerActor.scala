@@ -15,10 +15,10 @@ import cats.effect.std.Queue
 import cats.syntax.all.*
 import fs2.{Chunk, Stream}
 import fs2.kafka.*
+import fs2.kafka.internal.{Logging, WithShareConsumer}
 import fs2.kafka.internal.actor.KafkaShareConsumerActor.*
 import fs2.kafka.internal.converters.collection.*
 import fs2.kafka.internal.syntax.*
-import fs2.kafka.internal.WithShareConsumer
 
 import org.apache.kafka.clients.consumer.AcknowledgementCommitCallback
 import org.apache.kafka.common.{KafkaException, TopicIdPartition, TopicPartition}
@@ -45,7 +45,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
   finished: Deferred[F, Either[Throwable, Unit]],
   drained: Ref[F, Option[Either[Throwable, KafkaShareConsumerActor.CommitResult]]],
   waiters: Ref[F, Vector[KafkaShareConsumerActor.Waiter[F]]]
-)(implicit F: Async[F], logging: ShareLogging[F])
+)(implicit F: Async[F], logging: Logging[F])
     extends Stager[F] {
 
   // After the actor finished, it holds no records.
@@ -686,7 +686,7 @@ private[kafka] object KafkaShareConsumerActor {
     id: Int
   )(implicit F: Async[F]): Resource[F, KafkaShareConsumerActor[F, K, V]] =
     for {
-      logging  <- Resource.eval(ShareLogging.create[F]("fs2.kafka.KafkaShareConsumer$" + id))
+      logging  <- Resource.eval(Logging.create[F]("fs2.kafka.KafkaShareConsumer$" + id))
       requests <- Resource.eval(Queue.unbounded[F, ShareRequest[F]])
       output   <-
         Resource.eval(

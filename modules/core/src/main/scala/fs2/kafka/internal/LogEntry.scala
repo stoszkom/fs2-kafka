@@ -21,7 +21,8 @@ import fs2.kafka.CommittableConsumerRecord
 import org.apache.kafka.clients.consumer.OffsetAndMetadata
 import org.apache.kafka.common.TopicPartition
 
-sealed abstract private[kafka] class LogEntry {
+// Not sealed, so that the share consumer's entries can use `Logging`.
+abstract private[kafka] class LogEntry {
 
   def level: LogLevel
 

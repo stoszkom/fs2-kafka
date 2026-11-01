@@ -8,23 +8,13 @@ package fs2.kafka.internal.actor
 
 import scala.concurrent.duration.FiniteDuration
 
-import cats.effect.Sync
-import cats.syntax.all.*
-import fs2.kafka.internal.LogLevel
+import fs2.kafka.internal.{LogEntry, LogLevel}
 import fs2.kafka.internal.LogLevel.{Debug, Warn}
-
-import org.slf4j.LoggerFactory
 
 /**
   * What a [[KafkaShareConsumerActor]] logs, like `LogEntry` for `KafkaConsumerActor`.
   */
-sealed abstract private[kafka] class ShareLogEntry {
-
-  def level: LogLevel
-
-  def message: String
-
-}
+sealed abstract private[kafka] class ShareLogEntry extends LogEntry
 
 private[kafka] object ShareLogEntry {
 
@@ -54,40 +44,5 @@ private[kafka] object ShareLogEntry {
     }
 
   }
-
-}
-
-/**
-  * Logs [[ShareLogEntry]]s with SLF4J.
-  */
-sealed abstract private[kafka] class ShareLogging[F[_]] {
-
-  def log(entry: ShareLogEntry): F[Unit]
-
-}
-
-private[kafka] object ShareLogging {
-
-  def create[F[_]](name: String)(implicit F: Sync[F]): F[ShareLogging[F]] =
-    F.delay(LoggerFactory.getLogger(name))
-      .map { logger =>
-        new ShareLogging[F] {
-
-          override def log(entry: ShareLogEntry): F[Unit] =
-            F.delay {
-              entry.level match {
-                case LogLevel.Error =>
-                  if (logger.isErrorEnabled) logger.error(entry.message)
-                case LogLevel.Warn =>
-                  if (logger.isWarnEnabled) logger.warn(entry.message)
-                case LogLevel.Info =>
-                  if (logger.isInfoEnabled) logger.info(entry.message)
-                case LogLevel.Debug =>
-                  if (logger.isDebugEnabled) logger.debug(entry.message)
-              }
-            }
-
-        }
-      }
 
 }
