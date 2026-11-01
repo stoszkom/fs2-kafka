@@ -42,13 +42,10 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         createCustomTopic(topic)
         publish(topic, "0")
         val (subscription, lockDuration, metrics) = run(
-          KafkaShareConsumer
-            .resource(shareConsumerSettings)
-            .use { consumer =>
-              consumer.subscribeTo(topic) *>
-                consumer.records.take(1).evalMap(_.accept).compile.drain *>
-                (consumer.subscription, consumer.acquisitionLockTimeout, consumer.metrics).tupled
-            }
+          subscribed(shareConsumerSettings, topic) { consumer =>
+            consumer.records.take(1).evalMap(_.accept).compile.drain *>
+              (consumer.subscription, consumer.acquisitionLockTimeout, consumer.metrics).tupled
+          }
         )
         subscription shouldBe SortedSet(topic)
         lockDuration shouldBe Some(lock)
@@ -152,17 +149,14 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         createCustomTopic(topic)
         publish(topic, "0")
         val result = run(
-          KafkaShareConsumer
-            .resource(shareConsumerSettings)
-            .use { consumer =>
-              consumer.subscribeTo(topic) *>
-                consumer
-                  .records
-                  .take(1)
-                  .evalMap(r => consumer.records.compile.drain.attempt <* r.accept)
-                  .compile
-                  .lastOrError
-            }
+          subscribed(shareConsumerSettings, topic) { consumer =>
+            consumer
+              .records
+              .take(1)
+              .evalMap(r => consumer.records.compile.drain.attempt <* r.accept)
+              .compile
+              .lastOrError
+          }
         )
         result.swap.toOption.get shouldBe a[StreamAlreadyStartedException]
       }
@@ -207,8 +201,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
             .compile
             .drain
         )
-        publish(topic, "after")
-        readUntil(topic, settings, "after") shouldBe Vector("after" -> 1)
+        assertSettled(topic, settings)
       }
     }
 
@@ -277,29 +270,26 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         publish(topic, "0", "1")
         val settings = shareConsumerSettings.withMaxPollRecords(2)
         val results  = run(
-          KafkaShareConsumer
-            .resource(settings.withMaxAcknowledgementDelay(100.millis))
-            .use { consumer =>
-              consumer.subscribeTo(topic) *> consumer
-                .records
-                .zipWithIndex
-                .evalMap {
-                  case (r, 0) => r.accept.as(None)
-                  case (r, _) => IO.pure(Some(r))
-                }
-                .unNone
-                .take(1)
-                .compile
-                .lastOrError
-                .flatMap(second =>
-                  IO.sleep(1.second) *> consumer.commitSync <*
-                    second.accept
-                )
-            }
+          subscribed(settings.withMaxAcknowledgementDelay(100.millis), topic) { consumer =>
+            consumer
+              .records
+              .zipWithIndex
+              .evalMap {
+                case (r, 0) => r.accept.as(None)
+                case (r, _) => IO.pure(Some(r))
+              }
+              .unNone
+              .take(1)
+              .compile
+              .lastOrError
+              .flatMap(second =>
+                IO.sleep(1.second) *> consumer.commitSync <*
+                  second.accept
+              )
+          }
         )
         results shouldBe empty
-        publish(topic, "after")
-        readUntil(topic, settings, "after") shouldBe Vector("after" -> 1)
+        assertSettled(topic, settings)
       }
     }
 
@@ -309,28 +299,25 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         publish(topic, "0", "1")
         val settings = shareConsumerSettings
         val results  = run(
-          KafkaShareConsumer
-            .resource(settings)
-            .use { consumer =>
-              consumer.subscribeTo(topic) *> consumer
-                .records
-                .zipWithIndex
-                .evalMap {
-                  case (r, 0) => r.accept.as(None)
-                  case (r, _) => IO.pure(Some(r))
-                }
-                .unNone
-                .take(1)
-                .compile
-                .lastOrError
-                .flatMap(second => consumer.commitSync <* second.accept)
-            }
+          subscribed(settings, topic) { consumer =>
+            consumer
+              .records
+              .zipWithIndex
+              .evalMap {
+                case (r, 0) => r.accept.as(None)
+                case (r, _) => IO.pure(Some(r))
+              }
+              .unNone
+              .take(1)
+              .compile
+              .lastOrError
+              .flatMap(second => consumer.commitSync <* second.accept)
+          }
         )
         // Both records usually come in one poll, so the commit sends the first's decision; if not,
         // the poll for the second sent it.
         results.values.flatten shouldBe empty
-        publish(topic, "after")
-        readUntil(topic, settings, "after") shouldBe Vector("after" -> 1)
+        assertSettled(topic, settings)
       }
     }
     // Without the delay or a poll, only commitAsync sends the first's decision before commitSync.
@@ -340,26 +327,23 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         publish(topic, "0", "1")
         val settings = shareConsumerSettings.withMaxPollRecords(2)
         val results  = run(
-          KafkaShareConsumer
-            .resource(settings.withoutMaxAcknowledgementDelay)
-            .use { consumer =>
-              consumer.subscribeTo(topic) *> consumer
-                .records
-                .zipWithIndex
-                .evalMap {
-                  case (r, 0) => (r.accept *> consumer.commitAsync).as(None)
-                  case (r, _) => IO.pure(Some(r))
-                }
-                .unNone
-                .take(1)
-                .compile
-                .lastOrError
-                .flatMap(second => IO.sleep(1.second) *> consumer.commitSync <* second.accept)
-            }
+          subscribed(settings.withoutMaxAcknowledgementDelay, topic) { consumer =>
+            consumer
+              .records
+              .zipWithIndex
+              .evalMap {
+                case (r, 0) => (r.accept *> consumer.commitAsync).as(None)
+                case (r, _) => IO.pure(Some(r))
+              }
+              .unNone
+              .take(1)
+              .compile
+              .lastOrError
+              .flatMap(second => IO.sleep(1.second) *> consumer.commitSync <* second.accept)
+          }
         )
         results shouldBe empty
-        publish(topic, "after")
-        readUntil(topic, settings, "after") shouldBe Vector("after" -> 1)
+        assertSettled(topic, settings)
       }
     }
 
@@ -369,20 +353,17 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         publish(topic, (0 until 10).map(_.toString)*)
         val settings = shareConsumerSettings.withMaxPollRecords(5)
         run(
-          KafkaShareConsumer
-            .resource(settings)
-            .use { consumer =>
-              consumer.subscribeTo(topic) *> consumer
-                .records
-                .map(_.offset -> (AcknowledgeType.Accept: AcknowledgeType))
-                .take(10)
-                .through(acknowledgeChunks[IO])
-                .compile
-                .drain
-            }
+          subscribed(settings, topic) { consumer =>
+            consumer
+              .records
+              .map(_.offset -> (AcknowledgeType.Accept: AcknowledgeType))
+              .take(10)
+              .through(acknowledgeChunks[IO])
+              .compile
+              .drain
+          }
         )
-        publish(topic, "after")
-        readUntil(topic, settings, "after") shouldBe Vector("after" -> 1)
+        assertSettled(topic, settings)
       }
     }
     it("should let the last of several decisions staged together for a record win") {
@@ -391,22 +372,20 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         publish(topic, "0")
         val settings = shareConsumerSettings
         run(
-          KafkaShareConsumer
-            .resource(settings)
-            .use { consumer =>
-              consumer.subscribeTo(topic) *> consumer
-                .records
-                .take(1)
-                .flatMap(r =>
-                  fs2.Stream(
-                    r.offset -> (AcknowledgeType.Accept: AcknowledgeType),
-                    r.offset -> (AcknowledgeType.Release: AcknowledgeType)
-                  )
+          subscribed(settings, topic) { consumer =>
+            consumer
+              .records
+              .take(1)
+              .flatMap(r =>
+                fs2.Stream(
+                  r.offset -> (AcknowledgeType.Accept: AcknowledgeType),
+                  r.offset -> (AcknowledgeType.Release: AcknowledgeType)
                 )
-                .through(acknowledgeChunks[IO])
-                .compile
-                .drain *> consumer.commitSync
-            }
+              )
+              .through(acknowledgeChunks[IO])
+              .compile
+              .drain *> consumer.commitSync
+          }
         )
         // The release won, so the record is delivered again (this consumer may poll it once more).
         val again = readUntil(topic, settings, "0")
@@ -419,19 +398,17 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         createCustomTopic(topic)
         publish(topic, "0")
         val late = run(
-          KafkaShareConsumer
-            .resource(shareConsumerSettings)
-            .use { consumer =>
-              consumer.subscribeTo(topic) *> consumer
-                .records
-                .take(1)
-                .evalMap(r =>
-                  r.accept *> consumer.commitSync *>
-                    r.reject.attempt
-                )
-                .compile
-                .lastOrError
-            }
+          subscribed(shareConsumerSettings, topic) { consumer =>
+            consumer
+              .records
+              .take(1)
+              .evalMap(r =>
+                r.accept *> consumer.commitSync *>
+                  r.reject.attempt
+              )
+              .compile
+              .lastOrError
+          }
         )
         late.swap.toOption.get shouldBe a[RecordNotInFlightException]
       }
@@ -443,16 +420,14 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         createCustomTopic(topic)
         publish(topic, "0", "1")
         val result = run(
-          KafkaShareConsumer
-            .resource(shareConsumerSettings.withMaxPollRecords(2))
-            .use { consumer =>
-              consumer.subscribeTo(topic) *> consumer
-                .records
-                .take(1)
-                .evalMap(_.accept *> consumer.commitSync(1.nano).attempt)
-                .compile
-                .lastOrError
-            }
+          subscribed(shareConsumerSettings.withMaxPollRecords(2), topic) { consumer =>
+            consumer
+              .records
+              .take(1)
+              .evalMap(_.accept *> consumer.commitSync(1.nano).attempt)
+              .compile
+              .lastOrError
+          }
         )
         result.swap.toOption.get shouldBe a[ShareCommitTimeoutException]
       }
@@ -505,20 +480,18 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
                 def apply[A](io: IO[A]): IO[A] = called.update(_ + tag) *> io
               }
               val (first, second) = (tagged("first"), tagged("second"))
-              KafkaShareConsumer
-                .resource(shareConsumerSettings)
-                .use { consumer =>
-                  consumer.subscribeTo(topic) *> consumer
-                    .records
-                    .take(2)
-                    .map { r =>
-                      val f = if (r.record.value == "0") first else second
-                      r.offset.mapK(f) -> (AcknowledgeType.Accept: AcknowledgeType)
-                    }
-                    .through(acknowledgeChunks[IO])
-                    .compile
-                    .drain
-                } *> called.get
+              subscribed(shareConsumerSettings, topic) { consumer =>
+                consumer
+                  .records
+                  .take(2)
+                  .map { r =>
+                    val f = if (r.record.value == "0") first else second
+                    r.offset.mapK(f) -> (AcknowledgeType.Accept: AcknowledgeType)
+                  }
+                  .through(acknowledgeChunks[IO])
+                  .compile
+                  .drain
+              } *> called.get
             }
         )
         calls shouldBe Set("first", "second")
@@ -608,17 +581,14 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         publish(topic, produced*)
         val settings = implicitSettings
         val consumed = run(
-          KafkaShareConsumer
-            .resource(settings)
-            .use { consumer =>
-              consumer.subscribeTo(topic) *>
-                consumer
-                  .records
-                  .map(_.record.value)
-                  .evalTap(value => consumer.stopConsuming.whenA(value == produced.last))
-                  .compile
-                  .toVector
-            }
+          subscribed(settings, topic) { consumer =>
+            consumer
+              .records
+              .map(_.record.value)
+              .evalTap(value => consumer.stopConsuming.whenA(value == produced.last))
+              .compile
+              .toVector
+          }
         )
         consumed shouldBe produced
         publish(topic, "after")
@@ -662,16 +632,9 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
           .withAutoRenewal(true)
           .withCommitTimeout(lock)
         val values = run(
-          KafkaShareConsumer
-            .resource(settings)
-            .use { consumer =>
-              consumer.subscribeTo(topic) *> consumer
-                .records
-                .evalTap(_ => consumer.stopConsuming)
-                .map(_.record.value)
-                .compile
-                .toList
-            }
+          subscribed(settings, topic) { consumer =>
+            consumer.records.evalTap(_ => consumer.stopConsuming).map(_.record.value).compile.toList
+          }
         )
         values shouldBe List("0")
       }
@@ -711,22 +674,19 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         publish(topic, "0")
         val settings = shareConsumerSettings
         run(
-          KafkaShareConsumer
-            .resource(settings)
-            .use { consumer =>
-              consumer.subscribeTo(topic) *> consumer
-                .records
-                .take(1)
-                .evalMap(r =>
-                  r.renew *>
-                    r.accept
-                )
-                .compile
-                .drain
-            }
+          subscribed(settings, topic) { consumer =>
+            consumer
+              .records
+              .take(1)
+              .evalMap(r =>
+                r.renew *>
+                  r.accept
+              )
+              .compile
+              .drain
+          }
         )
-        publish(topic, "after")
-        readUntil(topic, settings, "after") shouldBe Vector("after" -> 1)
+        assertSettled(topic, settings)
       }
     }
     it("should send a decision for a renewed record while another record is slow") {
@@ -735,24 +695,21 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         publish(topic, "0", "1")
         val settings = shareConsumerSettings
         run(
-          KafkaShareConsumer
-            .resource(settings)
-            .use { consumer =>
-              consumer.subscribeTo(topic) *> consumer
-                .records
-                .take(2)
-                .parEvalMapUnordered(2) { r =>
-                  if (r.record.value == "0")
-                    r.renew *> IO.sleep(1.second) *>
-                      r.accept
-                  else IO.sleep(lock * 4 / 3) *> r.accept
-                }
-                .compile
-                .drain *> consumer.commitSync
-            }
+          subscribed(settings, topic) { consumer =>
+            consumer
+              .records
+              .take(2)
+              .parEvalMapUnordered(2) { r =>
+                if (r.record.value == "0")
+                  r.renew *> IO.sleep(1.second) *>
+                    r.accept
+                else IO.sleep(lock * 4 / 3) *> r.accept
+              }
+              .compile
+              .drain *> consumer.commitSync
+          }
         )
-        publish(topic, "after")
-        readUntil(topic, settings, "after") shouldBe Vector("after" -> 1)
+        assertSettled(topic, settings)
       }
     }
 
@@ -761,19 +718,17 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         createCustomTopic(topic)
         publish(topic, "0", "1")
         run(
-          KafkaShareConsumer
-            .resource(shareConsumerSettings.withMaxPollRecords(2))
-            .use { consumer =>
-              consumer.subscribeTo(topic) *> consumer
-                .records
-                .take(2)
-                .parEvalMapUnordered(2) { r =>
-                  if (r.record.value == "0") r.renew
-                  else IO.sleep(1.second) *> consumer.unsubscribe *> r.accept.attempt.void
-                }
-                .compile
-                .drain *> consumer.stopConsuming *> consumer.awaitTermination.timeout(30.seconds)
-            }
+          subscribed(shareConsumerSettings.withMaxPollRecords(2), topic) { consumer =>
+            consumer
+              .records
+              .take(2)
+              .parEvalMapUnordered(2) { r =>
+                if (r.record.value == "0") r.renew
+                else IO.sleep(1.second) *> consumer.unsubscribe *> r.accept.attempt.void
+              }
+              .compile
+              .drain *> consumer.stopConsuming *> consumer.awaitTermination.timeout(30.seconds)
+          }
         )
       }
     }
@@ -784,16 +739,14 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         publish(topic, "0")
         val settings = shareConsumerSettings
         val late     = run(
-          KafkaShareConsumer
-            .resource(settings.withMaxProcessingTime(3.seconds))
-            .use { consumer =>
-              consumer.subscribeTo(topic) *> consumer
-                .records
-                .take(1)
-                .evalMap(r => IO.sleep(5.seconds) *> r.accept.attempt)
-                .compile
-                .lastOrError
-            }
+          subscribed(settings.withMaxProcessingTime(3.seconds), topic) { consumer =>
+            consumer
+              .records
+              .take(1)
+              .evalMap(r => IO.sleep(5.seconds) *> r.accept.attempt)
+              .compile
+              .lastOrError
+          }
         )
         late.swap.toOption.get shouldBe a[RecordNotInFlightException]
         readUntil(topic, settings, "0").map(_._1) shouldBe Vector("0")
@@ -805,23 +758,20 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         publish(topic, "0")
         val settings = shareConsumerSettings
         val result   = run(
-          KafkaShareConsumer
-            .resource(settings.withMaxProcessingTime(3.seconds))
-            .use { consumer =>
-              consumer.subscribeTo(topic) *> consumer
-                .records
-                .take(1)
-                .evalMap(r =>
-                  IO.sleep(2.seconds) *> r.renew *>
-                    IO.sleep(2.seconds) *> r.accept.attempt
-                )
-                .compile
-                .lastOrError <* consumer.commitSync
-            }
+          subscribed(settings.withMaxProcessingTime(3.seconds), topic) { consumer =>
+            consumer
+              .records
+              .take(1)
+              .evalMap(r =>
+                IO.sleep(2.seconds) *> r.renew *>
+                  IO.sleep(2.seconds) *> r.accept.attempt
+              )
+              .compile
+              .lastOrError <* consumer.commitSync
+          }
         )
         result shouldBe Right(())
-        publish(topic, "after")
-        readUntil(topic, settings, "after") shouldBe Vector("after" -> 1)
+        assertSettled(topic, settings)
       }
     }
     it("should renew a record automatically while it is processed past its lock") {
@@ -840,8 +790,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
             .lastOrError
         )
         count shouldBe 1
-        publish(topic, "after")
-        readUntil(topic, settings, "after") shouldBe Vector("after" -> 1)
+        assertSettled(topic, settings)
       }
     }
 
@@ -851,22 +800,19 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         publish(topic, "0", "1")
         val settings = shareConsumerSettings.withAutoRenewal(true)
         val counts   = run(
-          KafkaShareConsumer
-            .resource(settings)
-            .use { consumer =>
-              consumer.subscribeTo(topic) *> consumer
-                .records
-                .take(2)
-                .parEvalMapUnordered(2)(r =>
-                  IO.sleep(lock + 1.second) *> r.accept.as(r.offset.deliveryCount.toInt)
-                )
-                .compile
-                .toVector
-            }
+          subscribed(settings, topic) { consumer =>
+            consumer
+              .records
+              .take(2)
+              .parEvalMapUnordered(2)(r =>
+                IO.sleep(lock + 1.second) *> r.accept.as(r.offset.deliveryCount.toInt)
+              )
+              .compile
+              .toVector
+          }
         )
         counts shouldBe Vector(1, 1)
-        publish(topic, "after")
-        readUntil(topic, settings, "after") shouldBe Vector("after" -> 1)
+        assertSettled(topic, settings)
       }
     }
 
@@ -889,8 +835,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
             .compile
             .drain
         )
-        publish(topic, "after")
-        readUntil(topic, settings, "after") shouldBe Vector("after" -> 1)
+        assertSettled(topic, settings)
       }
     }
 
@@ -902,19 +847,17 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         publish(topic, "0", "1")
         val settings = shareConsumerSettings.withMaxPollRecords(2)
         val results  = run(
-          KafkaShareConsumer
-            .resource(settings.withAutoRenewal(false))
-            .use { consumer =>
-              consumer.subscribeTo(topic) *> consumer
-                .records
-                .take(1)
-                .evalMap(r =>
-                  IO.sleep(lock + 1.second) *> r.accept *>
-                    consumer.commitSync
-                )
-                .compile
-                .lastOrError
-            }
+          subscribed(settings.withAutoRenewal(false), topic) { consumer =>
+            consumer
+              .records
+              .take(1)
+              .evalMap(r =>
+                IO.sleep(lock + 1.second) *> r.accept *>
+                  consumer.commitSync
+              )
+              .compile
+              .lastOrError
+          }
         )
         val error = results.values.toList.flatten.head
         error shouldBe an[InvalidRecordStateException]
@@ -970,8 +913,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
             }
         )
         acceptedBefore should contain theSameElementsAs Vector("1", "2", "3")
-        publish(topic, "after")
-        readUntil(topic, settings, "after") shouldBe Vector("after" -> 1)
+        assertSettled(topic, settings)
       }
     }
   }
@@ -984,16 +926,11 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         // The stream ends after the first poll, so a second poll, if any, is never taken.
         val settings          = shareConsumerSettings.withMaxPollRecords(2)
         val (elapsed, others) = run(
-          KafkaShareConsumer
-            .resource(settings)
-            .use { consumer =>
-              consumer.subscribeTo(topic) *> consumer
-                .records
-                .take(2)
-                .evalMap(_.accept)
-                .compile
-                .drain *> IO.delay(readUntil(topic, settings, "3")).timed
-            }
+          subscribed(settings, topic) { consumer =>
+            consumer.records.take(2).evalMap(_.accept).compile.drain *> IO
+              .delay(readUntil(topic, settings, "3"))
+              .timed
+          }
         )
         elapsed should be < lock
         others.map(_._1).toSet shouldBe Set("2", "3")
@@ -1005,19 +942,16 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         publish(topic, "0")
         val settings = shareConsumerSettings
         val results  = run(
-          KafkaShareConsumer
-            .resource(settings)
-            .use { consumer =>
-              consumer.subscribeTo(topic) *> consumer
-                .records
-                .evalMap(r => consumer.stopConsuming *> r.accept)
-                .compile
-                .drain *> consumer.commitSync
-            }
+          subscribed(settings, topic) { consumer =>
+            consumer
+              .records
+              .evalMap(r => consumer.stopConsuming *> r.accept)
+              .compile
+              .drain *> consumer.commitSync
+          }
         )
         results.values.flatten shouldBe empty
-        publish(topic, "after")
-        readUntil(topic, settings, "after") shouldBe Vector("after" -> 1)
+        assertSettled(topic, settings)
       }
     }
     it("should drain the records already polled on stopConsuming") {
@@ -1026,16 +960,13 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         publish(topic, "0", "1", "2")
         val settings = shareConsumerSettings.withMaxPollRecords(3)
         val first    = run(
-          KafkaShareConsumer
-            .resource(settings)
-            .use { consumer =>
-              consumer.subscribeTo(topic) *>
-                consumer
-                  .records
-                  .evalMap(r => consumer.stopConsuming *> r.accept.as(r.record.value))
-                  .compile
-                  .toVector <* consumer.awaitTermination
-            }
+          subscribed(settings, topic) { consumer =>
+            consumer
+              .records
+              .evalMap(r => consumer.stopConsuming *> r.accept.as(r.record.value))
+              .compile
+              .toVector <* consumer.awaitTermination
+          }
         )
         first should not be empty
         publish(topic, "after")
@@ -1050,13 +981,10 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         publish(topic, "0", "1")
         val settings = shareConsumerSettings.withMaxPollRecords(2)
         run(
-          KafkaShareConsumer
-            .resource(settings)
-            .use { consumer =>
-              consumer.subscribeTo(topic) *>
-                consumer.records.take(1).evalMap(_.accept).compile.drain *>
-                consumer.stopConsuming *> consumer.awaitTermination
-            }
+          subscribed(settings, topic) { consumer =>
+            consumer.records.take(1).evalMap(_.accept).compile.drain *>
+              consumer.stopConsuming *> consumer.awaitTermination
+          }
         )
         readUntil(topic, settings, "1").last shouldBe ("1" -> 2)
       }

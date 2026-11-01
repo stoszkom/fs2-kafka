@@ -22,6 +22,7 @@ import org.apache.kafka.clients.admin.{
   UpdateFeaturesOptions
 }
 import org.apache.kafka.common.config.ConfigResource
+import org.scalatest.Assertion
 
 abstract class ShareConsumerBaseKafkaSpec extends BaseKafkaSpec {
 
@@ -91,6 +92,23 @@ abstract class ShareConsumerBaseKafkaSpec extends BaseKafkaSpec {
   protected def run[A](io: IO[A]): A = io.timeout(2.minutes).unsafeRunSync()
 
   // Accepts every record up to and including `marker`, returning values and delivery counts.
+  // Runs `use` with a consumer subscribed to the topic.
+  protected def subscribed[A](settings: ShareConsumerSettings[IO, String, String], topic: String)(
+    use: KafkaShareConsumer[IO, String, String] => IO[A]
+  ): IO[A] =
+    KafkaShareConsumer
+      .resource(settings)
+      .use(consumer => consumer.subscribeTo(topic) *> use(consumer))
+
+  // Checks that the topic has no records left to deliver: a new record is the next one read.
+  protected def assertSettled(
+    topic: String,
+    settings: ShareConsumerSettings[IO, String, String]
+  ): Assertion = {
+    publish(topic, "after")
+    readUntil(topic, settings, "after") shouldBe Vector("after" -> 1)
+  }
+
   protected def readUntil(
     topic: String,
     settings: ShareConsumerSettings[IO, String, String],
