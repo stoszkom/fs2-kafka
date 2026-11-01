@@ -22,7 +22,7 @@ import fs2.kafka.internal.WithShareConsumer
 import fs2.Stream
 
 import org.apache.kafka.clients.consumer.ConsumerConfig
-import org.apache.kafka.common.{KafkaException, Metric, MetricName, TopicPartition, Uuid}
+import org.apache.kafka.common.{KafkaException, Metric, MetricName, TopicPartition}
 import org.apache.kafka.common.config.ConfigException
 
 /**
@@ -92,14 +92,6 @@ sealed abstract class KafkaShareConsumer[F[_], K, V]
   def acquisitionLockTimeout: F[Option[FiniteDuration]]
 
   /**
-    * Returns the client instance id used for client metrics.
-    *
-    * @see
-    *   org.apache.kafka.clients.consumer.KafkaShareConsumer#clientInstanceId
-    */
-  def clientInstanceId(timeout: FiniteDuration): F[Uuid]
-
-  /**
     * Like [[stream]], but one stream per poll, which hands the poll out, so that merged polls of
     * several consumers are handed out after the merge.
     */
@@ -150,9 +142,6 @@ object KafkaShareConsumer {
 
       override def acquisitionLockTimeout: F[Option[FiniteDuration]] =
         withConsumer.blocking(ShareTimeouts.acquisitionLock)
-
-      override def clientInstanceId(timeout: FiniteDuration): F[Uuid] =
-        withConsumer.blocking(_.clientInstanceId(timeout.toJava))
 
       override def terminate: F[Unit] = actor.terminate
 
