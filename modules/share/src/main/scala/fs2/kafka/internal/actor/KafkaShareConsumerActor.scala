@@ -296,9 +296,9 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
                       consumer.acknowledge(state.held(d.position).record, d.acknowledgeType.asJava)
                       done += d
                     } catch {
-                      // Java no longer holds it, e.g. after a commit failed once sent.
-                      case e: IllegalStateException if e.getMessage == notAcknowledgeable =>
-                        gone += d
+                      // Java no longer holds it, e.g. after a commit failed once sent. Its other
+                      // reasons, a closed consumer and implicit mode, cannot happen here.
+                      case _: IllegalStateException => gone += d
                     }
                   }
               )
@@ -673,9 +673,6 @@ private[kafka] object KafkaShareConsumerActor {
 
   // How often an unsubscribed consumer checks for a subscription.
   val subscriptionCheckInterval: FiniteDuration = 50.millis
-
-  // Java's error for a record it no longer holds.
-  val notAcknowledgeable = "The record cannot be acknowledged."
 
   // Half of the shortest lock a broker allows, while the broker has not reported the lock.
   val unknownLockRenewalInterval: FiniteDuration = 500.millis
