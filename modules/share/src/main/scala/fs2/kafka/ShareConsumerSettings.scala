@@ -228,7 +228,7 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
     * Without it, a record neither acknowledged nor renewed in time is delivered again, possibly to
     * another consumer; the other records are renewed only while a decision waits for a record you
     * renewed. Enable it when processing may outlast the lock. A hung record is then renewed until
-    * the stream ends or the [[maxProcessingTime]] passes.
+    * the consumer is closed or stopped, or the [[maxProcessingTime]] passes.
     */
   def withAutoRenewal(enabled: Boolean): ShareConsumerSettings[F, K, V]
 

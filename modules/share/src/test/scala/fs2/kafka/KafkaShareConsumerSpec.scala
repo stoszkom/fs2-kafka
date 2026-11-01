@@ -766,6 +766,31 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       }
     }
 
+    it("should keep renewing records processed downstream after the stream ended") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0", "1")
+        val settings = shareConsumerSettings.withAutoRenewal(true)
+        val counts   = run(
+          KafkaShareConsumer
+            .resource(settings)
+            .use { consumer =>
+              consumer.subscribeTo(topic) *> consumer
+                .records
+                .take(2)
+                .parEvalMapUnordered(2)(r =>
+                  IO.sleep(lock + 1.second) *> r.accept.as(r.offset.deliveryCount.toInt)
+                )
+                .compile
+                .toVector
+            }
+        )
+        counts shouldBe Vector(1, 1)
+        publish(topic, "after")
+        readUntil(topic, settings, "after") shouldBe Vector("after" -> 1)
+      }
+    }
+
     it("should keep a record past its lock with manual renewals only") {
       withTopic { topic =>
         createCustomTopic(topic)

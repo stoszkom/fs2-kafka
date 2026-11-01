@@ -494,7 +494,8 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
     val undecided = state.undecided.map(_._2.lockedSince)
     if (undecided.isEmpty) None
     else if (state.deferred.nonEmpty) Some(undecided.min)
-    else if (config.settings.autoRenewal && !state.readerClosed)
+    // Also after the stream ended, as records may still be processed downstream.
+    else if (config.settings.autoRenewal)
       Some(undecided.min + state.lock.fold(unknownLockRenewalInterval)(renewalInterval))
     else None
   }
