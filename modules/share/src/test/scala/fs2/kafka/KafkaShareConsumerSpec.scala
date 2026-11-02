@@ -37,18 +37,17 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       )
     }
 
-    it("should report the subscription, lock duration and metrics") {
+    it("should report the subscription and metrics") {
       withTopic { topic =>
         createCustomTopic(topic)
         publish(topic, "0")
-        val (subscription, lockDuration, metrics) = run(
+        val (subscription, metrics) = run(
           subscribed(shareConsumerSettings, topic) { consumer =>
             consumer.records.take(1).evalMap(_.accept).compile.drain *>
-              (consumer.subscription, consumer.acquisitionLockTimeout, consumer.metrics).tupled
+              (consumer.subscription, consumer.metrics).tupled
           }
         )
         subscription shouldBe SortedSet(topic)
-        lockDuration shouldBe Some(lock)
         metrics should not be empty
       }
     }

@@ -7,7 +7,6 @@
 package fs2.kafka
 
 import scala.collection.immutable.SortedSet
-import scala.concurrent.duration.*
 
 import cats.data.NonEmptyVector
 import cats.effect.{Async, Resource}
@@ -16,7 +15,7 @@ import cats.effect.std.Dispatcher
 import cats.syntax.all.*
 import cats.Reducible
 import fs2.kafka.consumer.*
-import fs2.kafka.internal.actor.{KafkaShareConsumerActor, ShareTimeouts}
+import fs2.kafka.internal.actor.KafkaShareConsumerActor
 import fs2.kafka.internal.converters.collection.*
 import fs2.kafka.internal.syntax.*
 import fs2.kafka.internal.WithShareConsumer
@@ -63,14 +62,6 @@ sealed abstract class KafkaShareConsumer[F[_], K, V]
   def settings: ShareConsumerSettings[F, K, V]
 
   /**
-    * Returns the broker's acquisition lock duration, or `None` until it is known.
-    *
-    * @see
-    *   org.apache.kafka.clients.consumer.KafkaShareConsumer#acquisitionLockTimeoutMs
-    */
-  def acquisitionLockTimeout: F[Option[FiniteDuration]]
-
-  /**
     * Like [[stream]], but one stream per poll, which hands the poll out, so that merged polls of
     * several consumers are handed out after the merge.
     */
@@ -108,9 +99,6 @@ object KafkaShareConsumer {
 
       override def metrics: F[Map[MetricName, Metric]] =
         withConsumer.blocking(_.metrics().asScala.toMap)
-
-      override def acquisitionLockTimeout: F[Option[FiniteDuration]] =
-        withConsumer.blocking(ShareTimeouts.acquisitionLock)
 
       override def terminate: F[Unit] = actor.terminate
 
