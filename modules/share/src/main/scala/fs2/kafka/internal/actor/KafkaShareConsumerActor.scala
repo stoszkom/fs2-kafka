@@ -42,8 +42,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
   output: Queue[F, Option[(Long, Chunk[AcknowledgeableConsumerRecord[F, K, V]])]],
   readerStarted: Ref[F, Boolean],
   shutdown: Deferred[F, Unit],
-  finished: Deferred[F, Either[Throwable, Unit]],
-  drained: Ref[F, Option[Either[Throwable, KafkaShareConsumerActor.CommitResult]]],
+  finished: Deferred[F, KafkaShareConsumerActor.Ended],
   waiters: Ref[F, Vector[KafkaShareConsumerActor.Waiter[F]]]
 )(implicit F: Async[F], logging: Logging[F])
     extends Stager[F] {
@@ -88,9 +87,11 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
           val failed = finished
             .get
             .flatMap {
-              case Left(_: ConsumerShutdownException) => F.pure(().asRight[Throwable])
-              case Left(error)                        => F.pure(error.asLeft[Unit])
-              case Right(_)                           => F.never[Either[Throwable, Unit]]
+              case Ended.Failed(error)        => F.pure(error.asLeft[Unit])
+              case Ended.Drained(Left(error)) => F.pure(error.asLeft[Unit])
+              case Ended.Shutdown             => F.pure(().asRight[Throwable])
+              // The output ends the stream.
+              case Ended.Drained(Right(_)) => F.never[Either[Throwable, Unit]]
             }
           // The finalizer also covers an interruption right after Start.
           (Stream.exec(requests.offer(ShareRequest.Start())) ++
@@ -115,8 +116,9 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
     finished
       .get
       .flatMap {
-        case Left(_: ConsumerShutdownException) => F.unit
-        case ended                              => ended.liftTo[F]
+        case Ended.Failed(error)        => F.raiseError(error)
+        case Ended.Drained(Left(error)) => F.raiseError(error)
+        case _                          => F.unit
       }
 
   // As in core, this does not wait for the actor to end.
@@ -129,14 +131,17 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
     request: (Either[Throwable, A] => F[Unit]) => ShareRequest[F],
     afterDrain: Either[Throwable, CommitResult] => Either[Throwable, A]
   ): F[A] = {
-    def afterEnd(ended: Either[Throwable, Unit]): F[A] =
-      (shutdown.tryGet, drained.get)
-        .tupled
+    def afterEnd(ended: Ended): F[A] =
+      shutdown
+        .tryGet
         .flatMap {
-          case (Some(_), _)    => F.raiseError[A](ConsumerShutdownException())
-          case (_, Some(last)) => afterDrain(last).liftTo[F]
-          case _               =>
-            F.raiseError[A](ended.fold(identity, _ => ConsumerShutdownException()))
+          case Some(_) => F.raiseError[A](ConsumerShutdownException())
+          case None    =>
+            ended match {
+              case Ended.Drained(last) => afterDrain(last).liftTo[F]
+              case Ended.Failed(error) => F.raiseError[A](error)
+              case Ended.Shutdown      => F.raiseError[A](ConsumerShutdownException())
+            }
         }
     // Nothing takes requests once the actor ended.
     finished
@@ -565,7 +570,8 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
       case request :: rest => receive(state, request).flatMap(receiveAll(_, rest))
     }
 
-  private def loop(state: ShareState): F[Unit] =
+  // Ends with the result of the final commit after stopping.
+  private def loop(state: ShareState): F[Either[Throwable, CommitResult]] =
     requests
       .tryTakeN(None)
       .flatMap(receiveAll(state, _))
@@ -580,10 +586,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
             val send    = nextSend(current)
             val wakeAt  = (renewal.toList ++ send ++ limit.map(_._2)).reduceOption(_ min _)
             if (current.isFinished)
-              // A failed final commit fails the stream.
-              commitStaged(current, config.settings.commitTimeout)
-                .attempt
-                .flatMap(result => drained.set(Some(result)) *> result.liftTo[F].void)
+              commitStaged(current, config.settings.commitTimeout).attempt
             else if (overdue.nonEmpty) releaseOverdue(current, overdue).flatMap(loop)
             // Stopping after the stream ended: nothing will decide the rest.
             else if (current.stopping && current.readerClosed && current.undecided.nonEmpty)
@@ -609,8 +612,12 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
       )
       .attempt
       .flatMap {
-        case Right(_)    => output.offer(None) *> finished.complete(Right(())).void
-        case Left(error) => finished.complete(Left(error)).void
+        // A failed final commit fails the stream.
+        case Right(Right(Left(error))) => finished.complete(Ended.Drained(Left(error))).void
+        case Right(Right(last))        =>
+          output.offer(None) *> finished.complete(Ended.Drained(last)).void
+        case Right(Left(_)) => output.offer(None) *> finished.complete(Ended.Shutdown).void
+        case Left(error)    => finished.complete(Ended.Failed(error)).void
       }
 
 }
@@ -620,6 +627,21 @@ private[kafka] object KafkaShareConsumerActor {
   type Position = TopicPartitionOffset
 
   type CommitResult = Map[TopicPartition, Option[KafkaException]]
+
+  // How the actor ended.
+  sealed abstract class Ended
+
+  object Ended {
+
+    // After stopping, with the result of the final commit.
+    final case class Drained(lastCommit: Either[Throwable, CommitResult]) extends Ended
+
+    // Terminated, or closed before it drained.
+    case object Shutdown extends Ended
+
+    final case class Failed(error: Throwable) extends Ended
+
+  }
 
   def position(record: KafkaByteConsumerRecord): Position =
     new TopicPartition(record.topic, record.partition) -> record.offset
@@ -695,8 +717,7 @@ private[kafka] object KafkaShareConsumerActor {
         )
       readerStarted <- Resource.eval(Ref.of[F, Boolean](false))
       shutdown      <- Resource.eval(Deferred[F, Unit])
-      finished      <- Resource.eval(Deferred[F, Either[Throwable, Unit]])
-      drained       <- Resource.eval(Ref.of[F, Option[Either[Throwable, CommitResult]]](None))
+      finished      <- Resource.eval(Deferred[F, Ended])
       waiters       <- Resource.eval(Ref.of[F, Vector[Waiter[F]]](Vector.empty))
       config        <- Resource.eval(ShareActorConfig.from(settings))
       actor          = new KafkaShareConsumerActor(
@@ -709,13 +730,11 @@ private[kafka] object KafkaShareConsumerActor {
                 readerStarted,
                 shutdown,
                 finished,
-                drained,
                 waiters
               )(F, logging)
       // Once closed, requests fail with ConsumerShutdownException.
       _ <- Resource.make(F.start(actor.run))(fiber =>
-             fiber.cancel *> shutdown.complete(()) *>
-               finished.complete(Left(ConsumerShutdownException())).void
+             fiber.cancel *> shutdown.complete(()) *> finished.complete(Ended.Shutdown).void
            )
     } yield actor
 
