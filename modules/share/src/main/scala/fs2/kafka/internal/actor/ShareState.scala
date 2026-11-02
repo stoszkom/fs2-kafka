@@ -8,7 +8,7 @@ package fs2.kafka.internal.actor
 
 import scala.concurrent.duration.FiniteDuration
 
-import fs2.kafka.{AcknowledgeType, KafkaByteConsumerRecord}
+import fs2.kafka.{AcknowledgeType, KafkaByteConsumerRecord, RecordNotInFlightException}
 import fs2.kafka.internal.syntax.*
 
 /**
@@ -29,6 +29,12 @@ final private[kafka] case class Held(
   heldSince: FiniteDuration
 )
 
+// A request completed once its decisions for renewing records are staged.
+final private[kafka] case class Waiter[F[_]](
+  positions: Set[TopicPartitionOffset],
+  done: Either[Throwable, Unit] => F[Unit]
+)
+
 /**
   * @param held
   *   records whose decision Java has not sent, and renewed records not returned yet
@@ -46,8 +52,10 @@ final private[kafka] case class Held(
   *   the latest poll offered to the stream, to tell a late hand-out of an earlier one apart
   * @param stagedSince
   *   when the oldest decision staged but not sent was staged
+  * @param waiters
+  *   requests completed once their decisions in `deferred` are staged
   */
-final private[kafka] case class ShareState(
+final private[kafka] case class ShareState[F[_]](
   held: Map[TopicPartitionOffset, Held] = Map.empty,
   decided: Set[TopicPartitionOffset] = Set.empty,
   renewing: Set[TopicPartitionOffset] = Set.empty,
@@ -58,7 +66,8 @@ final private[kafka] case class ShareState(
   stagedSince: Option[FiniteDuration] = None,
   started: Boolean = false,
   stopping: Boolean = false,
-  readerClosed: Boolean = false
+  readerClosed: Boolean = false,
+  waiters: Vector[Waiter[F]] = Vector.empty[Waiter[F]]
 ) {
 
   // Held records without a decision or a renewal.
@@ -91,7 +100,7 @@ final private[kafka] case class ShareState(
     waiting: Vector[Decision],
     at: FiniteDuration,
     byUser: Boolean
-  ): ShareState = {
+  ): ShareState[F] = {
     val (renewed, final_) = last.partition(_._2 == AcknowledgeType.Renew)
     copy(
       held = held ++ renewed
@@ -113,7 +122,7 @@ final private[kafka] case class ShareState(
     rejected: Vector[(TopicPartitionOffset, Held)],
     reportedLock: Option[FiniteDuration],
     holdAdmitted: Boolean
-  ): ShareState = {
+  ): ShareState[F] = {
     val fresh = admitted.map(_._1) ++ rejected.map(_._1)
     // A poll with new records means no renewal is pending: those not returned failed.
     val notReturned           = renewing -- returned.map(_._1)
@@ -136,7 +145,7 @@ final private[kafka] case class ShareState(
   }
 
   // The stream took the poll; the max processing time counts from now.
-  def withHandedOut(id: Long, at: FiniteDuration): ShareState =
+  def withHandedOut(id: Long, at: FiniteDuration): ShareState[F] =
     if (id != pollId) this
     else
       copy(
@@ -145,11 +154,35 @@ final private[kafka] case class ShareState(
       )
 
   // The staged decisions were sent.
-  def withoutDecided: ShareState =
+  def withoutDecided: ShareState[F] =
     copy(held = held -- decided, decided = Set.empty, stagedSince = None)
 
+  // Completes the requests waiting for a decision on the position with its staging result, as the
+  // effects to run.
+  def settled(
+    position: TopicPartitionOffset,
+    result: Either[Throwable, Unit]
+  ): (ShareState[F], Vector[F[Unit]]) = {
+    val (hit, rest)   = waiters.partition(_.positions(position))
+    val left          = hit.map(w => w.copy(positions = w.positions - position))
+    val (ready, keep) =
+      if (result.isLeft) (hit, Vector.empty) else left.partition(_.positions.isEmpty)
+    (copy(waiters = rest ++ keep), ready.map(_.done(result)))
+  }
+
+  // Fails the waiting decisions whose record lost its lock before a poll returned it.
+  def settledLost: (ShareState[F], Vector[F[Unit]]) =
+    waiters
+      .flatMap(_.positions)
+      .distinct
+      .filterNot(deferred.contains)
+      .foldLeft((this, Vector.empty[F[Unit]])) { case ((s, effects), p) =>
+        val (next, more) = s.settled(p, Left(RecordNotInFlightException(p._1, p._2)))
+        (next, effects ++ more)
+      }
+
   // The renewal failed, so the records lost their lock.
-  def withoutRenewing(positions: Set[TopicPartitionOffset]): ShareState = {
+  def withoutRenewing(positions: Set[TopicPartitionOffset]): ShareState[F] = {
     val lost = positions.intersect(renewing)
     if (lost.isEmpty) this
     else
