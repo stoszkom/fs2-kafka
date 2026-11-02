@@ -16,6 +16,7 @@ import fs2.kafka.*
 import fs2.kafka.internal.{Logging, WithShareConsumer}
 import fs2.kafka.internal.actor.KafkaShareConsumerActor.*
 import fs2.kafka.internal.converters.collection.*
+import fs2.kafka.internal.converters.option.*
 import fs2.kafka.internal.syntax.*
 
 import org.apache.kafka.clients.consumer.AcknowledgementCommitCallback
@@ -48,16 +49,15 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
 
   // After the actor finished, it holds no records.
   override def stage(decisions: Chunk[Decision]): F[Unit] =
-    if (decisions.isEmpty) F.unit
-    else if (config.implicitMode) F.raiseError(ImplicitAcknowledgementException())
-    else
-      ask[Unit](
-        ShareRequest.Stage(decisions, _),
-        _ =>
-          Left(
-            RecordNotInFlightException(decisions.head.get.offset._1, decisions.head.get.offset._2)
-          )
-      )
+    decisions.head match {
+      case None                           => F.unit
+      case Some(_) if config.implicitMode => F.raiseError(ImplicitAcknowledgementException())
+      case Some(first)                    =>
+        ask[Unit](
+          ShareRequest.Stage(decisions, _),
+          _ => Left(RecordNotInFlightException(first.offset._1, first.offset._2))
+        )
+    }
 
   // Java's `commitSync`; after the actor finished, the result of its final commit.
   def commitSync(timeout: FiniteDuration): F[CommitResult] =
@@ -165,7 +165,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
   // Java reports results here during consumer calls. Only failed renewals matter: their records
   // lost their lock.
   private val callback: AcknowledgementCommitCallback = (offsets, error) =>
-    if (error != null)
+    Option(error).foreach(_ =>
       dispatcher.unsafeRunSync(
         offsets
           .asScala
@@ -174,6 +174,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
             failedRenewals.offer(partition.topicPartition -> values.asScala.map(_.longValue).toSet)
           }
       )
+    )
 
   // A renewal never reported is given up after its lock and Kafka's API timeout.
   private def withoutUnreported(state: ShareState[F], now: FiniteDuration): ShareState[F] = {
@@ -305,28 +306,23 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
       if (now.isEmpty && !send) F.pure(stagings.as((Vector.empty, Vector.empty, None)))
       else
         withConsumer.blocking { consumer =>
+          // Stops at a request's first error, keeping what Java staged before it.
           val staged = stagings.map { request =>
-            val done  = Vector.newBuilder[Decision]
-            val gone  = Vector.newBuilder[Decision]
-            val error = scala
-              .util
-              .Try(
-                request
-                  .now
-                  .foreach { d =>
-                    try {
-                      consumer.acknowledge(state.held(d.offset).record, d.acknowledgeType.asJava)
-                      done += d
-                    } catch {
-                      // Java no longer holds it, e.g. after a commit failed once sent. Its other
-                      // reasons, a closed consumer and implicit mode, cannot happen here.
-                      case _: IllegalStateException => gone += d
-                    }
+            request
+              .now
+              .foldLeft((Vector.empty[Decision], Vector.empty[Decision], Option.empty[Throwable])) {
+                case (stop @ (_, _, Some(_)), _) => stop
+                case ((done, gone, None), d)     =>
+                  Either.catchNonFatal(
+                    consumer.acknowledge(state.held(d.offset).record, d.acknowledgeType.asJava)
+                  ) match {
+                    case Right(_) => (done :+ d, gone, None)
+                    // Java no longer holds it, e.g. after a commit failed once sent. Its other
+                    // reasons, a closed consumer and implicit mode, cannot happen here.
+                    case Left(_: IllegalStateException) => (done, gone :+ d, None)
+                    case Left(error)                    => (done, gone, Some(error))
                   }
-              )
-              .failed
-              .toOption
-            (done.result(), gone.result(), error)
+              }
           }
           // A failed send fails the actor.
           if (sending) consumer.commitAsync()
@@ -691,7 +687,7 @@ private[kafka] object KafkaShareConsumerActor {
     new TopicPartition(record.topic, record.partition) -> record.offset
 
   def deliveryCountOf(record: KafkaByteConsumerRecord): Short =
-    if (record.deliveryCount().isPresent) record.deliveryCount().get.shortValue else 1
+    record.deliveryCount().toScala.fold(1: Short)(_.shortValue)
 
   // One request's held decisions, to stage now or waiting for a renewed record, and its first
   // decision for a delivery not held.
@@ -709,15 +705,11 @@ private[kafka] object KafkaShareConsumerActor {
       decisions: Chunk[Decision],
       done: Either[Throwable, Unit] => F[Unit]
     ): Staging[F] = {
-      val now     = Vector.newBuilder[Decision]
-      val waiting = Vector.newBuilder[Decision]
-      var notHeld = Option.empty[Decision]
-      decisions.foreach { d =>
-        if (!state.holds(d.offset, d.deliveryCount)) { if (notHeld.isEmpty) notHeld = Some(d) }
-        else if (state.renewing(d.offset)) waiting += d
-        else now                                   += d
-      }
-      Staging(done, now.result(), waiting.result(), notHeld)
+      val (held, notHeld) = decisions
+        .toVector
+        .partition(d => state.holds(d.offset, d.deliveryCount))
+      val (waiting, now) = held.partition(d => state.renewing(d.offset))
+      Staging(done, now, waiting, notHeld.headOption)
     }
 
   }
@@ -735,7 +727,7 @@ private[kafka] object KafkaShareConsumerActor {
       .asScala
       .iterator
       .map { case (partition, error) =>
-        partition.topicPartition -> (if (error.isPresent) Some(error.get) else None)
+        partition.topicPartition -> error.toScala
       }
       .toMap
 

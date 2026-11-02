@@ -18,7 +18,7 @@ import org.apache.kafka.common.errors.TimeoutException
 sealed abstract class ShareCommitTimeoutException(timeout: FiniteDuration, cause: Throwable)
     extends TimeoutException(s"share commit timeout after $timeout") {
 
-  if (cause != null) initCause(cause)
+  initCause(cause)
 
   override def toString: String =
     s"fs2.kafka.ShareCommitTimeoutException: $getMessage"
@@ -27,7 +27,7 @@ sealed abstract class ShareCommitTimeoutException(timeout: FiniteDuration, cause
 
 private[kafka] object ShareCommitTimeoutException {
 
-  def apply(timeout: FiniteDuration, cause: Throwable = null): ShareCommitTimeoutException =
+  def apply(timeout: FiniteDuration, cause: Throwable): ShareCommitTimeoutException =
     new ShareCommitTimeoutException(timeout, cause) {}
 
 }

@@ -8,6 +8,7 @@ package fs2.kafka.internal.actor
 
 import scala.concurrent.duration.*
 
+import fs2.kafka.internal.converters.option.*
 import fs2.kafka.KafkaByteShareConsumer
 
 /**
@@ -18,9 +19,7 @@ private[kafka] object ShareTimeouts {
   /**
     * The acquisition lock duration last reported by the broker.
     */
-  def acquisitionLock(consumer: KafkaByteShareConsumer): Option[FiniteDuration] = {
-    val lock = consumer.acquisitionLockTimeoutMs()
-    if (lock.isPresent) Some(lock.get.intValue.millis) else None
-  }
+  def acquisitionLock(consumer: KafkaByteShareConsumer): Option[FiniteDuration] =
+    consumer.acquisitionLockTimeoutMs().toScala.map(_.intValue.millis)
 
 }

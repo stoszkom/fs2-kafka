@@ -11,20 +11,12 @@ import scala.concurrent.duration.*
 final class ShareCommitTimeoutExceptionSpec extends BaseSpec {
   describe("ShareCommitTimeoutException") {
     it("should have expected message and toString") {
-      val exception = ShareCommitTimeoutException(10.seconds)
+      val exception = ShareCommitTimeoutException(10.seconds, new RuntimeException("cause"))
       assert {
         exception.getMessage == "share commit timeout after 10 seconds" &&
         exception.toString ==
           "fs2.kafka.ShareCommitTimeoutException: share commit timeout after 10 seconds"
       }
-    }
-
-    it("should have no cause unless given one, so that one can still be set") {
-      val exception = ShareCommitTimeoutException(10.seconds)
-      assert(exception.getCause == null)
-      val cause = new RuntimeException("cause")
-      exception.initCause(cause)
-      assert(exception.getCause == cause)
     }
 
     it("should keep the given cause") {
