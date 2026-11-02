@@ -6,12 +6,10 @@
 
 package fs2.kafka.internal.actor
 
-import java.util.concurrent.ConcurrentLinkedQueue
-
 import scala.concurrent.duration.*
 
 import cats.effect.{Async, Deferred, Ref, Resource}
-import cats.effect.std.Queue
+import cats.effect.std.{Dispatcher, Queue}
 import cats.syntax.all.*
 import fs2.{Chunk, Stream}
 import fs2.kafka.*
@@ -39,6 +37,8 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
   valueDeserializer: ValueDeserializer[F, V],
   withConsumer: WithShareConsumer[F],
   requests: Queue[F, ShareRequest[F]],
+  failedRenewals: Queue[F, (TopicPartition, Set[Long])],
+  dispatcher: Dispatcher[F],
   output: Queue[F, Option[(Long, Chunk[AcknowledgeableConsumerRecord[F, K, V]])]],
   readerStarted: Ref[F, Boolean],
   shutdown: Deferred[F, Unit],
@@ -162,17 +162,18 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
 
   // --- Renewal results ---
 
-  private val failedRenewals = new ConcurrentLinkedQueue[(TopicPartition, Set[Long])]()
-
   // Java reports results here during consumer calls. Only failed renewals matter: their records
   // lost their lock.
   private val callback: AcknowledgementCommitCallback = (offsets, error) =>
     if (error != null)
-      offsets
-        .asScala
-        .foreach { case (partition, values) =>
-          failedRenewals.add(partition.topicPartition -> values.asScala.map(_.longValue).toSet)
-        }
+      dispatcher.unsafeRunSync(
+        offsets
+          .asScala
+          .toList
+          .traverse_ { case (partition, values) =>
+            failedRenewals.offer(partition.topicPartition -> values.asScala.map(_.longValue).toSet)
+          }
+      )
 
   // A renewal never reported is given up after its lock and Kafka's API timeout.
   private def withoutUnreported(state: ShareState[F], now: FiniteDuration): ShareState[F] = {
@@ -181,16 +182,11 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
   }
 
   private def dropFailedRenewals(state: ShareState[F]): F[ShareState[F]] =
-    F.delay {
-      if (failedRenewals.isEmpty) state
-      else
-        Iterator
-          .continually(failedRenewals.poll())
-          .takeWhile(_ != null)
-          .foldLeft(state) { case (s, (partition, offsets)) =>
-            s.withoutRenewing(offsets.map(partition -> _))
-          }
-    }
+    failedRenewals
+      .tryTakeN(None)
+      .map(_.foldLeft(state) { case (s, (partition, offsets)) =>
+        s.withoutRenewing(offsets.map(partition -> _))
+      })
 
   // A waiting decision whose record lost its lock before a poll returned it fails.
   private def settleLost(state: ShareState[F]): F[ShareState[F]] =
@@ -748,12 +744,14 @@ private[kafka] object KafkaShareConsumerActor {
     keyDeserializer: KeyDeserializer[F, K],
     valueDeserializer: ValueDeserializer[F, V],
     withConsumer: WithShareConsumer[F],
+    dispatcher: Dispatcher[F],
     id: Int
   )(implicit F: Async[F]): Resource[F, KafkaShareConsumerActor[F, K, V]] =
     for {
-      logging  <- Resource.eval(Logging.create[F]("fs2.kafka.KafkaShareConsumer$" + id))
-      requests <- Resource.eval(Queue.unbounded[F, ShareRequest[F]])
-      output   <-
+      logging        <- Resource.eval(Logging.create[F]("fs2.kafka.KafkaShareConsumer$" + id))
+      requests       <- Resource.eval(Queue.unbounded[F, ShareRequest[F]])
+      failedRenewals <- Resource.eval(Queue.unbounded[F, (TopicPartition, Set[Long])])
+      output         <-
         Resource.eval(
           Queue.unbounded[F, Option[(Long, Chunk[AcknowledgeableConsumerRecord[F, K, V]])]]
         )
@@ -767,6 +765,8 @@ private[kafka] object KafkaShareConsumerActor {
                 valueDeserializer,
                 withConsumer,
                 requests,
+                failedRenewals,
+                dispatcher,
                 output,
                 readerStarted,
                 shutdown,

@@ -12,6 +12,7 @@ import scala.concurrent.duration.*
 import cats.data.NonEmptyVector
 import cats.effect.{Async, Resource}
 import cats.effect.instances.spawn.*
+import cats.effect.std.Dispatcher
 import cats.syntax.all.*
 import cats.Reducible
 import fs2.kafka.consumer.*
@@ -163,12 +164,15 @@ object KafkaShareConsumer {
       keyDeserializer   <- settings.keyDeserializer
       valueDeserializer <- settings.valueDeserializer
       id                <- Resource.eval(F.delay(new Object().hashCode))
-      withConsumer      <- WithShareConsumer(mk, settings)
-      actor             <- KafkaShareConsumerActor.resource(
+      // Created before the Java consumer, as closing it can still report results to the actor.
+      dispatcher   <- Dispatcher.sequential[F]
+      withConsumer <- WithShareConsumer(mk, settings)
+      actor        <- KafkaShareConsumerActor.resource(
                  settings,
                  keyDeserializer,
                  valueDeserializer,
                  withConsumer,
+                 dispatcher,
                  id
                )
     } yield createKafkaShareConsumer(settings, actor, withConsumer, id)
