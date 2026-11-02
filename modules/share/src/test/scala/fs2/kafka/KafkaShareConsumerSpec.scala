@@ -275,9 +275,9 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
   }
 
   describe("acknowledging records") {
-    // The second record stays undecided past both locks, so no poll sends the first's decision
+    // The second record stays unacknowledged past both locks, so no poll sends the first's acknowledgement
     // in time; only the delay does. The second is then delivered again, the first is not.
-    it("should send staged decisions after the max acknowledgement delay, without a poll") {
+    it("should send pending acknowledgements after the max acknowledgement delay, without a poll") {
       withTopic { topic =>
         createCustomTopic(topic)
         publish(topic, "0", "1")
@@ -303,7 +303,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       }
     }
 
-    it("should send staged decisions with the next poll, and the last ones when closing") {
+    it("should send pending acknowledgements with the next poll, and the last ones when closing") {
       withTopic { topic =>
         createCustomTopic(topic)
         publish(topic, (0 until 10).map(_.toString)*)
@@ -322,7 +322,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         assertSettled(topic, settings)
       }
     }
-    it("should let the last of several decisions staged together for a record win") {
+    it("should let the last of several acknowledgements made together for a record win") {
       withTopic { topic =>
         createCustomTopic(topic)
         publish(topic, "0")
@@ -349,11 +349,11 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         again.head._2 should be >= 2
       }
     }
-    it("should fail a decision for a delivery whose decision was sent") {
+    it("should fail an acknowledgement for a delivery whose acknowledgement was sent") {
       withTopic { topic =>
         createCustomTopic(topic)
         publish(topic, "0")
-        // Without a delay, the decision is sent at once.
+        // Without a delay, the acknowledgement is sent at once.
         val late = run(
           subscribed(shareConsumerSettings.withMaxAcknowledgementDelay(Duration.Zero), topic) {
             consumer =>
@@ -396,7 +396,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
   }
 
   describe("acknowledgeChunks") {
-    it("should stage offsets mapped with different functions through each") {
+    it("should acknowledge offsets mapped with different functions through each") {
       withTopic { topic =>
         createCustomTopic(topic)
         publish(topic, "0", "1")
@@ -458,7 +458,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       }
     }
 
-    it("should stage a chunk's decisions with each of its consumers") {
+    it("should send a chunk's acknowledgements to each of its consumers") {
       withTopic { topic =>
         val other = topic + "-other"
         createCustomTopic(topic)
@@ -580,7 +580,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
   }
 
   describe("renewal") {
-    it("should stage a decision made right after a renewal once the record is returned") {
+    it("should acknowledge a record right after a renewal once the record is returned") {
       withTopic { topic =>
         createCustomTopic(topic)
         publish(topic, "0")
@@ -601,7 +601,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         assertSettled(topic, settings)
       }
     }
-    it("should send a decision for a renewed record while another record is slow") {
+    it("should send an acknowledgement for a renewed record while another record is slow") {
       withTopic { topic =>
         createCustomTopic(topic)
         publish(topic, "0", "1")
@@ -751,7 +751,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       }
     }
 
-    // The consumer does not track lock expiry itself: the decision is staged, and the broker
+    // The consumer does not track lock expiry itself: the acknowledgement is accepted, and the broker
     // rejects it once sent.
     it("should lose a record past its lock without renewal") {
       withTopic { topic =>
@@ -862,7 +862,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       }
     }
 
-    it("should send a decision made while paused") {
+    it("should send an acknowledgement made while paused") {
       withTopic { topic =>
         createCustomTopic(topic)
         publish(topic, "0")
@@ -870,7 +870,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         run(
           SignallingRef[IO, Boolean](false).flatMap { paused =>
             subscribed(settings.withPauseWhen(paused), topic) { consumer =>
-              // The pause reaches the consumer before the decision, so that no poll sends it, and
+              // The pause reaches the consumer before the acknowledgement, so that no poll sends it, and
               // the consumer stays open past the record's lock.
               consumer
                 .records
@@ -928,7 +928,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         others.map(_._1).toSet shouldBe Set("2", "3")
       }
     }
-    it("should send the last decisions before finishing after stopping") {
+    it("should send the last acknowledgements before finishing after stopping") {
       withTopic { topic =>
         createCustomTopic(topic)
         publish(topic, "0")
@@ -962,7 +962,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       }
     }
 
-    it("should release undecided records on stopConsuming after the stream ended") {
+    it("should release unacknowledged records on stopConsuming after the stream ended") {
       withTopic { topic =>
         createCustomTopic(topic)
         publish(topic, "0", "1")

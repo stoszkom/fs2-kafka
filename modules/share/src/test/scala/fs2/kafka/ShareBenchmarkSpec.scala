@@ -78,7 +78,7 @@ final class ShareBenchmarkSpec extends ShareConsumerBaseKafkaSpec {
     println(f"BENCHMARK $name%-48s ${count / seconds}%10.0f records/s")
   }
 
-  // Sends the last staged decisions with the final commit after stopping, as the Java loop commits,
+  // Sends the last pending acknowledgements with the final commit after stopping, as the Java loop commits,
   // before stopping the clock.
   private def fs2Consumer(topic: String, count: Int)(
     pipe: Records => fs2.Stream[IO, Unit]

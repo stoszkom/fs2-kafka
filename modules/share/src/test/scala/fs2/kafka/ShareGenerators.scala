@@ -7,7 +7,7 @@
 package fs2.kafka
 
 import cats.ApplicativeThrow
-import fs2.kafka.internal.actor.{Decision, Stager}
+import fs2.kafka.internal.actor.{Acknowledgement, Acknowledger}
 import fs2.Chunk
 
 import org.scalacheck.{Arbitrary, Cogen, Gen}
@@ -15,9 +15,9 @@ import org.scalacheck.rng.Seed
 
 trait ShareGenerators extends BaseGenerators {
 
-  def genStager[F[_]: ApplicativeThrow]: Gen[Stager[F]] =
-    Gen.const(new Stager[F] {
-      override def stage(decisions: Chunk[Decision]): F[Unit] = ApplicativeThrow[F].unit
+  def genAcknowledger[F[_]: ApplicativeThrow]: Gen[Acknowledger[F]] =
+    Gen.const(new Acknowledger[F] {
+      override def acknowledge(acks: Chunk[Acknowledgement]): F[Unit] = ApplicativeThrow[F].unit
     })
 
   def genAcknowledgeableOffset[F[_]: ApplicativeThrow]: Gen[AcknowledgeableOffset[F]] =
@@ -25,8 +25,8 @@ trait ShareGenerators extends BaseGenerators {
       topicPartition <- genTopicPartition
       offset         <- Gen.posNum[Long]
       deliveryCount  <- Gen.choose[Short](1, 10)
-      stager         <- genStager[F]
-    } yield AcknowledgeableOffset[F](topicPartition, offset, deliveryCount, stager)
+      acknowledger   <- genAcknowledger[F]
+    } yield AcknowledgeableOffset[F](topicPartition, offset, deliveryCount, acknowledger)
 
   implicit def arbAcknowledgeableOffset[F[_]: ApplicativeThrow]
     : Arbitrary[AcknowledgeableOffset[F]] =

@@ -30,16 +30,17 @@ import org.apache.kafka.common.config.ConfigException
   * `KafkaShareConsumer`. It provides a single top-level [[stream]] of records, in the order they
   * were polled.<br><br>
   *
-  * Records come as [[AcknowledgeableConsumerRecord]]s. Acknowledging one stages the decision in the
-  * Java consumer, as Java's `acknowledge` does, one record at a time or a chunk at once with
-  * [[acknowledgeChunks]]. Staged decisions are sent by the next poll, after the
-  * [[ShareConsumerSettings.maxAcknowledgementDelay]], while paused, or when the consumer stops or
-  * closes. As the consumer polls on its own, there is no commit to call: results are not reported,
-  * and a decision the broker rejects shows as the record being delivered again.<br><br>
+  * Records come as [[AcknowledgeableConsumerRecord]]s. Acknowledging one records the
+  * acknowledgement in the Java consumer, as Java's `acknowledge` does, one record at a time or a
+  * chunk at once with [[acknowledgeChunks]]. Pending acknowledgements are sent by the next poll,
+  * after the [[ShareConsumerSettings.maxAcknowledgementDelay]], while paused, or when the consumer
+  * stops or closes. As the consumer polls on its own, there is no commit to call: results are not
+  * reported, and an acknowledgement the broker rejects shows as the record being delivered
+  * again.<br><br>
   *
   * In explicit acknowledgement mode, the default, the consumer polls again once every record of the
-  * previous poll has a decision. A record not acknowledged within its acquisition lock is delivered
-  * again, unless it is renewed, see [[ShareConsumerSettings.withAutoRenewal]].<br><br>
+  * previous poll has an acknowledgement. A record not acknowledged within its acquisition lock is
+  * delivered again, unless it is renewed, see [[ShareConsumerSettings.withAutoRenewal]].<br><br>
   *
   * In implicit acknowledgement mode, the next poll accepts the previous one, and acknowledging
   * fails with an [[ImplicitAcknowledgementException]]. The consumer polls again once the stream

@@ -29,7 +29,7 @@ final private[kafka] case class Held(
   heldSince: FiniteDuration
 )
 
-// A request completed once its decisions for renewing records are staged.
+// A request completed once Java recorded its acknowledgements for renewing records.
 final private[kafka] case class Waiter[F[_]](
   offsets: Set[TopicPartitionOffset],
   done: Either[Throwable, Unit] => F[Unit]
@@ -37,13 +37,13 @@ final private[kafka] case class Waiter[F[_]](
 
 /**
   * @param held
-  *   records whose decision Java has not sent, and renewed records not returned yet
-  * @param decided
-  *   held records with a staged decision
+  *   records whose acknowledgement Java has not sent, and renewed records not returned yet
+  * @param acknowledged
+  *   held records with a pending acknowledgement
   * @param renewing
   *   held records whose renewal was sent, which a later poll returns
   * @param deferred
-  *   decisions for renewing records, staged once a poll returns them
+  *   acknowledgements for renewing records, given to Java once a poll returns them
   * @param lock
   *   the acquisition lock last reported by the broker
   * @param unpulled
@@ -51,9 +51,9 @@ final private[kafka] case class Waiter[F[_]](
   * @param pollId
   *   the latest poll offered to the stream, to tell a late hand-out of an earlier one apart
   * @param stagedSince
-  *   when the oldest decision staged but not sent was staged
+  *   when the oldest pending acknowledgement was made
   * @param waiters
-  *   requests completed once their decisions in `deferred` are staged
+  *   requests completed once Java recorded their acknowledgements in `deferred`
   * @param paused
   *   whether the pause signal holds back polls for new records
   * @param acceptPending
@@ -61,13 +61,13 @@ final private[kafka] case class Waiter[F[_]](
   */
 final private[kafka] case class ShareState[F[_]](
   held: Map[TopicPartitionOffset, Held] = Map.empty,
-  decided: Set[TopicPartitionOffset] = Set.empty,
+  acked: Set[TopicPartitionOffset] = Set.empty,
   renewing: Set[TopicPartitionOffset] = Set.empty,
   deferred: Map[TopicPartitionOffset, AcknowledgeType] = Map.empty,
   lock: Option[FiniteDuration] = None,
   unpulled: Set[TopicPartitionOffset] = Set.empty,
   pollId: Long = 0L,
-  stagedSince: Option[FiniteDuration] = None,
+  unsentSince: Option[FiniteDuration] = None,
   started: Boolean = false,
   stopping: Boolean = false,
   readerClosed: Boolean = false,
@@ -76,9 +76,9 @@ final private[kafka] case class ShareState[F[_]](
   acceptPending: Boolean = false
 ) {
 
-  // Held records without a decision or a renewal.
-  lazy val undecided: Vector[(TopicPartitionOffset, Held)] =
-    held.iterator.filterNot { case (p, _) => decided(p) || renewing(p) }.toVector
+  // Held records without an acknowledgement or a renewal.
+  lazy val unacked: Vector[(TopicPartitionOffset, Held)] =
+    held.iterator.filterNot { case (p, _) => acked(p) || renewing(p) }.toVector
 
   // Whether a poll's new records are handed out.
   def admitting: Boolean = !stopping && !readerClosed && unpulled.isEmpty
@@ -90,23 +90,23 @@ final private[kafka] case class ShareState[F[_]](
   def holds(offset: TopicPartitionOffset, deliveryCount: Short): Boolean =
     held.get(offset).exists(_.deliveryCount == deliveryCount)
 
-  // Java polls once every record has a decision or a renewal, and the stream took the poll. Renewed
+  // Java polls once every record has an acknowledgement or a renewal, and the stream took the poll. Renewed
   // records come back only from a poll, which returns no new records while a renewal is pending.
   def canPoll: Boolean = started && allSettled && (renewing.nonEmpty || acquiring)
 
-  // Whether no held record is undecided, without building `undecided`: `decided` and `renewing`
+  // Whether no held record is unacknowledged, without building `unacknowledged`: `acknowledged` and `renewing`
   // are disjoint sets of held records.
-  def allSettled: Boolean = held.size == decided.size + renewing.size
+  def allSettled: Boolean = held.size == acked.size + renewing.size
 
-  // After stopping, once every record is decided and the stream took the latest poll or ended. In
-  // explicit mode, an untaken poll is undecided anyway.
+  // After stopping, once every record is acknowledged and the stream took the latest poll or ended. In
+  // explicit mode, an untaken poll is unacknowledged anyway.
   def isFinished: Boolean =
-    stopping && held.keySet.subsetOf(decided) && (unpulled.isEmpty || readerClosed)
+    stopping && held.keySet.subsetOf(acked) && (unpulled.isEmpty || readerClosed)
 
   // Renewals restart their records' locks at `at`, and a user's renewal the time held.
-  def withStaged(
+  def withAcked(
     last: Map[TopicPartitionOffset, AcknowledgeType],
-    waiting: Vector[Decision],
+    waiting: Vector[Acknowledgement],
     at: FiniteDuration,
     byUser: Boolean
   ): ShareState[F] = {
@@ -117,14 +117,14 @@ final private[kafka] case class ShareState[F[_]](
         .map { p =>
           p -> held(p).copy(lockedSince = at, heldSince = if (byUser) at else held(p).heldSince)
         },
-      decided = decided ++ final_.keySet -- renewed.keySet,
-      stagedSince = stagedSince.orElse(if (final_.isEmpty) None else Some(at)),
+      acked = acked ++ final_.keySet -- renewed.keySet,
+      unsentSince = unsentSince.orElse(if (final_.isEmpty) None else Some(at)),
       renewing = renewing ++ renewed.keySet,
-      deferred = deferred ++ waiting.map(d => d.offset -> d.acknowledgeType)
+      deferred = deferred ++ waiting.map(a => a.offset -> a.acknowledgeType)
     )
   }
 
-  // A poll sent the staged decisions and returned renewed and new records.
+  // A poll sent the pending acknowledgements and returned renewed and new records.
   def polled(
     returned: Vector[(TopicPartitionOffset, Held)],
     admitted: Vector[(TopicPartitionOffset, Held)],
@@ -142,8 +142,8 @@ final private[kafka] case class ShareState[F[_]](
       // In implicit mode nothing is held; rejected records only until released.
       held = held.filterKeysStrict(stillRenewing) ++ returned ++ rejected ++
         (if (holdAdmitted) admitted else Vector.empty),
-      decided = Set.empty,
-      stagedSince = None,
+      acked = Set.empty,
+      unsentSince = None,
       renewing = stillRenewing,
       // A renewed record returned as a new delivery is among the lost.
       deferred = deferred -- lost,
@@ -163,11 +163,11 @@ final private[kafka] case class ShareState[F[_]](
         unpulled = Set.empty
       )
 
-  // The staged decisions were sent.
-  def withoutDecided: ShareState[F] =
-    copy(held = held -- decided, decided = Set.empty, stagedSince = None, acceptPending = false)
+  // The pending acknowledgements were sent.
+  def withoutAcked: ShareState[F] =
+    copy(held = held -- acked, acked = Set.empty, unsentSince = None, acceptPending = false)
 
-  // Completes the requests waiting for a decision on the offset with its staging result, as the
+  // Completes the requests waiting for an acknowledgement on the offset with its result, as the
   // effects to run.
   def settled(
     offset: TopicPartitionOffset,
@@ -180,7 +180,7 @@ final private[kafka] case class ShareState[F[_]](
     (copy(waiters = rest ++ keep), ready.map(_.done(result)))
   }
 
-  // Fails the waiting decisions whose record lost its lock before a poll returned it.
+  // Fails the waiting acknowledgements whose record lost its lock before a poll returned it.
   def settledLost: (ShareState[F], Vector[F[Unit]]) =
     waiters
       .flatMap(_.offsets)

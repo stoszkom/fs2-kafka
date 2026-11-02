@@ -13,7 +13,7 @@ import org.apache.kafka.common.errors.TimeoutException
 /**
   * [[ShareCommitTimeoutException]] indicates that the broker did not confirm a share consumer's
   * commit within its commit timeout, like [[CommitTimeoutException]] for `KafkaConsumer`. The
-  * staged decisions may still have been applied.
+  * pending acknowledgements may still have been applied.
   */
 sealed abstract class ShareCommitTimeoutException(timeout: FiniteDuration, cause: Throwable)
     extends TimeoutException(s"share commit timeout after $timeout") {

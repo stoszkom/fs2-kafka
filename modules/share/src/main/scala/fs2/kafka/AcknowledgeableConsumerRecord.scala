@@ -18,10 +18,10 @@ import cats.syntax.traverse.*
 
 /**
   * [[AcknowledgeableConsumerRecord]] is a Kafka record along with an instance of
-  * [[AcknowledgeableOffset]], which stages a decision for the record in its consumer. In explicit
-  * acknowledgement mode, the default in this library, every record of a poll needs a decision
-  * before its consumer can poll new records; the next poll sends the decisions. Decisions for many
-  * records can be staged together with [[acknowledgeChunks]].
+  * [[AcknowledgeableOffset]], which acknowledges the record in its consumer. In explicit
+  * acknowledgement mode, the default in this library, every record of a poll needs an
+  * acknowledgement before its consumer can poll new records; the next poll sends the
+  * acknowledgements. Many records can be acknowledged together with [[acknowledgeChunks]].
   *
   * In implicit acknowledgement mode, records cannot be acknowledged. Instead, the consumer polls
   * again once every record of the previous poll has been emitted by the stream, and that poll
@@ -45,23 +45,23 @@ sealed abstract class AcknowledgeableConsumerRecord[F[_], +K, +V] { self =>
   def offset: AcknowledgeableOffset[F]
 
   /**
-    * Stages the decision for the record, see [[AcknowledgeableOffset.acknowledge]].
+    * Acknowledges the record, see [[AcknowledgeableOffset.acknowledge]].
     */
   final def acknowledge(acknowledgeType: AcknowledgeType): F[Unit] =
     offset.acknowledge(acknowledgeType)
 
   /**
-    * Stages an `Accept`, see [[AcknowledgeableOffset.accept]].
+    * Acknowledges with `Accept`, see [[AcknowledgeableOffset.accept]].
     */
   final def accept: F[Unit] = offset.accept
 
   /**
-    * Stages a `Release`, see [[AcknowledgeableOffset.release]].
+    * Acknowledges with `Release`, see [[AcknowledgeableOffset.release]].
     */
   final def release: F[Unit] = offset.release
 
   /**
-    * Stages a `Reject`, see [[AcknowledgeableOffset.reject]].
+    * Acknowledges with `Reject`, see [[AcknowledgeableOffset.reject]].
     */
   final def reject: F[Unit] = offset.reject
 

@@ -18,9 +18,9 @@ trait KafkaShareConsume[F[_], K, V] {
 
   /**
     * `Stream` of the records received by the share consumer, in the order they were polled. The
-    * consumer polls again once every record of the previous poll has a decision, or in implicit
-    * mode once the stream took the previous poll. Java's share consumer returns renewed records
-    * from a later poll again, but they are not emitted again here, and stay valid for
+    * consumer polls again once every record of the previous poll has an acknowledgement, or in
+    * implicit mode once the stream took the previous poll. Java's share consumer returns renewed
+    * records from a later poll again, but they are not emitted again here, and stay valid for
     * acknowledgement. A poll is taken as one chunk. When the stream ends, the records of a poll it
     * never took are released; records skipped by operators such as `take` stay held until the
     * consumer closes.
@@ -40,9 +40,9 @@ trait KafkaShareConsume[F[_], K, V] {
   /**
     * Stops consuming new messages from Kafka. In explicit acknowledgement mode, polled records can
     * still be acknowledged, and the stream ends once all of them are, after a final commit of the
-    * staged decisions; if the stream already ended, records still without a decision are released.
-    * In implicit mode, the stream ends once it took the latest poll, which the final commit
-    * accepts.
+    * pending acknowledgements; if the stream already ended, records still without an
+    * acknowledgement are released. In implicit mode, the stream ends once it took the latest poll,
+    * which the final commit accepts.
     */
   def stopConsuming: F[Unit]
 

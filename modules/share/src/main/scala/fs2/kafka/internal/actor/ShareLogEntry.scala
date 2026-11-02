@@ -39,7 +39,7 @@ private[kafka] object ShareLogEntry {
 
     override def message: String = {
       val shown = describe(records.take(10)) + (if (records.size > 10) ", ..." else "")
-      s"Releasing ${records.size} records held without a decision past the max processing " +
+      s"Releasing ${records.size} records held without an acknowledgement past the max processing " +
         s"time ($maxProcessingTime), so they are delivered again: $shown."
     }
 

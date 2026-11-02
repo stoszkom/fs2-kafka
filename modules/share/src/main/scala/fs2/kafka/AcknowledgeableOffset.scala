@@ -11,7 +11,7 @@ import cats.syntax.all.*
 import cats.Eq
 import cats.Show
 import fs2.kafka.instances.*
-import fs2.kafka.internal.actor.{Decision, Stager}
+import fs2.kafka.internal.actor.{Acknowledgement, Acknowledger}
 import fs2.Chunk
 
 import org.apache.kafka.common.TopicPartition
@@ -36,49 +36,51 @@ sealed abstract class AcknowledgeableOffset[F[_]] { self =>
     */
   def deliveryCount: Short
 
-  private[kafka] def stager: Stager[F]
+  private[kafka] def acknowledger: Acknowledger[F]
 
   /**
-    * Stages the decision in the Java consumer, as Java's `acknowledge` does. A later decision
-    * replaces it until it is sent, by the next poll, a commit, or after the
-    * [[ShareConsumerSettings.maxAcknowledgementDelay]]. Once sent, or for a delivery the consumer
-    * no longer holds, a decision fails with a [[RecordNotInFlightException]]. A decision for a
-    * record being renewed completes once a poll returns the record and Java staged the decision, or
-    * fails if the record loses its lock first. In implicit acknowledgement mode, it fails with an
+    * Acknowledges the record in the Java consumer, as Java's `acknowledge` does; the
+    * acknowledgement is sent later. A later acknowledgement replaces it until it is sent, by the
+    * next poll, a commit, or after the [[ShareConsumerSettings.maxAcknowledgementDelay]]. Once
+    * sent, or for a delivery the consumer no longer holds, an acknowledgement fails with a
+    * [[RecordNotInFlightException]]. An acknowledgement for a record being renewed completes once a
+    * poll returns the record and Java recorded the acknowledgement, or fails if the record loses
+    * its lock first. In implicit acknowledgement mode, it fails with an
     * [[ImplicitAcknowledgementException]].
     */
   final def acknowledge(acknowledgeType: AcknowledgeType): F[Unit] =
-    stager.stage(Chunk.singleton(decision(acknowledgeType)))
+    acknowledger.acknowledge(Chunk.singleton(ack(acknowledgeType)))
 
   /**
-    * Stages an `Accept`: the record was processed. See [[acknowledge]].
+    * Acknowledges with `Accept`: the record was processed. See [[acknowledge]].
     */
   final def accept: F[Unit] = acknowledge(AcknowledgeType.Accept)
 
   /**
-    * Stages a `Release`: the record is delivered again. See [[acknowledge]].
+    * Acknowledges with `Release`: the record is delivered again. See [[acknowledge]].
     */
   final def release: F[Unit] = acknowledge(AcknowledgeType.Release)
 
   /**
-    * Stages a `Reject`: the record is not delivered again. See [[acknowledge]].
+    * Acknowledges with `Reject`: the record is not delivered again. See [[acknowledge]].
     */
   final def reject: F[Unit] = acknowledge(AcknowledgeType.Reject)
 
   /**
-    * Renews the record's acquisition lock; it needs another decision later. See [[acknowledge]].
+    * Renews the record's acquisition lock; it needs another acknowledgement later. See
+    * [[acknowledge]].
     */
   final def renew: F[Unit] = acknowledge(AcknowledgeType.Renew)
 
-  private[kafka] def decision(acknowledgeType: AcknowledgeType): Decision =
-    Decision(topicPartition -> offset, deliveryCount, acknowledgeType)
+  private[kafka] def ack(acknowledgeType: AcknowledgeType): Acknowledgement =
+    Acknowledgement(topicPartition -> offset, deliveryCount, acknowledgeType)
 
   /**
     * Creates a new [[AcknowledgeableOffset]] in which the effect type has been changed using the
     * specified `FunctionK`.
     */
   final def mapK[G[_]](f: F ~> G): AcknowledgeableOffset[G] =
-    AcknowledgeableOffset(topicPartition, offset, deliveryCount, Stager.mapK(stager, f))
+    AcknowledgeableOffset(topicPartition, offset, deliveryCount, Acknowledger.mapK(acknowledger, f))
 
 }
 
@@ -88,7 +90,7 @@ object AcknowledgeableOffset {
     override val topicPartition: TopicPartition,
     override val offset: Long,
     override val deliveryCount: Short,
-    override private[kafka] val stager: Stager[F]
+    override private[kafka] val acknowledger: Acknowledger[F]
   ) extends AcknowledgeableOffset[F] {
 
     override def toString: String =
@@ -101,9 +103,9 @@ object AcknowledgeableOffset {
     topicPartition: TopicPartition,
     offset: Long,
     deliveryCount: Short,
-    stager: Stager[F]
+    acknowledger: Acknowledger[F]
   ): AcknowledgeableOffset[F] =
-    AcknowledgeableOffsetImpl(topicPartition, offset, deliveryCount, stager)
+    AcknowledgeableOffsetImpl(topicPartition, offset, deliveryCount, acknowledger)
 
   implicit def acknowledgeableOffsetEq[F[_]]: Eq[AcknowledgeableOffset[F]] =
     Eq.fromUniversalEquals

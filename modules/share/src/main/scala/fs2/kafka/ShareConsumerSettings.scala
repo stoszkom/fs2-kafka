@@ -182,7 +182,7 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
 
   /**
     * How long the final commit after `stopConsuming` waits for the broker to confirm the last
-    * decisions. A commit timing out before it is sent fails the stream with a
+    * acknowledgements. A commit timing out before it is sent fails the stream with a
     * [[ShareCommitTimeoutException]].<br><br>
     *
     * The default value is 15 seconds.
@@ -196,8 +196,8 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
 
   /**
     * How long we should allow the `poll` call to block for in the Java `KafkaShareConsumer`. The
-    * consumer polls again as soon as the previous poll is decided and the stream has taken it, so
-    * this is also how long an idle consumer waits between polls.<br><br>
+    * consumer polls again as soon as the previous poll is acknowledged and the stream has taken it,
+    * so this is also how long an idle consumer waits between polls.<br><br>
     *
     * The default value is 50 milliseconds.
     */
@@ -221,9 +221,9 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
     * Creates a new [[ShareConsumerSettings]] with the specified [[autoRenewal]].<br><br>
     *
     * Without it, a record neither acknowledged nor renewed in time is delivered again, possibly to
-    * another consumer; the other records are renewed only while a decision waits for a record you
-    * renewed. Enable it when processing may outlast the lock. A hung record is then renewed until
-    * the consumer is closed or stopped, or the [[maxProcessingTime]] passes.
+    * another consumer; the other records are renewed only while an acknowledgement waits for a
+    * record you renewed. Enable it when processing may outlast the lock. A hung record is then
+    * renewed until the consumer is closed or stopped, or the [[maxProcessingTime]] passes.
     */
   def withAutoRenewal(enabled: Boolean): ShareConsumerSettings[F, K, V]
 
@@ -246,10 +246,10 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
   def withRenewalMargin(margin: FiniteDuration): ShareConsumerSettings[F, K, V]
 
   /**
-    * How long the consumer may hold a record without a decision, or `None` for no limit. A record
-    * held longer is released and delivered again; its processing is not cancelled, and its later
-    * decision fails with a [[RecordNotInFlightException]], which [[acknowledgeChunks]] skips. It
-    * applies with explicit acknowledgement.<br><br>
+    * How long the consumer may hold a record without an acknowledgement, or `None` for no limit. A
+    * record held longer is released and delivered again; its processing is not cancelled, and its
+    * later acknowledgement fails with a [[RecordNotInFlightException]], which [[acknowledgeChunks]]
+    * skips. It applies with explicit acknowledgement.<br><br>
     *
     * The time counts from when the stream took the record's poll, or from its latest `Renew` by the
     * user. Set it well above the time to process a whole poll: `max.poll.records` times the time
@@ -279,13 +279,13 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
   def withoutMaxProcessingTime: ShareConsumerSettings[F, K, V]
 
   /**
-    * How long a staged decision may wait before the consumer sends it, or `None` to send decisions
-    * only with the next poll, as a Java loop does. The next poll waits for every record of the
-    * current one, so without a limit, decisions for fast records wait for the slowest record, and
-    * can be lost with their lock, or with the consumer, if it takes too long. Once the oldest
-    * unsent decision is this old, the consumer sends every staged decision with Java's
-    * `commitAsync`, without waiting for the result. It applies with explicit
-    * acknowledgement.<br><br>
+    * How long a pending acknowledgement may wait before the consumer sends it, or `None` to send
+    * acknowledgements only with the next poll, as a Java loop does. The next poll waits for every
+    * record of the current one, so without a limit, acknowledgements for fast records wait for the
+    * slowest record, and can be lost with their lock, or with the consumer, if it takes too long.
+    * Once the oldest unsent acknowledgement is this old, the consumer sends every pending
+    * acknowledgement with Java's `commitAsync`, without waiting for the result. It applies with
+    * explicit acknowledgement.<br><br>
     *
     * The default value is 1 second.
     */
@@ -299,7 +299,7 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
 
   /**
     * Creates a new [[ShareConsumerSettings]] without a [[maxAcknowledgementDelay]], so that
-    * decisions are sent with the next poll, as in a Java loop.
+    * acknowledgements are sent with the next poll, as in a Java loop.
     */
   def withoutMaxAcknowledgementDelay: ShareConsumerSettings[F, K, V]
 
@@ -307,14 +307,14 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
     * A signal which pauses the consumer while it is `true`, or `None` to never pause. While paused,
     * the consumer polls for no new records, so records are not acquired and their delivery count
     * does not grow while, for example, a service the processing needs is down. Records already
-    * taken by the stream are processed and acknowledged as usual: their decisions are sent at once,
-    * and auto-renewal keeps renewing them. Without records held, a pause longer than
+    * taken by the stream are processed and acknowledged as usual: their acknowledgements are sent
+    * at once, and auto-renewal keeps renewing them. Without records held, a pause longer than
     * `max.poll.interval.ms` makes Java leave the share group, and the first poll after it rejoins.
     *
     * The circuit breaker deciding when to pause, such as one counting failures or checking a
     * service's health, is yours: set the signal, for example a `SignallingRef`. While processing
-    * fails, keep a record undecided and retry it, with auto-renewal, rather than releasing it, so
-    * that its delivery count does not grow.<br><br>
+    * fails, keep a record unacknowledged and retry it, with auto-renewal, rather than releasing it,
+    * so that its delivery count does not grow.<br><br>
     *
     * The default value is `None`.
     */

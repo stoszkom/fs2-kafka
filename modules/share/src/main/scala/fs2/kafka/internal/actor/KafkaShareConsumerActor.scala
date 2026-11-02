@@ -24,13 +24,15 @@ import org.apache.kafka.common.errors.TimeoutException
 import org.apache.kafka.common.TopicPartition
 
 /**
-  * Owns a Java share consumer and stages each decision in it as it arrives. Java sends staged
-  * decisions with the next poll, and the last one for a record wins until then, so the actor mostly
-  * tracks which records of the latest poll have a decision, and polls once all do. Staged decisions
-  * waiting longer than `maxAcknowledgementDelay` are sent with `commitAsync`.
+  * Owns a Java share consumer and gives it each acknowledgement as it arrives. Java sends pending
+  * acknowledgements with the next poll, and the last one for a record wins until then, so the actor
+  * mostly tracks which records of the latest poll have an acknowledgement, and polls once all do.
+  * Pending acknowledgements waiting longer than `maxAcknowledgementDelay` are sent with
+  * `commitAsync`.
   *
-  * Renewals are sent at once. Java lets a renewed record be decided again only once a poll returned
-  * it, so a decision for it waits in the actor until then, and the record is not handed out again.
+  * Renewals are sent at once. Java lets a renewed record be acknowledged again only once a poll
+  * returned it, so an acknowledgement for it waits in the actor until then, and the record is not
+  * handed out again.
   */
 final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
   config: ShareActorConfig[F, K, V],
@@ -45,16 +47,16 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
   shutdown: Deferred[F, Unit],
   finished: Deferred[F, KafkaShareConsumerActor.Ended]
 )(implicit F: Async[F], logging: Logging[F])
-    extends Stager[F] {
+    extends Acknowledger[F] {
 
   // After the actor finished, it holds no records.
-  override def stage(decisions: Chunk[Decision]): F[Unit] =
-    decisions.head match {
+  override def acknowledge(acks: Chunk[Acknowledgement]): F[Unit] =
+    acks.head match {
       case None                           => F.unit
       case Some(_) if config.implicitMode => F.raiseError(ImplicitAcknowledgementException())
       case Some(first)                    =>
         ask[Unit](
-          ShareRequest.Stage(decisions, _),
+          ShareRequest.Ack(acks, _),
           RecordNotInFlightException(first.offset._1, first.offset._2)
         )
     }
@@ -178,7 +180,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
         s.withoutRenewing(offsets.map(partition -> _))
       })
 
-  // A waiting decision whose record lost its lock before a poll returned it fails.
+  // A waiting acknowledgement whose record lost its lock before a poll returned it fails.
   private def settleLost(state: ShareState[F]): F[ShareState[F]] =
     if (state.waiters.isEmpty) F.pure(state)
     else {
@@ -201,10 +203,10 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
           .map(s =>
             if (config.implicitMode && id == state.pollId) s.copy(acceptPending = true) else s
           )
-      case ShareRequest.Paused(paused)         => F.pure(state.copy(paused = paused))
-      case ShareRequest.ReaderClosed()         => releaseUnpulled(state.copy(readerClosed = true))
-      case ShareRequest.Stage(decisions, done) =>
-        stageAll(state, Vector(decisions -> done), send = false, byUser = true)
+      case ShareRequest.Paused(paused)  => F.pure(state.copy(paused = paused))
+      case ShareRequest.ReaderClosed()  => releaseUnpulled(state.copy(readerClosed = true))
+      case ShareRequest.Ack(acks, done) =>
+        ackAll(state, Vector(acks -> done), send = false, byUser = true)
     }
 
   // Releases a poll the stream never took; renewing records once a poll returns them. In implicit
@@ -212,14 +214,14 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
   private def releaseUnpulled(state: ShareState[F]): F[ShareState[F]] =
     if (config.implicitMode) F.pure(state)
     else {
-      val undecided = state.undecided.map(_._1).toSet
-      val renewing  = state.unpulled.filter(state.renewing)
+      val unacked  = state.unacked.map(_._1).toSet
+      val renewing = state.unpulled.filter(state.renewing)
       release(
         state.copy(
           unpulled = Set.empty,
           deferred = state.deferred ++ renewing.map(_ -> AcknowledgeType.Release)
         ),
-        state.unpulled.filter(undecided).toVector
+        state.unpulled.filter(unacked).toVector
       )
     }
 
@@ -228,41 +230,41 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
     offsets: Vector[TopicPartitionOffset]
   ): F[ShareState[F]] =
     if (offsets.isEmpty) F.pure(state)
-    else stageOwn(state, offsets.map(decision(state, _, AcknowledgeType.Release)), byUser = false)
+    else ackOwn(state, offsets.map(ack(state, _, AcknowledgeType.Release)), byUser = false)
 
   private val noCallback: Either[Throwable, Unit] => F[Unit] = _ => F.unit
 
-  private def decision(
+  private def ack(
     state: ShareState[F],
     offset: TopicPartitionOffset,
     kind: AcknowledgeType
-  ): Decision =
-    Decision(offset, state.held(offset).deliveryCount, kind)
+  ): Acknowledgement =
+    Acknowledgement(offset, state.held(offset).deliveryCount, kind)
 
-  // Stages and sends the actor's own decisions; a failure fails the actor. `byUser` renewals
+  // Acknowledges and sends the actor's own acknowledgements; a failure fails the actor. `byUser` renewals
   // restart the time held.
-  private def stageOwn(
+  private def ackOwn(
     state: ShareState[F],
-    decisions: Vector[Decision],
+    acks: Vector[Acknowledgement],
     byUser: Boolean
   ): F[ShareState[F]] =
-    stageAll(
+    ackAll(
       state,
-      Vector(Chunk.from(decisions) -> ((result: Either[Throwable, Unit]) => result.liftTo[F])),
+      Vector(Chunk.from(acks) -> ((result: Either[Throwable, Unit]) => result.liftTo[F])),
       send = true,
       byUser
     )
 
-  // Stages several requests' decisions in one call to Java. Decisions for renewing records wait for
+  // Gives several requests' acknowledgements to Java in one call. Acknowledgements for renewing records wait for
   // the poll which returns them; renewals, or everything if `send` is set, are sent at once.
-  private def stageAll(
+  private def ackAll(
     state: ShareState[F],
-    batch: Vector[(Chunk[Decision], Either[Throwable, Unit] => F[Unit])],
+    batch: Vector[(Chunk[Acknowledgement], Either[Throwable, Unit] => F[Unit])],
     send: Boolean,
     byUser: Boolean
   ): F[ShareState[F]] =
-    stageResults(state, batch, send, byUser).flatMap { case (staged, outcomes) =>
-      // Completes once a poll returns the renewing records and Java staged their decisions.
+    ackResults(state, batch, send, byUser).flatMap { case (acked, outcomes) =>
+      // Completes once a poll returns the renewing records and Java recorded their acknowledgements.
       val waiters = outcomes.collect {
         case (request, Right(_)) if request.waiting.nonEmpty =>
           Waiter(request.waiting.map(_.offset).toSet, request.done)
@@ -272,75 +274,81 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
           case (request, Right(_)) if request.waiting.nonEmpty => F.unit
           case (request, result)                               => request.done(result)
         }
-        .as(staged.copy(waiters = staged.waiters ++ waiters))
+        .as(acked.copy(waiters = acked.waiters ++ waiters))
     }
 
-  // Stages the requests' decisions, giving each request's result; once Java failed, it completes
+  // Gives the requests' acknowledgements to Java, with each request's result; once Java failed, it completes
   // every request with the error and fails.
-  private def stageResults(
+  private def ackResults(
     state: ShareState[F],
-    batch: Vector[(Chunk[Decision], Either[Throwable, Unit] => F[Unit])],
+    batch: Vector[(Chunk[Acknowledgement], Either[Throwable, Unit] => F[Unit])],
     send: Boolean,
     byUser: Boolean
-  ): F[(ShareState[F], Vector[(Staging[F], Either[Throwable, Unit])])] = {
-    val stagings = batch.map { case (own, done) => Staging(state, own, done) }
-    val now      = stagings.flatMap(_.now)
-    val sending  = send || now.exists(_.acknowledgeType == AcknowledgeType.Renew)
-    // Per request: the decisions Java staged, those it no longer holds, and its error.
-    val calls: F[Vector[(Vector[Decision], Vector[Decision], Option[Throwable])]] =
-      if (now.isEmpty && !send) F.pure(stagings.as((Vector.empty, Vector.empty, None)))
+  ): F[(ShareState[F], Vector[(Acking[F], Either[Throwable, Unit])])] = {
+    val ackings = batch.map { case (own, done) => Acking(state, own, done) }
+    val now     = ackings.flatMap(_.now)
+    val sending = send || now.exists(_.acknowledgeType == AcknowledgeType.Renew)
+    // Per request: the acknowledgements Java recorded, those it no longer holds, and its error.
+    val calls: F[Vector[(Vector[Acknowledgement], Vector[Acknowledgement], Option[Throwable])]] =
+      if (now.isEmpty && !send) F.pure(ackings.as((Vector.empty, Vector.empty, None)))
       else
         withConsumer.blocking { consumer =>
-          // Stops at a request's first error, keeping what Java staged before it.
-          val staged = stagings.map { request =>
+          // Stops at a request's first error, keeping what Java recorded before it.
+          val recorded = ackings.map { request =>
             request
               .now
-              .foldLeft((Vector.empty[Decision], Vector.empty[Decision], Option.empty[Throwable])) {
+              .foldLeft(
+                (
+                  Vector.empty[Acknowledgement],
+                  Vector.empty[Acknowledgement],
+                  Option.empty[Throwable]
+                )
+              ) {
                 case (stop @ (_, _, Some(_)), _) => stop
-                case ((done, gone, None), d)     =>
+                case ((done, gone, None), a)     =>
                   Either.catchNonFatal(
-                    consumer.acknowledge(state.held(d.offset).record, d.acknowledgeType.asJava)
+                    consumer.acknowledge(state.held(a.offset).record, a.acknowledgeType.asJava)
                   ) match {
-                    case Right(_) => (done :+ d, gone, None)
+                    case Right(_) => (done :+ a, gone, None)
                     // Java no longer holds it, e.g. after a commit failed once sent. Its other
                     // reasons, a closed consumer and implicit mode, cannot happen here.
-                    case Left(_: IllegalStateException) => (done, gone :+ d, None)
+                    case Left(_: IllegalStateException) => (done, gone :+ a, None)
                     case Left(error)                    => (done, gone, Some(error))
                   }
               }
           }
           // A failed send fails the actor.
           if (sending) consumer.commitAsync()
-          staged
+          recorded
         }
     (F.monotonic, calls.attempt)
       .tupled
       .flatMap {
         case (at, Right(results)) =>
-          // Tracks what Java staged, also of a request that failed part-way. The last one wins.
-          // Records Java no longer holds count as decided, so that they are dropped once sent.
-          val outcomes = stagings.zip(results)
+          // Tracks what Java recorded, also of a request that failed part-way. The last one wins.
+          // Records Java no longer holds count as acknowledged, so that they are dropped once sent.
+          val outcomes = ackings.zip(results)
           val last     = outcomes
             .flatMap { case (_, (done, _, _)) => done }
-            .map(d => d.offset -> d.acknowledgeType)
+            .map(a => a.offset -> a.acknowledgeType)
             .toMap
           val gone     = outcomes.flatMap { case (_, (_, gone, _)) => gone.map(_.offset) }.toSet
           val waiting  = outcomes.collect { case (request, (_, _, None)) => request.waiting }.flatten
-          val withLast = state.withStaged(last, waiting, at, byUser)
-          val staged   = withLast.copy(decided = withLast.decided ++ gone)
+          val withLast = state.withAcked(last, waiting, at, byUser)
+          val acked    = withLast.copy(acked = withLast.acked ++ gone)
           val answers  = outcomes.map { case (request, (_, gone, error)) =>
             request -> error
               .orElse(
                 (gone ++ request.notHeld)
                   .headOption
-                  .map(d => RecordNotInFlightException(d.offset._1, d.offset._2))
+                  .map(a => RecordNotInFlightException(a.offset._1, a.offset._2))
               )
               .toLeft(())
           }
-          F.pure((if (sending) staged.withoutDecided else staged) -> answers)
+          F.pure((if (sending) acked.withoutAcked else acked) -> answers)
         case (_, Left(error)) =>
           batch.traverse_(_._2(Left(error))) *>
-            F.raiseError[(ShareState[F], Vector[(Staging[F], Either[Throwable, Unit])])](error)
+            F.raiseError[(ShareState[F], Vector[(Acking[F], Either[Throwable, Unit])])](error)
       }
   }
 
@@ -348,9 +356,9 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
   private def holdsUntakenPoll(state: ShareState[F]): Boolean =
     config.implicitMode && state.unpulled.nonEmpty
 
-  // Java's `commitSync`, which sends every staged decision and waits for the broker. Results per
+  // Java's `commitSync`, which sends every pending acknowledgement and waits for the broker. Results per
   // partition are not reported, as with the other sends.
-  private def commitStaged(state: ShareState[F], timeout: FiniteDuration): F[Unit] =
+  private def commitSync(state: ShareState[F], timeout: FiniteDuration): F[Unit] =
     if (holdsUntakenPoll(state)) F.unit
     else
       withConsumer
@@ -390,7 +398,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
           }
       )
 
-  // Returned renewed records get their waiting decisions; new records are handed out, or released
+  // Returned renewed records get their waiting acknowledgements; new records are handed out, or released
   // if not admitted. New records count as acquired at the poll's start; records Java buffered from
   // an earlier fetch are older, which the renewal margin covers.
   private def polled(
@@ -425,19 +433,19 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
              .whenA(records.nonEmpty)
       _ <-
         output.offer(Some(next.pollId -> Chunk.from(admitted.map(_._2)))).whenA(admitted.nonEmpty)
-      // Waiting decisions are the user's, sent at once rather than behind the slowest record.
+      // Waiting acknowledgements are the user's, sent at once rather than behind the slowest record.
       waiting = returned.flatMap { case (p, _) => next.deferred.get(p).map(p -> _) }
-      // One request per waiting decision, to settle its waiters with its own result.
+      // One request per waiting acknowledgement, to settle its waiters with its own result.
       waitingBatch = waiting.map { case (p, kind) =>
-                       Chunk.singleton(decision(next, p, kind)) -> noCallback
+                       Chunk.singleton(ack(next, p, kind)) -> noCallback
                      }
-      releases = rejected.map { case (p, _) => decision(next, p, AcknowledgeType.Release) }
+      releases = rejected.map { case (p, _) => ack(next, p, AcknowledgeType.Release) }
       batch    = waitingBatch ++
                 (if (releases.isEmpty) Vector.empty else Vector(Chunk.from(releases) -> noCallback))
-      staged <-
+      acked <-
         if (batch.isEmpty) F.pure(next)
         else
-          stageResults(
+          ackResults(
             next.copy(deferred = next.deferred -- waiting.map(_._1)),
             batch,
             send = true,
@@ -455,7 +463,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
             // A failed release fails the actor.
             effects.sequence_ *> releaseResults.traverse_(_.liftTo[F]).as(settled)
           }
-    } yield staged
+    } yield acked
   }
 
   private def held(
@@ -485,16 +493,16 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
 
   // --- Automatic renewal ---
 
-  // Undecided records are renewed at once while a decision waits for a renewed record, so that the
+  // Unacknowledged records are renewed at once while an acknowledgement waits for a renewed record, so that the
   // consumer can poll it, and with automatic renewal at the renewal interval.
   private def nextRenewal(state: ShareState[F]): Option[FiniteDuration] = {
     // Only scans the records when something is to be renewed.
-    lazy val undecided = state.undecided.map(_._2.lockedSince)
+    lazy val unacked = state.unacked.map(_._2.lockedSince)
     if (state.allSettled || (state.deferred.isEmpty && !config.settings.autoRenewal)) None
-    else if (state.deferred.nonEmpty) Some(undecided.min)
+    else if (state.deferred.nonEmpty) Some(unacked.min)
     // Also after the stream ended, as records may still be processed downstream.
     else if (config.settings.autoRenewal)
-      Some(undecided.min + state.lock.fold(unknownLockRenewalInterval)(renewalInterval))
+      Some(unacked.min + state.lock.fold(unknownLockRenewalInterval)(renewalInterval))
     else None
   }
 
@@ -507,38 +515,38 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
   }
 
   private def renew(state: ShareState[F]): F[ShareState[F]] =
-    stageOwn(
+    ackOwn(
       state,
-      state.undecided.map { case (p, _) => decision(state, p, AcknowledgeType.Renew) },
+      state.unacked.map { case (p, _) => ack(state, p, AcknowledgeType.Renew) },
       byUser = false
     )
 
   // --- Max acknowledgement delay ---
 
-  // When the staged decisions are sent without waiting for the next poll: at once while paused, as
+  // When the pending acknowledgements are sent without waiting for the next poll: at once while paused, as
   // no poll comes, also to accept a taken poll in implicit mode.
   private def nextSend(state: ShareState[F]): Option[FiniteDuration] =
     if (state.paused && state.renewing.isEmpty)
       state
-        .stagedSince
+        .unsentSince
         .orElse(if (state.acceptPending && !holdsUntakenPoll(state)) Some(Duration.Zero) else None)
-    else (state.stagedSince, config.settings.maxAcknowledgementDelay).mapN(_ + _)
+    else (state.unsentSince, config.settings.maxAcknowledgementDelay).mapN(_ + _)
 
-  // Java's `commitAsync`, which sends every staged decision.
-  private def sendStaged(state: ShareState[F]): F[ShareState[F]] =
+  // Java's `commitAsync`, which sends every pending acknowledgement.
+  private def commitAsync(state: ShareState[F]): F[ShareState[F]] =
     if (holdsUntakenPoll(state)) F.pure(state)
-    else withConsumer.blocking(_.commitAsync()).as(state.withoutDecided)
+    else withConsumer.blocking(_.commitAsync()).as(state.withoutAcked)
 
   // --- Max processing time ---
 
-  // When the max processing time releases each undecided record the stream took, counted from
+  // When the max processing time releases each unacknowledged record the stream took, counted from
   // when it took it or the user's latest renewal.
   private def limits(state: ShareState[F]): Vector[(TopicPartitionOffset, FiniteDuration)] =
     config
       .settings
       .maxProcessingTime
       .fold(Vector.empty[(TopicPartitionOffset, FiniteDuration)])(max =>
-        state.undecided.collect { case (p, h) if !state.unpulled(p) => p -> (h.heldSince + max) }
+        state.unacked.collect { case (p, h) if !state.unpulled(p) => p -> (h.heldSince + max) }
       )
 
   // Releases overdue records, so they are delivered again and the consumer can poll.
@@ -563,14 +571,14 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
           taker.cancel *> taker.join.flatMap(_.fold(F.pure(None), F.raiseError, _.map(Some(_))))
       }
 
-  // Receives requests in order, staging consecutive decisions in one call.
+  // Receives requests in order, giving consecutive acknowledgements to Java in one call.
   private def receiveAll(state: ShareState[F], taken: List[ShareRequest[F]]): F[ShareState[F]] =
     taken match {
-      case Nil                             => F.pure(state)
-      case (_: ShareRequest.Stage[F]) :: _ =>
-        val (stages, rest) = taken.span(_.isInstanceOf[ShareRequest.Stage[F]])
-        val batch          = stages.collect { case ShareRequest.Stage(d, done) => d -> done }.toVector
-        stageAll(state, batch, send = false, byUser = true).flatMap(receiveAll(_, rest))
+      case Nil                           => F.pure(state)
+      case (_: ShareRequest.Ack[F]) :: _ =>
+        val (acks, rest) = taken.span(_.isInstanceOf[ShareRequest.Ack[F]])
+        val batch        = acks.collect { case ShareRequest.Ack(a, done) => a -> done }.toVector
+        ackAll(state, batch, send = false, byUser = true).flatMap(receiveAll(_, rest))
       case request :: rest => receive(state, request).flatMap(receiveAll(_, rest))
     }
 
@@ -590,14 +598,14 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
             val send    = nextSend(current)
             val wakeAt  = (renewal.toList ++ send ++ limit.map(_._2)).reduceOption(_ min _)
             if (current.isFinished)
-              commitStaged(current, config.settings.commitTimeout).attempt
+              commitSync(current, config.settings.commitTimeout).attempt
             else if (overdue.nonEmpty) releaseOverdue(current, overdue).flatMap(loop)
-            // Stopping after the stream ended: nothing will decide the rest.
-            else if (current.stopping && current.readerClosed && current.undecided.nonEmpty)
-              release(current, current.undecided.map(_._1)).flatMap(loop)
+            // Stopping after the stream ended: nothing will acknowledge the rest.
+            else if (current.stopping && current.readerClosed && current.unacked.nonEmpty)
+              release(current, current.unacked.map(_._1)).flatMap(loop)
             else if (renewal.exists(_ <= now)) renew(current).flatMap(loop)
             // Before polling, which may wait while unsubscribed.
-            else if (send.exists(_ <= now)) sendStaged(current).flatMap(loop)
+            else if (send.exists(_ <= now)) commitAsync(current).flatMap(loop)
             else if (current.canPoll) poll(current).flatMap(loop)
             else
               wakeAt
@@ -666,27 +674,25 @@ private[kafka] object KafkaShareConsumerActor {
   def deliveryCountOf(record: KafkaByteConsumerRecord): Short =
     record.deliveryCount().toScala.fold(1: Short)(_.shortValue)
 
-  // One request's held decisions, to stage now or waiting for a renewed record, and its first
-  // decision for a delivery not held.
-  final case class Staging[F[_]](
+  // One request's held acknowledgements, to give Java now or waiting for a renewed record, and its first
+  // acknowledgement for a delivery not held.
+  final case class Acking[F[_]](
     done: Either[Throwable, Unit] => F[Unit],
-    now: Vector[Decision],
-    waiting: Vector[Decision],
-    notHeld: Option[Decision]
+    now: Vector[Acknowledgement],
+    waiting: Vector[Acknowledgement],
+    notHeld: Option[Acknowledgement]
   )
 
-  object Staging {
+  object Acking {
 
     def apply[F[_]](
       state: ShareState[F],
-      decisions: Chunk[Decision],
+      acks: Chunk[Acknowledgement],
       done: Either[Throwable, Unit] => F[Unit]
-    ): Staging[F] = {
-      val (held, notHeld) = decisions
-        .toVector
-        .partition(d => state.holds(d.offset, d.deliveryCount))
-      val (waiting, now) = held.partition(d => state.renewing(d.offset))
-      Staging(done, now, waiting, notHeld.headOption)
+    ): Acking[F] = {
+      val (held, notHeld) = acks.toVector.partition(a => state.holds(a.offset, a.deliveryCount))
+      val (waiting, now)  = held.partition(a => state.renewing(a.offset))
+      Acking(done, now, waiting, notHeld.headOption)
     }
 
   }
