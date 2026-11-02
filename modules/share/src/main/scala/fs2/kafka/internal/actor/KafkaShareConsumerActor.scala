@@ -55,7 +55,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
         ShareRequest.Stage(decisions, _),
         _ =>
           Left(
-            RecordNotInFlightException(decisions.head.get.topicPartition, decisions.head.get.offset)
+            RecordNotInFlightException(decisions.head.get.offset._1, decisions.head.get.offset._2)
           )
       )
 
@@ -241,14 +241,21 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
       )
     }
 
-  private def release(state: ShareState[F], positions: Vector[Position]): F[ShareState[F]] =
-    if (positions.isEmpty) F.pure(state)
-    else stageOwn(state, positions.map(decision(state, _, AcknowledgeType.Release)), byUser = false)
+  private def release(
+    state: ShareState[F],
+    offsets: Vector[TopicPartitionOffset]
+  ): F[ShareState[F]] =
+    if (offsets.isEmpty) F.pure(state)
+    else stageOwn(state, offsets.map(decision(state, _, AcknowledgeType.Release)), byUser = false)
 
   private val noCallback: Either[Throwable, Unit] => F[Unit] = _ => F.unit
 
-  private def decision(state: ShareState[F], position: Position, kind: AcknowledgeType): Decision =
-    Decision(position._1, position._2, state.held(position).deliveryCount, kind)
+  private def decision(
+    state: ShareState[F],
+    offset: TopicPartitionOffset,
+    kind: AcknowledgeType
+  ): Decision =
+    Decision(offset, state.held(offset).deliveryCount, kind)
 
   // Stages and sends the actor's own decisions; a failure fails the actor. `byUser` renewals
   // restart the time held.
@@ -276,7 +283,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
       // Completes once a poll returns the renewing records and Java staged their decisions.
       val waiters = outcomes.collect {
         case (request, Right(_)) if request.waiting.nonEmpty =>
-          Waiter(request.waiting.map(_.position).toSet, request.done)
+          Waiter(request.waiting.map(_.offset).toSet, request.done)
       }
       outcomes
         .traverse_ {
@@ -312,7 +319,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
                   .now
                   .foreach { d =>
                     try {
-                      consumer.acknowledge(state.held(d.position).record, d.acknowledgeType.asJava)
+                      consumer.acknowledge(state.held(d.offset).record, d.acknowledgeType.asJava)
                       done += d
                     } catch {
                       // Java no longer holds it, e.g. after a commit failed once sent. Its other
@@ -338,9 +345,9 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
           val outcomes = stagings.zip(results)
           val last     = outcomes
             .flatMap { case (_, (done, _, _)) => done }
-            .map(d => d.position -> d.acknowledgeType)
+            .map(d => d.offset -> d.acknowledgeType)
             .toMap
-          val gone     = outcomes.flatMap { case (_, (_, gone, _)) => gone.map(_.position) }.toSet
+          val gone     = outcomes.flatMap { case (_, (_, gone, _)) => gone.map(_.offset) }.toSet
           val waiting  = outcomes.collect { case (request, (_, _, None)) => request.waiting }.flatten
           val withLast = state.withStaged(last, waiting, at, byUser)
           val staged   = withLast.copy(decided = withLast.decided ++ gone)
@@ -349,7 +356,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
               .orElse(
                 (gone ++ request.notHeld)
                   .headOption
-                  .map(d => RecordNotInFlightException(d.topicPartition, d.offset))
+                  .map(d => RecordNotInFlightException(d.offset._1, d.offset._2))
               )
               .toLeft(())
           }
@@ -422,8 +429,8 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
     acquiredAt: FiniteDuration,
     now: FiniteDuration
   ): F[ShareState[F]] = {
-    val positioned        = records.map(r => position(r) -> r)
-    val (returned, fresh) = positioned.partition { case (p, r) =>
+    val withOffsets       = records.map(r => offsetOf(r) -> r)
+    val (returned, fresh) = withOffsets.partition { case (p, r) =>
       state.renewing(p) && state.holds(p, deliveryCountOf(r))
     }
     val admitting = state.admitting
@@ -488,19 +495,19 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
     Held(deliveryCountOf(record), record, acquiredAt, now)
 
   private def admit(
-    position: Position,
+    offset: TopicPartitionOffset,
     record: KafkaByteConsumerRecord,
     acquiredAt: FiniteDuration,
     now: FiniteDuration
-  ): F[((Position, Held), AcknowledgeableConsumerRecord[F, K, V])] = {
+  ): F[((TopicPartitionOffset, Held), AcknowledgeableConsumerRecord[F, K, V])] = {
     val delivery = held(record, acquiredAt, now)
     ConsumerRecord
       .fromJava(record, keyDeserializer, valueDeserializer)
       .map(decoded =>
-        (position -> delivery) ->
+        (offset -> delivery) ->
           AcknowledgeableConsumerRecord(
             decoded,
-            AcknowledgeableOffset(position._1, position._2, delivery.deliveryCount, this)
+            AcknowledgeableOffset(offset._1, offset._2, delivery.deliveryCount, this)
           )
       )
   }
@@ -555,16 +562,19 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
 
   // When the max processing time releases each undecided record the stream took, counted from
   // when it took it or the user's latest renewal.
-  private def limits(state: ShareState[F]): Vector[(Position, FiniteDuration)] =
+  private def limits(state: ShareState[F]): Vector[(TopicPartitionOffset, FiniteDuration)] =
     config
       .settings
       .maxProcessingTime
-      .fold(Vector.empty[(Position, FiniteDuration)])(max =>
+      .fold(Vector.empty[(TopicPartitionOffset, FiniteDuration)])(max =>
         state.undecided.collect { case (p, h) if !state.unpulled(p) => p -> (h.heldSince + max) }
       )
 
   // Releases overdue records, so they are delivered again and the consumer can poll.
-  private def releaseOverdue(state: ShareState[F], records: Vector[Position]): F[ShareState[F]] =
+  private def releaseOverdue(
+    state: ShareState[F],
+    records: Vector[TopicPartitionOffset]
+  ): F[ShareState[F]] =
     config
       .settings
       .maxProcessingTime
@@ -664,8 +674,6 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
 
 private[kafka] object KafkaShareConsumerActor {
 
-  type Position = TopicPartitionOffset
-
   type CommitResult = Map[TopicPartition, Option[KafkaException]]
 
   // How the actor ended.
@@ -683,7 +691,7 @@ private[kafka] object KafkaShareConsumerActor {
 
   }
 
-  def position(record: KafkaByteConsumerRecord): Position =
+  def offsetOf(record: KafkaByteConsumerRecord): TopicPartitionOffset =
     new TopicPartition(record.topic, record.partition) -> record.offset
 
   def deliveryCountOf(record: KafkaByteConsumerRecord): Short =
@@ -709,9 +717,9 @@ private[kafka] object KafkaShareConsumerActor {
       val waiting = Vector.newBuilder[Decision]
       var notHeld = Option.empty[Decision]
       decisions.foreach { d =>
-        if (!state.holds(d.position, d.deliveryCount)) { if (notHeld.isEmpty) notHeld = Some(d) }
-        else if (state.renewing(d.position)) waiting += d
-        else now                                     += d
+        if (!state.holds(d.offset, d.deliveryCount)) { if (notHeld.isEmpty) notHeld = Some(d) }
+        else if (state.renewing(d.offset)) waiting += d
+        else now                                   += d
       }
       Staging(done, now.result(), waiting.result(), notHeld)
     }

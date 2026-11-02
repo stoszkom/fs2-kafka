@@ -10,7 +10,8 @@ import org.apache.kafka.common.TopicPartition
 
 package object actor {
 
-  // A record's position. It identifies a record, not a delivery: a redelivery has the same one.
+  // A record's offset in its topic partition. It identifies a record, not a delivery: a redelivery
+  // has the same one.
   type TopicPartitionOffset = (TopicPartition, Long)
 
 }

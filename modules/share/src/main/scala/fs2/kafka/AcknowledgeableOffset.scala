@@ -17,7 +17,7 @@ import fs2.Chunk
 import org.apache.kafka.common.TopicPartition
 
 /**
-  * The position of a record held by a [[KafkaShareConsumer]], with the delivery it belongs to.
+  * The offset of a record held by a [[KafkaShareConsumer]], with the delivery it belongs to.
   */
 sealed abstract class AcknowledgeableOffset[F[_]] { self =>
 
@@ -71,7 +71,7 @@ sealed abstract class AcknowledgeableOffset[F[_]] { self =>
   final def renew: F[Unit] = acknowledge(AcknowledgeType.Renew)
 
   private[kafka] def decision(acknowledgeType: AcknowledgeType): Decision =
-    Decision(topicPartition, offset, deliveryCount, acknowledgeType)
+    Decision(topicPartition -> offset, deliveryCount, acknowledgeType)
 
   /**
     * Creates a new [[AcknowledgeableOffset]] in which the effect type has been changed using the

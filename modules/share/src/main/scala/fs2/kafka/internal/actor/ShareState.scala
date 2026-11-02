@@ -31,7 +31,7 @@ final private[kafka] case class Held(
 
 // A request completed once its decisions for renewing records are staged.
 final private[kafka] case class Waiter[F[_]](
-  positions: Set[TopicPartitionOffset],
+  offsets: Set[TopicPartitionOffset],
   done: Either[Throwable, Unit] => F[Unit]
 )
 
@@ -87,8 +87,8 @@ final private[kafka] case class ShareState[F[_]](
   def acquiring: Boolean = admitting && !paused
 
   // Whether the delivery is held.
-  def holds(position: TopicPartitionOffset, deliveryCount: Short): Boolean =
-    held.get(position).exists(_.deliveryCount == deliveryCount)
+  def holds(offset: TopicPartitionOffset, deliveryCount: Short): Boolean =
+    held.get(offset).exists(_.deliveryCount == deliveryCount)
 
   // Java polls once every record has a decision or a renewal, and the stream took the poll. Renewed
   // records come back only from a poll, which returns no new records while a renewal is pending.
@@ -120,7 +120,7 @@ final private[kafka] case class ShareState[F[_]](
       decided = decided ++ final_.keySet -- renewed.keySet,
       stagedSince = stagedSince.orElse(if (final_.isEmpty) None else Some(at)),
       renewing = renewing ++ renewed.keySet,
-      deferred = deferred ++ waiting.map(d => d.position -> d.acknowledgeType)
+      deferred = deferred ++ waiting.map(d => d.offset -> d.acknowledgeType)
     )
   }
 
@@ -167,23 +167,23 @@ final private[kafka] case class ShareState[F[_]](
   def withoutDecided: ShareState[F] =
     copy(held = held -- decided, decided = Set.empty, stagedSince = None, acceptPending = false)
 
-  // Completes the requests waiting for a decision on the position with its staging result, as the
+  // Completes the requests waiting for a decision on the offset with its staging result, as the
   // effects to run.
   def settled(
-    position: TopicPartitionOffset,
+    offset: TopicPartitionOffset,
     result: Either[Throwable, Unit]
   ): (ShareState[F], Vector[F[Unit]]) = {
-    val (hit, rest)   = waiters.partition(_.positions(position))
-    val left          = hit.map(w => w.copy(positions = w.positions - position))
+    val (hit, rest)   = waiters.partition(_.offsets(offset))
+    val left          = hit.map(w => w.copy(offsets = w.offsets - offset))
     val (ready, keep) =
-      if (result.isLeft) (hit, Vector.empty) else left.partition(_.positions.isEmpty)
+      if (result.isLeft) (hit, Vector.empty) else left.partition(_.offsets.isEmpty)
     (copy(waiters = rest ++ keep), ready.map(_.done(result)))
   }
 
   // Fails the waiting decisions whose record lost its lock before a poll returned it.
   def settledLost: (ShareState[F], Vector[F[Unit]]) =
     waiters
-      .flatMap(_.positions)
+      .flatMap(_.offsets)
       .distinct
       .filterNot(deferred.contains)
       .foldLeft((this, Vector.empty[F[Unit]])) { case ((s, effects), p) =>
@@ -192,8 +192,8 @@ final private[kafka] case class ShareState[F[_]](
       }
 
   // The renewal failed, so the records lost their lock.
-  def withoutRenewing(positions: Set[TopicPartitionOffset]): ShareState[F] = {
-    val lost = positions.intersect(renewing)
+  def withoutRenewing(offsets: Set[TopicPartitionOffset]): ShareState[F] = {
+    val lost = offsets.intersect(renewing)
     if (lost.isEmpty) this
     else
       copy(

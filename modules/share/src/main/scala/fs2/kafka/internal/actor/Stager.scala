@@ -10,19 +10,12 @@ import cats.~>
 import fs2.kafka.AcknowledgeType
 import fs2.Chunk
 
-import org.apache.kafka.common.TopicPartition
-
 // A decision for one delivery of a record.
 final private[kafka] case class Decision(
-  topicPartition: TopicPartition,
-  offset: Long,
+  offset: TopicPartitionOffset,
   deliveryCount: Short,
   acknowledgeType: AcknowledgeType
-) {
-
-  val position: TopicPartitionOffset = topicPartition -> offset
-
-}
+)
 
 // Stages decisions in the Java consumer of the records they are for. `acknowledgeChunks` groups
 // offsets by stager: a consumer's actor by reference, a mapped one by its stager and function.
