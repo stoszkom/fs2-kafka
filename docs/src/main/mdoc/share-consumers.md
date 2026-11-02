@@ -82,6 +82,8 @@ In addition, there are several settings specific to the library.
 
 - `withMaxAcknowledgementDelay` sets how long a staged decision may wait before the consumer sends it, without waiting for the next poll. Default is 1 second; `withoutMaxAcknowledgementDelay` sends decisions only with the next poll or commit, as in Java; a delay can be at most 365 days. See [acknowledging](#acknowledging).
 
+- `withPauseWhen` takes a `Signal[F, Boolean]`; while it is `true`, the consumer acquires no new records. Not paused by default. See [pausing](#pausing).
+
 - `withMaxPollRecords` sets the records polled at once, and so held per consumer with `record_limit`. Default is 500.
 
 - `withPollTimeout` modifies for how long `poll` is allowed to block. The consumer polls again as soon as every record of the previous poll has a decision and the stream has taken it, so there is no poll interval. Default is 50 milliseconds.
@@ -193,6 +195,32 @@ With `withAutoRenewal(true)`, records without an acknowledgement are renewed `wi
 - **A record whose processing hangs** can be let go with `withMaxProcessingTime`. A record held without a decision for longer is released and delivered again, and the consumer can poll again once the stream has taken its previous poll. Records of a poll the stream has not taken yet are not released. The time counts from when the stream took the record's poll, or from your latest `Renew` of it, until its decision reaches the consumer, so set it well above the time to process a whole poll. With several consumers merged into one pipeline, or `batch_optimized` polls above `max.poll.records`, records wait behind more records, so allow for that too. Its processing is not cancelled.
 
 - **A late decision fails** with a `RecordNotInFlightException` once the consumer has released the record. One for a record whose lock has expired is rejected by the broker when it is sent, see [acknowledging](#acknowledging). Either way, the record is processed again after its redelivery.
+
+## Pausing
+
+When something the processing needs is unavailable, polling on would acquire records only to fail them, and each redelivery raises their delivery count, until the broker archives them at the delivery count limit. With `withPauseWhen(signal)`, the consumer polls for no new records while the signal is `true`.
+
+```scala mdoc:silent
+import fs2.concurrent.SignallingRef
+
+def pausable(paused: SignallingRef[IO, Boolean]): IO[Unit] =
+  KafkaShareConsumer.stream(settings.withPauseWhen(paused))
+    .subscribeTo("jobs")
+    .records
+    .parEvalMapUnordered(32) { record =>
+      process(record.record) *> record.accept
+    }
+    .compile
+    .drain
+```
+
+Deciding when to pause is up to us: a circuit breaker, a health check, or failures counted in the processing, which sets the signal. While paused:
+
+- Records already taken by the stream are processed and acknowledged as usual. As no poll comes, their decisions are sent at once, and in implicit mode, a poll the stream took is accepted with a commit. Auto-renewal keeps renewing records still held.
+- With no records held, a pause longer than `max.poll.interval.ms` makes Java leave the share group; the first poll after it rejoins. Nothing is acquired meanwhile, so nothing is lost.
+- `stopConsuming` still finishes, with its final commit.
+
+Pausing stops new records. For a record whose processing fails while the service is down, retry it rather than releasing it: keep it undecided, with auto-renewal holding its lock, so that its delivery count does not grow.
 
 ## Acknowledgement and Acquire Modes
 

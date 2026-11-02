@@ -24,6 +24,9 @@ private[kafka] object ShareRequest {
 
   final case class HandedOut[F[_]](pollId: Long) extends ShareRequest[F]
 
+  // The pause signal changed.
+  final case class Paused[F[_]](paused: Boolean) extends ShareRequest[F]
+
   final case class Stage[F[_]](
     decisions: Chunk[Decision],
     done: Either[Throwable, Unit] => F[Unit]

@@ -9,6 +9,7 @@ package fs2.kafka
 import scala.concurrent.duration.*
 
 import cats.effect.Resource
+import fs2.concurrent.Signal
 
 import org.apache.kafka.clients.consumer.ConsumerConfig
 
@@ -308,6 +309,34 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
     */
   def withoutMaxAcknowledgementDelay: ShareConsumerSettings[F, K, V]
 
+  /**
+    * A signal which pauses the consumer while it is `true`, or `None` to never pause. While paused,
+    * the consumer polls for no new records, so records are not acquired and their delivery count
+    * does not grow while, for example, a service the processing needs is down. Records already
+    * taken by the stream are processed and acknowledged as usual: their decisions are sent at once,
+    * and auto-renewal keeps renewing them. Without records held, a pause longer than
+    * `max.poll.interval.ms` makes Java leave the share group, and the first poll after it rejoins.
+    *
+    * The circuit breaker deciding when to pause, such as one counting failures or checking a
+    * service's health, is yours: set the signal, for example a `SignallingRef`. While processing
+    * fails, keep a record undecided and retry it, with auto-renewal, rather than releasing it, so
+    * that its delivery count does not grow.<br><br>
+    *
+    * The default value is `None`.
+    */
+  def pauseWhen: Option[Signal[F, Boolean]]
+
+  /**
+    * Creates a new [[ShareConsumerSettings]] which pauses while the signal is `true`, see
+    * [[pauseWhen]].
+    */
+  def withPauseWhen(signal: Signal[F, Boolean]): ShareConsumerSettings[F, K, V]
+
+  /**
+    * Creates a new [[ShareConsumerSettings]] which never pauses, the default.
+    */
+  def withoutPauseWhen: ShareConsumerSettings[F, K, V]
+
 }
 
 object ShareConsumerSettings {
@@ -325,7 +354,8 @@ object ShareConsumerSettings {
     autoRenewal: Boolean,
     renewalMargin: FiniteDuration,
     maxProcessingTime: Option[FiniteDuration],
-    maxAcknowledgementDelay: Option[FiniteDuration]
+    maxAcknowledgementDelay: Option[FiniteDuration],
+    pauseWhen: Option[Signal[F, Boolean]]
   ) extends ShareConsumerSettings[F, K, V] {
 
     override def withProperty(key: String, value: String): ShareConsumerSettings[F, K, V] =
@@ -383,8 +413,17 @@ object ShareConsumerSettings {
     override def withoutMaxAcknowledgementDelay: ShareConsumerSettings[F, K, V] =
       copy(maxAcknowledgementDelay = None)
 
+    override def withPauseWhen(signal: Signal[F, Boolean]): ShareConsumerSettings[F, K, V] =
+      copy(pauseWhen = Some(signal))
+
+    override def withoutPauseWhen: ShareConsumerSettings[F, K, V] =
+      copy(pauseWhen = None)
+
     override def toString: String =
-      s"ShareConsumerSettings(closeTimeout = $closeTimeout, pollTimeout = $pollTimeout, commitTimeout = $commitTimeout, autoRenewal = $autoRenewal, renewalMargin = $renewalMargin, maxProcessingTime = $maxProcessingTime, maxAcknowledgementDelay = $maxAcknowledgementDelay)"
+      s"ShareConsumerSettings(closeTimeout = $closeTimeout, pollTimeout = $pollTimeout, commitTimeout = $commitTimeout, autoRenewal = $autoRenewal, renewalMargin = $renewalMargin, maxProcessingTime = $maxProcessingTime, maxAcknowledgementDelay = $maxAcknowledgementDelay, pauseWhen = ${if (
+          pauseWhen.isDefined
+        ) "Some(<signal>)"
+        else "None"})"
 
   }
 
@@ -411,7 +450,8 @@ object ShareConsumerSettings {
       autoRenewal = false,
       renewalMargin = 5.seconds,
       maxProcessingTime = None,
-      maxAcknowledgementDelay = Some(1.second)
+      maxAcknowledgementDelay = Some(1.second),
+      pauseWhen = None
     ).withAcknowledgementMode(ShareAcknowledgementMode.Explicit)
       .withAcquireMode(ShareAcquireMode.RecordLimit)
 

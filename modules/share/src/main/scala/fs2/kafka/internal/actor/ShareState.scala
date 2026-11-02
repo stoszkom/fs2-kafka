@@ -54,6 +54,10 @@ final private[kafka] case class Waiter[F[_]](
   *   when the oldest decision staged but not sent was staged
   * @param waiters
   *   requests completed once their decisions in `deferred` are staged
+  * @param paused
+  *   whether the pause signal holds back polls for new records
+  * @param acceptPending
+  *   in implicit mode, whether the stream took a poll which no poll or commit accepted yet
   */
 final private[kafka] case class ShareState[F[_]](
   held: Map[TopicPartitionOffset, Held] = Map.empty,
@@ -67,7 +71,9 @@ final private[kafka] case class ShareState[F[_]](
   started: Boolean = false,
   stopping: Boolean = false,
   readerClosed: Boolean = false,
-  waiters: Vector[Waiter[F]] = Vector.empty[Waiter[F]]
+  waiters: Vector[Waiter[F]] = Vector.empty[Waiter[F]],
+  paused: Boolean = false,
+  acceptPending: Boolean = false
 ) {
 
   // Held records without a decision or a renewal.
@@ -77,13 +83,16 @@ final private[kafka] case class ShareState[F[_]](
   // Whether a poll's new records are handed out.
   def admitting: Boolean = !stopping && !readerClosed && unpulled.isEmpty
 
+  // Whether a poll may acquire new records.
+  def acquiring: Boolean = admitting && !paused
+
   // Whether the delivery is held.
   def holds(position: TopicPartitionOffset, deliveryCount: Short): Boolean =
     held.get(position).exists(_.deliveryCount == deliveryCount)
 
   // Java polls once every record has a decision or a renewal, and the stream took the poll. Renewed
   // records come back only from a poll, which returns no new records while a renewal is pending.
-  def canPoll: Boolean = started && allSettled && (renewing.nonEmpty || admitting)
+  def canPoll: Boolean = started && allSettled && (renewing.nonEmpty || acquiring)
 
   // Whether no held record is undecided, without building `undecided`: `decided` and `renewing`
   // are disjoint sets of held records.
@@ -139,6 +148,7 @@ final private[kafka] case class ShareState[F[_]](
       // A renewed record returned as a new delivery is among the lost.
       deferred = deferred -- lost,
       lock = reportedLock,
+      acceptPending = false,
       unpulled = if (admitted.isEmpty) unpulled -- lost else admitted.map(_._1).toSet,
       pollId = if (admitted.isEmpty) pollId else pollId + 1
     )
@@ -155,7 +165,7 @@ final private[kafka] case class ShareState[F[_]](
 
   // The staged decisions were sent.
   def withoutDecided: ShareState[F] =
-    copy(held = held -- decided, decided = Set.empty, stagedSince = None)
+    copy(held = held -- decided, decided = Set.empty, stagedSince = None, acceptPending = false)
 
   // Completes the requests waiting for a decision on the position with its staging result, as the
   // effects to run.

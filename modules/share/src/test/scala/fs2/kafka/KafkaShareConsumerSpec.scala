@@ -12,6 +12,7 @@ import scala.concurrent.duration.*
 import cats.~>
 import cats.effect.{Deferred, IO, Ref}
 import cats.syntax.all.*
+import fs2.concurrent.SignallingRef
 
 import org.apache.kafka.common.config.ConfigException
 import org.apache.kafka.common.errors.InvalidRecordStateException
@@ -914,6 +915,91 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         )
         acceptedBefore should contain theSameElementsAs Vector("1", "2", "3")
         assertSettled(topic, settings)
+      }
+    }
+  }
+
+  describe("pausing") {
+    it("should acquire no records while paused") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0")
+        val (whilePaused, count) = run(
+          SignallingRef[IO, Boolean](true).flatMap { paused =>
+            Ref
+              .of[IO, Option[Int]](None)
+              .flatMap { seen =>
+                subscribed(shareConsumerSettings.withPauseWhen(paused), topic) { consumer =>
+                  consumer
+                    .records
+                    .take(1)
+                    .evalMap(r => seen.set(Some(r.offset.deliveryCount.toInt)) *> r.accept)
+                    .compile
+                    .drain
+                    .background
+                    .use(done =>
+                      // Longer than joining the group and a first poll take.
+                      IO.sleep(10.seconds) *> seen
+                        .get
+                        .flatMap(before =>
+                          paused.set(false) *> done.flatMap(_.embedNever) *> seen
+                            .get
+                            .tupleLeft(before)
+                        )
+                    )
+                }
+              }
+          }
+        )
+        whilePaused shouldBe None
+        count shouldBe Some(1)
+      }
+    }
+
+    it("should send a decision made while paused") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0")
+        val settings = shareConsumerSettings.withoutMaxAcknowledgementDelay
+        run(
+          SignallingRef[IO, Boolean](false).flatMap { paused =>
+            subscribed(settings.withPauseWhen(paused), topic) { consumer =>
+              // The pause reaches the consumer before the decision, so that no poll sends it, and
+              // the consumer stays open past the record's lock.
+              consumer
+                .records
+                .take(1)
+                .evalMap(r =>
+                  paused.set(true) *> IO.sleep(1.second) *> r.accept *> IO.sleep(lock + 1.second)
+                )
+                .compile
+                .drain
+            }
+          }
+        )
+        assertSettled(topic, settings)
+      }
+    }
+
+    it("should accept a taken poll while paused in implicit mode") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0")
+        val settings = shareConsumerSettings.withProperty("share.acknowledgement.mode", "implicit")
+        run(
+          SignallingRef[IO, Boolean](false).flatMap { paused =>
+            subscribed(settings.withPauseWhen(paused), topic) { consumer =>
+              consumer
+                .records
+                .evalMap(_ => paused.set(true))
+                .compile
+                .drain
+                // Past the record's lock, also after joining the group.
+                .timeoutTo(lock + 5.seconds, IO.unit)
+            }
+          }
+        )
+        assertSettled(topic, settings.withProperty("share.acknowledgement.mode", "explicit"))
       }
     }
   }

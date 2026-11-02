@@ -208,8 +208,14 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
         withConsumer
           .blocking(_.subscription().isEmpty)
           .ifM(F.raiseError(NotSubscribedException()), F.pure(state.copy(started = true)))
-      case ShareRequest.Stop()                 => F.pure(state.copy(stopping = true))
-      case ShareRequest.HandedOut(id)          => F.monotonic.map(state.withHandedOut(id, _))
+      case ShareRequest.Stop()        => F.pure(state.copy(stopping = true))
+      case ShareRequest.HandedOut(id) =>
+        F.monotonic
+          .map(state.withHandedOut(id, _))
+          .map(s =>
+            if (config.implicitMode && id == state.pollId) s.copy(acceptPending = true) else s
+          )
+      case ShareRequest.Paused(paused)         => F.pure(state.copy(paused = paused))
       case ShareRequest.ReaderClosed()         => releaseUnpulled(state.copy(readerClosed = true))
       case ShareRequest.Stage(decisions, done) =>
         stageAll(state, Vector(decisions -> done), send = false, byUser = true)
@@ -531,9 +537,14 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
 
   // --- Max acknowledgement delay ---
 
-  // When the staged decisions are sent without waiting for the next poll.
+  // When the staged decisions are sent without waiting for the next poll: at once while paused, as
+  // no poll comes, also to accept a taken poll in implicit mode.
   private def nextSend(state: ShareState[F]): Option[FiniteDuration] =
-    (state.stagedSince, config.settings.maxAcknowledgementDelay).mapN(_ + _)
+    if (state.paused && state.renewing.isEmpty)
+      state
+        .stagedSince
+        .orElse(if (state.acceptPending && !holdsUntakenPoll(state)) Some(Duration.Zero) else None)
+    else (state.stagedSince, config.settings.maxAcknowledgementDelay).mapN(_ + _)
 
   // Java's `commitAsync`, which sends every staged decision.
   private def sendStaged(state: ShareState[F]): F[ShareState[F]] =
@@ -615,12 +626,29 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
           }
       }
 
+  // The loop, told of the pause signal's changes. It starts with the signal's value, so that it
+  // does not poll before the first change arrives.
+  private def withPauses: F[Either[Throwable, CommitResult]] =
+    config
+      .settings
+      .pauseWhen
+      .fold(loop(ShareState[F]())) { signal =>
+        val changes =
+          signal.discrete.evalMap(p => requests.offer(ShareRequest.Paused(p))).compile.drain
+        signal
+          .get
+          .flatMap(paused => F.race(changes *> F.never[Unit], loop(ShareState[F](paused = paused))))
+          .flatMap {
+            case Right(result) => F.pure(result)
+            case Left(_)       => F.never[Either[Throwable, CommitResult]]
+          }
+      }
+
   // Terminating ends without draining, so later requests fail.
   private[actor] def run: F[Unit] =
     F.race(
         shutdown.get,
-        withConsumer.blocking(_.setAcknowledgementCommitCallback(callback)) *>
-          loop(ShareState[F]())
+        withConsumer.blocking(_.setAcknowledgementCommitCallback(callback)) *> withPauses
       )
       .attempt
       .flatMap {
