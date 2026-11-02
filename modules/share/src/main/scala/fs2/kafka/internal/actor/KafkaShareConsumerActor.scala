@@ -487,8 +487,9 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
   // Undecided records are renewed at once while a decision waits for a renewed record, so that the
   // consumer can poll it, and with automatic renewal at the renewal interval.
   private def nextRenewal(state: ShareState): Option[FiniteDuration] = {
-    val undecided = state.undecided.map(_._2.lockedSince)
-    if (undecided.isEmpty) None
+    // Only scans the records when something is to be renewed.
+    lazy val undecided = state.undecided.map(_._2.lockedSince)
+    if (state.allSettled || (state.deferred.isEmpty && !config.settings.autoRenewal)) None
     else if (state.deferred.nonEmpty) Some(undecided.min)
     // Also after the stream ended, as records may still be processed downstream.
     else if (config.settings.autoRenewal)

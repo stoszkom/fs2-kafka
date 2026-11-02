@@ -74,7 +74,11 @@ final private[kafka] case class ShareState(
 
   // Java polls once every record has a decision or a renewal, and the stream took the poll. Renewed
   // records come back only from a poll, which returns no new records while a renewal is pending.
-  def canPoll: Boolean = started && undecided.isEmpty && (renewing.nonEmpty || admitting)
+  def canPoll: Boolean = started && allSettled && (renewing.nonEmpty || admitting)
+
+  // Whether no held record is undecided, without building `undecided`: `decided` and `renewing`
+  // are disjoint sets of held records.
+  def allSettled: Boolean = held.size == decided.size + renewing.size
 
   // After stopping, once every record is decided and the stream took the latest poll or ended. In
   // explicit mode, an untaken poll is undecided anyway.
