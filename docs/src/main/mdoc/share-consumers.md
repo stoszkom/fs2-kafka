@@ -76,11 +76,11 @@ In addition, there are several settings specific to the library.
 
 - `withCloseTimeout` controls the timeout when waiting for consumer shutdown. Default is 20 seconds.
 
-- `withCommitTimeout` sets how long to wait for the broker to confirm a commit. Default is 15 seconds. A commit blocks the consumer while it waits, so with auto-renewal, a commit waiting longer than the renewal margin delays renewals and can let locks expire. A healthy broker confirms within milliseconds; if slow commits are a concern, keep the commit timeout below the margin, or raise the margin.
+- `withCommitTimeout` sets how long the final commit after `stopConsuming` waits for the broker to confirm the last decisions. Default is 15 seconds.
 
 - `withMaxProcessingTime` sets how long a record may be held without a decision before it is released, so a hung record does not hold back its consumer. No limit by default, or with `withoutMaxProcessingTime`; a limit can be at most 365 days. See [renewal](#renewal).
 
-- `withMaxAcknowledgementDelay` sets how long a staged decision may wait before the consumer sends it, without waiting for the next poll. Default is 1 second; `withoutMaxAcknowledgementDelay` sends decisions only with the next poll or commit, as in Java; a delay can be at most 365 days. See [acknowledging](#acknowledging).
+- `withMaxAcknowledgementDelay` sets how long a staged decision may wait before the consumer sends it, without waiting for the next poll. Default is 1 second; `withoutMaxAcknowledgementDelay` sends decisions only with the next poll, as a Java loop does; a delay can be at most 365 days. See [acknowledging](#acknowledging).
 
 - `withPauseWhen` takes a `Signal[F, Boolean]`; while it is `true`, the consumer acquires no new records. Not paused by default. See [pausing](#pausing).
 
@@ -126,9 +126,7 @@ As in Java, `acknowledge` stages a decision in the consumer, and sends nothing. 
 
 - `acknowledgeChunks` stages the decisions of each chunk with one call per consumer. Use it after steps which keep the stream's chunks, such as `map` or `evalMapChunk`, where a chunk is a whole poll: acknowledging one record at a time there waits for the consumer on every record. After `parEvalMap`, chunks mostly hold one record, so acknowledge each record instead; the consumer already stages decisions arriving together in one call. To use `acknowledgeChunks` there anyway, group the decisions first with `groupWithin(n, d).unchunks`.
 
-- `KafkaShareConsumer#commitSync` sends every staged decision at once and waits for the result per partition, as a `Map[TopicPartition, Option[KafkaException]]`, as Java's `commitSync` does. It waits for the commit timeout, or for the timeout given to `commitSync(timeout)`. A partition the broker does not confirm in time has Kafka's `TimeoutException` as its result; a commit that times out before it is sent fails with a `ShareCommitTimeoutException`.
-
-- `KafkaShareConsumer#commitAsync` sends every staged decision without waiting, as Java's `commitAsync` does, and reports no results.
+- There is no commit to call. Java's `commitSync` and `commitAsync` fit a loop you run yourself, where nothing else sends between your acknowledgements and your commit. Here the consumer polls on its own, and its polls send the staged decisions, so a commit would race them.
 
 ```scala mdoc:silent
 val chunked: IO[Unit] =
@@ -145,7 +143,7 @@ val chunked: IO[Unit] =
 
 As in Java, the last decision for a record wins until it is sent. Once sent, a later decision fails with a `RecordNotInFlightException`; so does a decision for a delivery the consumer no longer holds: its renewal failed, the consumer released it after the max processing time, or the offset belongs to an earlier delivery. `acknowledgeChunks` skips these, as the record is delivered again.
 
-Staging succeeds without asking the broker, so a decision for a record whose lock has expired is only rejected when it is sent. The broker's `InvalidRecordStateException` then appears in the results of `commitSync`; a poll, `commitAsync`, or a send after the max acknowledgement delay, sends decisions without reporting results. Errors are reported per partition, so an error applies to every decision of that partition in the same request.
+Staging succeeds without asking the broker, so a decision for a record whose lock has expired is only rejected when it is sent. Results are not reported: the record is delivered again. Errors are per partition, so the broker's rejection applies to every decision of that partition in the same request.
 
 Delivery is at-least-once, so processing must tolerate redelivery. A failed record can be released for another attempt.
 
@@ -184,7 +182,7 @@ def processOrReject(
 
 A record which is not acknowledged within its acquisition lock, 30 seconds by default, is delivered again, possibly to another consumer, and its later acknowledgement fails. As in Java, records are not renewed automatically, except to let a renewed record be acknowledged, see below. We can renew a record with `Renew`, any number of times before its final acknowledgement.
 
-With `withAutoRenewal(true)`, records without an acknowledgement are renewed `withRenewalMargin` (5 seconds by default) before their lock ends, or earlier when half of `max.poll.interval.ms` requires it. A commit blocks renewals while it waits, see `withCommitTimeout`. A record's lock counts from the start of the poll which returned it. Java can fetch records earlier and keep them buffered, for example from a second broker while you process the previous poll; a record buffered for longer than the margin can lose its lock before it is renewed, so raise the margin if polls take long to process. Enable it when processing may outlast the lock. Note that a record whose processing hangs is then renewed, and holds back its consumer, until the consumer is closed or stopped, unless you set a max processing time.
+With `withAutoRenewal(true)`, records without an acknowledgement are renewed `withRenewalMargin` (5 seconds by default) before their lock ends, or earlier when half of `max.poll.interval.ms` requires it. A record's lock counts from the start of the poll which returned it. Java can fetch records earlier and keep them buffered, for example from a second broker while you process the previous poll; a record buffered for longer than the margin can lose its lock before it is renewed, so raise the margin if polls take long to process. Enable it when processing may outlast the lock. Note that a record whose processing hangs is then renewed, and holds back its consumer, until the consumer is closed or stopped, unless you set a max processing time.
 
 - **A slow record holds back its consumer.** Renewing lets the consumer poll again, but Java then returns only the renewed records, and polls new ones only once every record is settled. Use [several consumers](#several-consumers) to keep polling past slow records; `withMaxProcessingTime` only lets go of records that take too long.
 
@@ -216,7 +214,7 @@ def pausable(paused: SignallingRef[IO, Boolean]): IO[Unit] =
 
 Deciding when to pause is up to us: a circuit breaker, a health check, or failures counted in the processing, which sets the signal. While paused:
 
-- Records already taken by the stream are processed and acknowledged as usual. As no poll comes, their decisions are sent at once, and in implicit mode, a poll the stream took is accepted with a commit. Auto-renewal keeps renewing records still held.
+- Records already taken by the stream are processed and acknowledged as usual. As no poll comes, their decisions are sent at once, and in implicit mode, a poll the stream took is accepted with a commit, as no poll accepts it. Auto-renewal keeps renewing records still held.
 - With no records held, a pause longer than `max.poll.interval.ms` makes Java leave the share group; the first poll after it rejoins. Nothing is acquired meanwhile, so nothing is lost.
 - `stopConsuming` still finishes, with its final commit.
 
@@ -227,7 +225,7 @@ Pausing stops new records. For a record whose processing fails while the service
 | Property | Value | Behaviour |
 | --- | --- | --- |
 | `share.acknowledgement.mode` | `explicit` (default here) | Every record needs an acknowledgement before the next poll |
-| | `implicit` (Java's default) | The next poll, or a commit, accepts every record of the previous poll; acknowledging fails with an `ImplicitAcknowledgementException` |
+| | `implicit` (Java's default) | The next poll accepts every record of the previous poll; acknowledging fails with an `ImplicitAcknowledgementException` |
 | `share.acquire.mode` | `record_limit` (default here) | A poll returns at most `max.poll.records` records |
 | | `batch_optimized` (Java's default) | A poll may return more, to align with the broker's record batches |
 
@@ -237,7 +235,7 @@ Pausing stops new records. For a record whose processing fails while the service
 
 - **Implicit acknowledgement** is at-most-once here. In a Java poll loop, the next poll comes after processing. A stream polls in the background instead, once it has taken the previous poll, so records may still be processing, for example in `parEvalMapUnordered`, when they are accepted. A record whose processing fails is not delivered again, similar to `withEnableAutoCommit(true)` on `KafkaConsumer`. Use explicit acknowledgement for at-least-once.
 
-With implicit acknowledgement, records are not renewed, as Java does not allow it, `acknowledge` and `acknowledgeChunks` fail with an `ImplicitAcknowledgementException`, and `commitSync` and `commitAsync` accept the latest poll once the stream has taken it. As the consumer polls again once the stream took a poll, and that poll accepts the one before, a commit usually finds nothing to accept, and `commitSync` returns an empty result. After `stopConsuming`, the last poll is accepted once the stream has taken it. A poll the stream never took is not accepted, and closing the consumer releases its records; a poll counts as taken once the stream asks for the records after it, so records skipped by `take` are not accepted.
+With implicit acknowledgement, records are not renewed, as Java does not allow it, `acknowledge` and `acknowledgeChunks` fail with an `ImplicitAcknowledgementException`. The consumer polls again once the stream took a poll, and that poll accepts the one before. After `stopConsuming`, the last poll is accepted once the stream has taken it. A poll the stream never took is not accepted, and closing the consumer releases its records; a poll counts as taken once the stream asks for the records after it, so records skipped by `take` are not accepted.
 
 ```scala mdoc:silent
 val atMostOnce: IO[Unit] =
@@ -296,11 +294,11 @@ The consumer logs with SLF4J, under `fs2.kafka.KafkaShareConsumer$<id>`, the sam
 
 ## Graceful Shutdown
 
-- `stopConsuming` stops polling. The stream ends once every polled record has a decision, after a final commit sends them; if the stream already ended, records still without a decision are released; a decision that arrives later fails with a `RecordNotInFlightException`. If that final commit fails, the stream fails, and so does a later `commitSync` or `commitAsync`, with its error.
+- `stopConsuming` stops polling. The stream ends once every polled record has a decision, after a final commit sends them; if the stream already ended, records still without a decision are released; a decision that arrives later fails with a `RecordNotInFlightException`. If that final commit fails, the stream fails with its error.
 
 - When the stream ends, records it never handed out are released. In explicit acknowledgement mode, the records of a poll are handed out as one chunk, so operators such as `take` or `prefetch` count the whole chunk as handed out; closing the consumer releases the records they skipped. Auto-renewal continues after the stream ends, as steps such as `parEvalMap` may still process records, until the consumer is closed or stopped.
 
-- Releasing the resource closes the Java consumer, which sends the staged decisions and releases the records it still holds without one; it never accepts them automatically. A record stream still running ends normally, as in core, and later decisions and commits fail with a `ConsumerShutdownException`.
+- Releasing the resource closes the Java consumer, which sends the staged decisions and releases the records it still holds without one; it never accepts them automatically. A record stream still running ends normally, as in core, and later decisions fail with a `ConsumerShutdownException`.
 
 [acknowledgeableoffset]: @API_BASE_URL@/AcknowledgeableOffset.html
 [acknowledgeablerecord]: @API_BASE_URL@/AcknowledgeableConsumerRecord.html

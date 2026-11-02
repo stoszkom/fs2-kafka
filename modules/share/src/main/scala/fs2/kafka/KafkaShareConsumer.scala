@@ -23,7 +23,7 @@ import fs2.kafka.internal.WithShareConsumer
 import fs2.Stream
 
 import org.apache.kafka.clients.consumer.ConsumerConfig
-import org.apache.kafka.common.{KafkaException, Metric, MetricName, TopicPartition}
+import org.apache.kafka.common.{Metric, MetricName}
 import org.apache.kafka.common.config.ConfigException
 
 /**
@@ -34,16 +34,17 @@ import org.apache.kafka.common.config.ConfigException
   * Records come as [[AcknowledgeableConsumerRecord]]s. Acknowledging one stages the decision in the
   * Java consumer, as Java's `acknowledge` does, one record at a time or a chunk at once with
   * [[acknowledgeChunks]]. Staged decisions are sent by the next poll, after the
-  * [[ShareConsumerSettings.maxAcknowledgementDelay]], or by [[commitSync]], which reports the
-  * result, or [[commitAsync]].<br><br>
+  * [[ShareConsumerSettings.maxAcknowledgementDelay]], while paused, or when the consumer stops or
+  * closes. As the consumer polls on its own, there is no commit to call: results are not reported,
+  * and a decision the broker rejects shows as the record being delivered again.<br><br>
   *
   * In explicit acknowledgement mode, the default, the consumer polls again once every record of the
   * previous poll has a decision. A record not acknowledged within its acquisition lock is delivered
   * again, unless it is renewed, see [[ShareConsumerSettings.withAutoRenewal]].<br><br>
   *
-  * In implicit acknowledgement mode, the next poll or commit accepts the previous poll, and
-  * acknowledging fails with an [[ImplicitAcknowledgementException]]. The consumer polls again once
-  * the stream took a poll, so this is at-most-once.<br><br>
+  * In implicit acknowledgement mode, the next poll accepts the previous one, and acknowledging
+  * fails with an [[ImplicitAcknowledgementException]]. The consumer polls again once the stream
+  * took a poll, so this is at-most-once.<br><br>
   *
   * A second stream fails with a [[StreamAlreadyStartedException]]. To consume again, create a new
   * consumer. For several consumers in one share group, see [[KafkaShareConsumers]].<br><br>
@@ -60,30 +61,6 @@ sealed abstract class KafkaShareConsumer[F[_], K, V]
     * Returns the settings used to create the consumer instance.
     */
   def settings: ShareConsumerSettings[F, K, V]
-
-  /**
-    * Sends every staged decision and waits for the result per partition, as Java's `commitSync`
-    * does, within [[ShareConsumerSettings.commitTimeout]]. Decisions waiting for a renewed record
-    * are not included. In implicit mode, it accepts the latest poll once the stream took it, which
-    * the next poll usually did already, giving an empty result. A partition the broker did not
-    * confirm in time has Kafka's `TimeoutException` as its result; a commit that times out before
-    * it is sent fails with a [[ShareCommitTimeoutException]].
-    */
-  def commitSync: F[Map[TopicPartition, Option[KafkaException]]]
-
-  /**
-    * [[commitSync]] with the given timeout, which must be positive. With automatic renewal, a
-    * commit waiting longer than [[ShareConsumerSettings.renewalMargin]] can delay renewals past the
-    * lock.
-    */
-  def commitSync(timeout: FiniteDuration): F[Map[TopicPartition, Option[KafkaException]]]
-
-  /**
-    * Sends every staged decision without waiting for the broker, as Java's `commitAsync` does.
-    * Results are not reported: a decision the broker rejects shows as the record being delivered
-    * again.
-    */
-  def commitAsync: F[Unit]
 
   /**
     * Returns the broker's acquisition lock duration, or `None` until it is known.
@@ -112,16 +89,6 @@ object KafkaShareConsumer {
     new KafkaShareConsumer[F, K, V] {
 
       override val settings: ShareConsumerSettings[F, K, V] = _settings
-
-      override def commitSync: F[Map[TopicPartition, Option[KafkaException]]] =
-        actor.commitSync(settings.commitTimeout)
-
-      override def commitSync(
-        timeout: FiniteDuration
-      ): F[Map[TopicPartition, Option[KafkaException]]] =
-        actor.commitSync(timeout)
-
-      override def commitAsync: F[Unit] = actor.commitAsync
 
       override private[kafka] def polls
         : Stream[F, Stream[F, AcknowledgeableConsumerRecord[F, K, V]]] =

@@ -181,21 +181,16 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
   def withCloseTimeout(timeout: FiniteDuration): ShareConsumerSettings[F, K, V]
 
   /**
-    * How long [[KafkaShareConsumer.commitSync]] waits for the broker to confirm. Unconfirmed
-    * partitions get Kafka's `TimeoutException` as their result; a commit timing out before it is
-    * sent fails with a [[ShareCommitTimeoutException]].<br><br>
+    * How long the final commit after `stopConsuming` waits for the broker to confirm the last
+    * decisions. A commit timing out before it is sent fails the stream with a
+    * [[ShareCommitTimeoutException]].<br><br>
     *
     * The default value is 15 seconds.
     */
   def commitTimeout: FiniteDuration
 
   /**
-    * Creates a new [[ShareConsumerSettings]] with the specified [[commitTimeout]].<br><br>
-    *
-    * A commit blocks the consumer while it waits, so with [[withAutoRenewal]] enabled, a commit
-    * waiting longer than the [[renewalMargin]] can delay renewals past the lock, and those records
-    * are delivered again. A healthy broker confirms within milliseconds; if slow commits are a
-    * concern, keep the timeout below the margin, or raise the margin.
+    * Creates a new [[ShareConsumerSettings]] with the specified [[commitTimeout]].
     */
   def withCommitTimeout(timeout: FiniteDuration): ShareConsumerSettings[F, K, V]
 
@@ -236,8 +231,7 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
     * How long before a record's lock ends [[autoRenewal]] renews it. A record's lock counts from
     * the start of the poll which returned it, but Java may have fetched it earlier and kept it
     * buffered, e.g. from a second broker while you processed the previous poll; a record buffered
-    * for longer than the margin can lose its lock before it is renewed. A commit waiting longer
-    * than the margin can delay renewals too, see [[withCommitTimeout]]. Renewal also happens within
+    * for longer than the margin can lose its lock before it is renewed. Renewal also happens within
     * half of `max.poll.interval.ms`. Renewal repeats every lock duration minus the margin, so a
     * margin close to the lock renews often; a margin of the whole lock or more renews at half of
     * the lock.<br><br>
@@ -286,7 +280,7 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
 
   /**
     * How long a staged decision may wait before the consumer sends it, or `None` to send decisions
-    * only with the next poll or commit, as Java does. The next poll waits for every record of the
+    * only with the next poll, as a Java loop does. The next poll waits for every record of the
     * current one, so without a limit, decisions for fast records wait for the slowest record, and
     * can be lost with their lock, or with the consumer, if it takes too long. Once the oldest
     * unsent decision is this old, the consumer sends every staged decision with Java's
@@ -305,7 +299,7 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
 
   /**
     * Creates a new [[ShareConsumerSettings]] without a [[maxAcknowledgementDelay]], so that
-    * decisions are sent with the next poll or commit, as in Java.
+    * decisions are sent with the next poll, as in a Java loop.
     */
   def withoutMaxAcknowledgementDelay: ShareConsumerSettings[F, K, V]
 

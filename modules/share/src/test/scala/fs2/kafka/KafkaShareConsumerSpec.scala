@@ -15,7 +15,6 @@ import cats.syntax.all.*
 import fs2.concurrent.SignallingRef
 
 import org.apache.kafka.common.config.ConfigException
-import org.apache.kafka.common.errors.InvalidRecordStateException
 
 final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
 
@@ -122,16 +121,29 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         publish(topic, "0")
         val settings = ShareConsumerSettings(
           Deserializer[IO, String],
-          Deserializer.fail[IO, String](new RuntimeException("failed"))
+          Deserializer.lift[IO, String] { bytes =>
+            val value = new String(bytes)
+            if (value == "bad") IO.raiseError(new RuntimeException("failed")) else IO.pure(value)
+          }
         ).withProperties(shareConsumerSettings.properties)
+        // The first record is accepted, then a record which fails to deserialize fails the actor.
         val (failure, afterClose) = run(
-          KafkaShareConsumer
-            .resource(settings)
-            .allocated
-            .flatMap { case (consumer, close) =>
-              (consumer.subscribeTo(topic) *> consumer.records.compile.drain.attempt).flatMap(
-                failure => close *> consumer.commitSync.attempt.tupleLeft(failure)
-              )
+          Ref
+            .of[IO, Option[AcknowledgeableConsumerRecord[IO, String, String]]](None)
+            .flatMap { first =>
+              KafkaShareConsumer
+                .resource(settings)
+                .allocated
+                .flatMap { case (consumer, close) =>
+                  (consumer.subscribeTo(topic) *> consumer
+                    .records
+                    .evalMap(r => first.set(Some(r)) *> r.accept *> IO(publish(topic, "bad")))
+                    .compile
+                    .drain
+                    .attempt).flatMap(failure =>
+                    close *> first.get.flatMap(_.get.accept.attempt).tupleLeft(failure)
+                  )
+                }
             }
         )
         failure.swap.toOption.get.getMessage shouldBe "failed"
@@ -264,13 +276,14 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
   }
 
   describe("acknowledging records") {
-    // The second record stays undecided, so no poll sends the first's decision; the delay does.
+    // The second record stays undecided past both locks, so no poll sends the first's decision
+    // in time; only the delay does. The second is then delivered again, the first is not.
     it("should send staged decisions after the max acknowledgement delay, without a poll") {
       withTopic { topic =>
         createCustomTopic(topic)
         publish(topic, "0", "1")
         val settings = shareConsumerSettings.withMaxPollRecords(2)
-        val results  = run(
+        run(
           subscribed(settings.withMaxAcknowledgementDelay(100.millis), topic) { consumer =>
             consumer
               .records
@@ -283,68 +296,11 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
               .take(1)
               .compile
               .lastOrError
-              .flatMap(second =>
-                IO.sleep(1.second) *> consumer.commitSync <*
-                  second.accept
-              )
+              .flatMap(second => IO.sleep(lock + 1.second) *> second.release.attempt)
           }
         )
-        results shouldBe empty
-        assertSettled(topic, settings)
-      }
-    }
-
-    it("should commit staged decisions") {
-      withTopic { topic =>
-        createCustomTopic(topic)
-        publish(topic, "0", "1")
-        val settings = shareConsumerSettings
-        val results  = run(
-          subscribed(settings, topic) { consumer =>
-            consumer
-              .records
-              .zipWithIndex
-              .evalMap {
-                case (r, 0) => r.accept.as(None)
-                case (r, _) => IO.pure(Some(r))
-              }
-              .unNone
-              .take(1)
-              .compile
-              .lastOrError
-              .flatMap(second => consumer.commitSync <* second.accept)
-          }
-        )
-        // Both records usually come in one poll, so the commit sends the first's decision; if not,
-        // the poll for the second sent it.
-        results.values.flatten shouldBe empty
-        assertSettled(topic, settings)
-      }
-    }
-    // Without the delay or a poll, only commitAsync sends the first's decision before commitSync.
-    it("should send staged decisions with commitAsync") {
-      withTopic { topic =>
-        createCustomTopic(topic)
-        publish(topic, "0", "1")
-        val settings = shareConsumerSettings.withMaxPollRecords(2)
-        val results  = run(
-          subscribed(settings.withoutMaxAcknowledgementDelay, topic) { consumer =>
-            consumer
-              .records
-              .zipWithIndex
-              .evalMap {
-                case (r, 0) => (r.accept *> consumer.commitAsync).as(None)
-                case (r, _) => IO.pure(Some(r))
-              }
-              .unNone
-              .take(1)
-              .compile
-              .lastOrError
-              .flatMap(second => IO.sleep(1.second) *> consumer.commitSync <* second.accept)
-          }
-        )
-        results shouldBe empty
-        assertSettled(topic, settings)
+        publish(topic, "after")
+        readUntil(topic, settings, "after").map(_._1) shouldBe Vector("1", "after")
       }
     }
 
@@ -385,7 +341,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
               )
               .through(acknowledgeChunks[IO])
               .compile
-              .drain *> consumer.commitSync
+              .drain
           }
         )
         // The release won, so the record is delivered again (this consumer may poll it once more).
@@ -398,49 +354,21 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       withTopic { topic =>
         createCustomTopic(topic)
         publish(topic, "0")
+        // Without a delay, the decision is sent at once.
         val late = run(
-          subscribed(shareConsumerSettings, topic) { consumer =>
-            consumer
-              .records
-              .take(1)
-              .evalMap(r =>
-                r.accept *> consumer.commitSync *>
-                  r.reject.attempt
-              )
-              .compile
-              .lastOrError
+          subscribed(shareConsumerSettings.withMaxAcknowledgementDelay(Duration.Zero), topic) {
+            consumer =>
+              consumer
+                .records
+                .take(1)
+                .evalMap(r => r.accept *> IO.sleep(1.second) *> r.reject.attempt)
+                .compile
+                .lastOrError
           }
         )
         late.swap.toOption.get shouldBe a[RecordNotInFlightException]
       }
     }
-    // A commit timeout far below a broker round trip, so the broker cannot confirm in time. The
-    // second record stays undecided, so that no poll sends the first's decision before the commit.
-    it("should fail a commit which the broker does not confirm in time") {
-      withTopic { topic =>
-        createCustomTopic(topic)
-        publish(topic, "0", "1")
-        val result = run(
-          subscribed(shareConsumerSettings.withMaxPollRecords(2), topic) { consumer =>
-            consumer
-              .records
-              .take(1)
-              .evalMap(_.accept *> consumer.commitSync(1.nano).attempt)
-              .compile
-              .lastOrError
-          }
-        )
-        result.swap.toOption.get shouldBe a[ShareCommitTimeoutException]
-      }
-    }
-
-    it("should reject a non-positive commit timeout") {
-      val result = run(
-        KafkaShareConsumer.resource(shareConsumerSettings).use(_.commitSync(Duration.Zero).attempt)
-      )
-      result.swap.toOption.get shouldBe an[IllegalArgumentException]
-    }
-
     it("should fail an acknowledgement through the offset of an earlier delivery") {
       withTopic { topic =>
         createCustomTopic(topic)
@@ -553,7 +481,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
                       .through(acknowledgeChunks[IO])
                       .compile
                       .drain
-                  } *> first.commitSync *> second.commitSync
+                  }
             }
         )
         publish(topic, "after")
@@ -624,22 +552,6 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         result.swap.toOption.get shouldBe an[ImplicitAcknowledgementException]
       }
     }
-    it("should not check the commit timeout against the lock in implicit mode") {
-      withTopic { topic =>
-        createCustomTopic(topic)
-        publish(topic, "0")
-        val settings = shareConsumerSettings
-          .withAcknowledgementMode(ShareAcknowledgementMode.Implicit)
-          .withAutoRenewal(true)
-          .withCommitTimeout(lock)
-        val values = run(
-          subscribed(settings, topic) { consumer =>
-            consumer.records.evalTap(_ => consumer.stopConsuming).map(_.record.value).compile.toList
-          }
-        )
-        values shouldBe List("0")
-      }
-    }
   }
 
   describe("batch_optimized acquisition") {
@@ -707,7 +619,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
                 else IO.sleep(lock * 4 / 3) *> r.accept
               }
               .compile
-              .drain *> consumer.commitSync
+              .drain
           }
         )
         assertSettled(topic, settings)
@@ -768,7 +680,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
                   IO.sleep(2.seconds) *> r.accept.attempt
               )
               .compile
-              .lastOrError <* consumer.commitSync
+              .lastOrError
           }
         )
         result shouldBe Right(())
@@ -840,29 +752,24 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       }
     }
 
-    // The consumer does not track lock expiry itself, so the broker reports the error. The second
-    // record stays undecided, so that the commit sends the first's decision.
-    it("should lose a record past its lock without renewal, with the broker's error") {
+    // The consumer does not track lock expiry itself: the decision is staged, and the broker
+    // rejects it once sent.
+    it("should lose a record past its lock without renewal") {
       withTopic { topic =>
         createCustomTopic(topic)
         publish(topic, "0", "1")
         val settings = shareConsumerSettings.withMaxPollRecords(2)
-        val results  = run(
+        val late     = run(
           subscribed(settings.withAutoRenewal(false), topic) { consumer =>
             consumer
               .records
               .take(1)
-              .evalMap(r =>
-                IO.sleep(lock + 1.second) *> r.accept *>
-                  consumer.commitSync
-              )
+              .evalMap(r => IO.sleep(lock + 1.second) *> r.accept.attempt)
               .compile
               .lastOrError
           }
         )
-        val error = results.values.toList.flatten.head
-        error shouldBe an[InvalidRecordStateException]
-        error should not be a[RecordNotInFlightException]
+        late shouldBe Right(())
         all(readUntil(topic, settings, "1").map(_._2)) should be >= 2
       }
     }
@@ -1027,16 +934,11 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         createCustomTopic(topic)
         publish(topic, "0")
         val settings = shareConsumerSettings
-        val results  = run(
+        run(
           subscribed(settings, topic) { consumer =>
-            consumer
-              .records
-              .evalMap(r => consumer.stopConsuming *> r.accept)
-              .compile
-              .drain *> consumer.commitSync
+            consumer.records.evalMap(r => consumer.stopConsuming *> r.accept).compile.drain
           }
         )
-        results.values.flatten shouldBe empty
         assertSettled(topic, settings)
       }
     }

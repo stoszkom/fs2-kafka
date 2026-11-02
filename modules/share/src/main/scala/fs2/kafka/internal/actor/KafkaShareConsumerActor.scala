@@ -20,14 +20,14 @@ import fs2.kafka.internal.converters.option.*
 import fs2.kafka.internal.syntax.*
 
 import org.apache.kafka.clients.consumer.AcknowledgementCommitCallback
-import org.apache.kafka.common.{KafkaException, TopicIdPartition, TopicPartition}
 import org.apache.kafka.common.errors.TimeoutException
+import org.apache.kafka.common.TopicPartition
 
 /**
   * Owns a Java share consumer and stages each decision in it as it arrives. Java sends staged
-  * decisions with the next poll or commit, and the last one for a record wins until then, so the
-  * actor mostly tracks which records of the latest poll have a decision, and polls once all do.
-  * Staged decisions waiting longer than `maxAcknowledgementDelay` are sent with `commitAsync`.
+  * decisions with the next poll, and the last one for a record wins until then, so the actor mostly
+  * tracks which records of the latest poll have a decision, and polls once all do. Staged decisions
+  * waiting longer than `maxAcknowledgementDelay` are sent with `commitAsync`.
   *
   * Renewals are sent at once. Java lets a renewed record be decided again only once a poll returned
   * it, so a decision for it waits in the actor until then, and the record is not handed out again.
@@ -55,19 +55,9 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
       case Some(first)                    =>
         ask[Unit](
           ShareRequest.Stage(decisions, _),
-          _ => Left(RecordNotInFlightException(first.offset._1, first.offset._2))
+          RecordNotInFlightException(first.offset._1, first.offset._2)
         )
     }
-
-  // Java's `commitSync`; after the actor finished, the result of its final commit.
-  def commitSync(timeout: FiniteDuration): F[CommitResult] =
-    if (timeout <= Duration.Zero)
-      F.raiseError(new IllegalArgumentException("commit timeout must be positive"))
-    else ask(ShareRequest.CommitSync(timeout, _), identity)
-
-  // Java's `commitAsync`; after the actor finished, fails only if its final commit failed.
-  def commitAsync: F[Unit] =
-    ask(ShareRequest.CommitAsync(_), _.void)
 
   def stopConsuming: F[Unit] = finished
     .tryGet
@@ -123,12 +113,11 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
   // As in core, this does not wait for the actor to end.
   def terminate: F[Unit] = shutdown.complete(()).void
 
-  // Sends a request and waits for its answer. Once the actor ended, the answer comes from
-  // `afterDrain` if it drained, or else it is the reason it ended; once shut down, the consumer
-  // is.
+  // Sends a request and waits for its answer. Once the actor ended, the answer is `afterDrain` if
+  // it drained, or else the reason it ended; once shut down, the consumer is.
   private def ask[A](
     request: (Either[Throwable, A] => F[Unit]) => ShareRequest[F],
-    afterDrain: Either[Throwable, CommitResult] => Either[Throwable, A]
+    afterDrain: => Throwable
   ): F[A] = {
     def afterEnd(ended: Ended): F[A] =
       shutdown
@@ -137,7 +126,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
           case Some(_) => F.raiseError[A](ConsumerShutdownException())
           case None    =>
             ended match {
-              case Ended.Drained(last) => afterDrain(last).liftTo[F]
+              case Ended.Drained(_)    => F.raiseError[A](afterDrain)
               case Ended.Failed(error) => F.raiseError[A](error)
               case Ended.Shutdown      => F.raiseError[A](ConsumerShutdownException())
             }
@@ -216,10 +205,6 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
       case ShareRequest.ReaderClosed()         => releaseUnpulled(state.copy(readerClosed = true))
       case ShareRequest.Stage(decisions, done) =>
         stageAll(state, Vector(decisions -> done), send = false, byUser = true)
-      case ShareRequest.CommitSync(timeout, done) => commit(state, timeout, done)
-      // A failed send fails the actor, as Java's `commitAsync` fails only on a broken consumer.
-      case ShareRequest.CommitAsync(done) =>
-        sendStaged(state).attempt.flatTap(r => done(r.void)).flatMap(_.liftTo[F])
     }
 
   // Releases a poll the stream never took; renewing records once a poll returns them. In implicit
@@ -359,23 +344,17 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
       }
   }
 
-  // Java's `commitSync`, which sends every staged decision.
-  private def commit(
-    state: ShareState[F],
-    timeout: FiniteDuration,
-    done: Either[Throwable, CommitResult] => F[Unit]
-  ): F[ShareState[F]] =
-    commitStaged(state, timeout).attempt.flatTap(done).as(state.withoutDecided)
-
   // In implicit mode, a commit would accept a poll the stream has not taken.
   private def holdsUntakenPoll(state: ShareState[F]): Boolean =
     config.implicitMode && state.unpulled.nonEmpty
 
-  private def commitStaged(state: ShareState[F], timeout: FiniteDuration): F[CommitResult] =
-    if (holdsUntakenPoll(state)) F.pure(Map.empty)
+  // Java's `commitSync`, which sends every staged decision and waits for the broker. Results per
+  // partition are not reported, as with the other sends.
+  private def commitStaged(state: ShareState[F], timeout: FiniteDuration): F[Unit] =
+    if (holdsUntakenPoll(state)) F.unit
     else
       withConsumer
-        .blocking(consumer => commitResult(consumer.commitSync(timeout.toJava)))
+        .blocking(consumer => consumer.commitSync(timeout.toJava): Unit)
         .adaptError { case error: TimeoutException =>
           ShareCommitTimeoutException(timeout, error)
         }
@@ -520,7 +499,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
   }
 
   // The renewal margin before the lock ends, or half the lock, early enough for
-  // `max.poll.interval.ms`. A commit blocks renewals while it waits.
+  // `max.poll.interval.ms`.
   private def renewalInterval(lock: FiniteDuration): FiniteDuration = {
     val byMargin =
       if (config.settings.renewalMargin < lock) lock - config.settings.renewalMargin else lock / 2
@@ -596,7 +575,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
     }
 
   // Ends with the result of the final commit after stopping.
-  private def loop(state: ShareState[F]): F[Either[Throwable, CommitResult]] =
+  private def loop(state: ShareState[F]): F[Either[Throwable, Unit]] =
     requests
       .tryTakeN(None)
       .flatMap(receiveAll(state, _))
@@ -630,7 +609,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
 
   // The loop, told of the pause signal's changes. It starts with the signal's value, so that it
   // does not poll before the first change arrives.
-  private def withPauses: F[Either[Throwable, CommitResult]] =
+  private def withPauses: F[Either[Throwable, Unit]] =
     config
       .settings
       .pauseWhen
@@ -642,7 +621,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
           .flatMap(paused => F.race(changes *> F.never[Unit], loop(ShareState[F](paused = paused))))
           .flatMap {
             case Right(result) => F.pure(result)
-            case Left(_)       => F.never[Either[Throwable, CommitResult]]
+            case Left(_)       => F.never[Either[Throwable, Unit]]
           }
       }
 
@@ -666,15 +645,13 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
 
 private[kafka] object KafkaShareConsumerActor {
 
-  type CommitResult = Map[TopicPartition, Option[KafkaException]]
-
   // How the actor ended.
   sealed abstract class Ended
 
   object Ended {
 
     // After stopping, with the result of the final commit.
-    final case class Drained(lastCommit: Either[Throwable, CommitResult]) extends Ended
+    final case class Drained(lastCommit: Either[Throwable, Unit]) extends Ended
 
     // Terminated, or closed before it drained.
     case object Shutdown extends Ended
@@ -719,17 +696,6 @@ private[kafka] object KafkaShareConsumerActor {
 
   // Half of the shortest lock a broker allows, while the broker has not reported the lock.
   val unknownLockRenewalInterval: FiniteDuration = 500.millis
-
-  private def commitResult(
-    results: java.util.Map[TopicIdPartition, java.util.Optional[KafkaException]]
-  ): CommitResult =
-    results
-      .asScala
-      .iterator
-      .map { case (partition, error) =>
-        partition.topicPartition -> error.toScala
-      }
-      .toMap
 
   def resource[F[_], K, V](
     settings: ShareConsumerSettings[F, K, V],

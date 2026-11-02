@@ -6,9 +6,6 @@
 
 package fs2.kafka.internal.actor
 
-import scala.concurrent.duration.FiniteDuration
-
-import fs2.kafka.internal.actor.KafkaShareConsumerActor.CommitResult
 import fs2.Chunk
 
 // A request to the share consumer's actor.
@@ -31,13 +28,5 @@ private[kafka] object ShareRequest {
     decisions: Chunk[Decision],
     done: Either[Throwable, Unit] => F[Unit]
   ) extends ShareRequest[F]
-
-  final case class CommitSync[F[_]](
-    timeout: FiniteDuration,
-    done: Either[Throwable, CommitResult] => F[Unit]
-  ) extends ShareRequest[F]
-
-  final case class CommitAsync[F[_]](done: Either[Throwable, Unit] => F[Unit])
-      extends ShareRequest[F]
 
 }
