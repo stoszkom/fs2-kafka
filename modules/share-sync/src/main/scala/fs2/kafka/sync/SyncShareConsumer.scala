@@ -250,16 +250,15 @@ object SyncShareConsumer {
       F.monotonic
         .flatMap { now =>
           val deliveries = records.map(r => offsetOf(r) -> Delivery(r, deliveryCountOf(r), now))
-          state.update(SyncState.polled(deliveries, start, None, _)) *>
+          // Also when decoding fails: the poll is held from the state update on.
+          (state.update(SyncState.polled(deliveries, start, None, _)) *>
             Chunk
               .from(records)
               .traverse(decode)
               .flatMap { chunk =>
                 // The timers only end by failing, which cancels `process` and fails `consume`.
-                F.race(F.both(timers, sendsWhenPaused) *> F.never[Unit], process(chunk))
-                  .void
-                  .guarantee(mutex.lock.surround(releaseUnacked))
-              }
+                F.race(F.both(timers, sendsWhenPaused) *> F.never[Unit], process(chunk)).void
+              }).guarantee(mutex.lock.surround(releaseUnacked))
         }
 
     private def decode(record: KafkaByteConsumerRecord): F[AcknowledgeableConsumerRecord[F, K, V]] =

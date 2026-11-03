@@ -101,6 +101,55 @@ final class SyncShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       }
     }
 
+    it("should release the poll and raise the error when a record fails to deserialize") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "bad")
+        val (first, second) =
+          run(
+            Ref
+              .of[IO, Boolean](false)
+              .flatMap { failed =>
+                // Fails the first time only, so that the record can be consumed again.
+                val values = Deserializer.lift[IO, String] { bytes =>
+                  failed
+                    .getAndSet(true)
+                    .ifM(IO.pure(new String(bytes)), IO.raiseError(new RuntimeException("failed")))
+                }
+                val settings = ShareConsumerSettings(Deserializer[IO, String], values)
+                  .withProperties(shareConsumerSettings.properties)
+                SyncShareConsumer
+                  .resource(settings)
+                  .use { consumer =>
+                    val once = consumer.consume(records =>
+                      records.traverse_(_.accept) *> consumer.stopConsuming
+                    )
+                    consumer.subscribeTo(topic) *> once
+                      .attempt
+                      .flatMap { first =>
+                        Ref
+                          .of[IO, Vector[Int]](Vector.empty)
+                          .flatMap { counts =>
+                            consumer
+                              .consume(records =>
+                                counts.update(
+                                  _ ++ records.toVector.map(_.offset.deliveryCount.toInt)
+                                ) *>
+                                  records.traverse_(_.accept) *> consumer.stopConsuming
+                              )
+                              .attempt
+                              .flatMap(result => counts.get.map(result -> _))
+                          }
+                          .tupleLeft(first)
+                      }
+                  }
+              }
+          )
+        first.left.toOption.map(_.getMessage) shouldBe Some("failed")
+        second shouldBe (Right(()) -> Vector(2))
+      }
+    }
+
     it("should fail an acknowledgement made after process returned") {
       withTopic { topic =>
         createCustomTopic(topic)
