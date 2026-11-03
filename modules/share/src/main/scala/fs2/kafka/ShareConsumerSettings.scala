@@ -234,7 +234,7 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
     * for longer than the margin can lose its lock before it is renewed. Renewal also happens within
     * half of `max.poll.interval.ms`. Renewal repeats every lock duration minus the margin, so a
     * margin close to the lock renews often; a margin of the whole lock or more renews at half of
-    * the lock.<br><br>
+    * the lock. A renewal waits for the broker for up to the margin.<br><br>
     *
     * The default value is 5 seconds.
     */

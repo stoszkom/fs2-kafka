@@ -30,9 +30,11 @@ import org.apache.kafka.common.TopicPartition
   * Pending acknowledgements waiting longer than `maxAcknowledgementDelay` are sent with
   * `commitAsync`.
   *
-  * Renewals are sent at once. Java lets a renewed record be acknowledged again only once a poll
-  * returned it, so an acknowledgement for it waits in the actor until then, and the record is not
-  * handed out again.
+  * Renewals are sent at once with `commitSync`, so that the poll which returns the renewed records
+  * sends no fetch: a poll made while a renewal is pending makes Java fetch, and keep fetching until
+  * it acquires records, which raises their delivery count while they wait unseen in its buffer.
+  * Java lets a renewed record be acknowledged again only once a poll returned it, so an
+  * acknowledgement for it waits in the actor until then, and the record is not handed out again.
   */
 final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
   config: ShareActorConfig[F, K, V],
@@ -287,7 +289,8 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
   ): F[(ShareState[F], Vector[(Acking[F], Either[Throwable, Unit])])] = {
     val ackings = batch.map { case (own, done) => Acking(state, own, done) }
     val now     = ackings.flatMap(_.now)
-    val sending = send || now.exists(_.acknowledgeType == AcknowledgeType.Renew)
+    val renewal = now.exists(_.acknowledgeType == AcknowledgeType.Renew)
+    val sending = send || renewal
     // Per request: the acknowledgements Java recorded, those it no longer holds, and its error.
     val calls: F[Vector[(Vector[Acknowledgement], Vector[Acknowledgement], Option[Throwable])]] =
       if (now.isEmpty && !send) F.pure(ackings.as((Vector.empty, Vector.empty, None)))
@@ -317,8 +320,16 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
                   }
               }
           }
-          // A failed send fails the actor.
-          if (sending) consumer.commitAsync()
+          // A failed send fails the actor. A renewal waits for the broker, up to the renewal margin; one
+          // still pending after it is returned by a poll which also fetches, as with `commitAsync`.
+          if (renewal)
+            Either
+              .catchOnly[TimeoutException](
+                consumer.commitSync(config.settings.renewalMargin.toJava)
+              )
+              .void
+              .getOrElse(())
+          else if (sending) consumer.commitAsync()
           recorded
         }
     (F.monotonic, calls.attempt)

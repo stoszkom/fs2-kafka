@@ -605,7 +605,8 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       withTopic { topic =>
         createCustomTopic(topic)
         publish(topic, "0", "1")
-        val settings = shareConsumerSettings
+        // The slow record outlives its lock too, so it needs automatic renewal.
+        val settings = shareConsumerSettings.withAutoRenewal(true)
         run(
           subscribed(settings, topic) { consumer =>
             consumer
@@ -906,6 +907,36 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
           }
         )
         assertSettled(topic, settings.withProperty("share.acknowledgement.mode", "explicit"))
+      }
+    }
+
+    // Renewing a held record must not acquire the records published while paused: each acquisition
+    // raises their delivery count, until the broker archives them unprocessed.
+    it("should not raise the delivery count of new records while renewing during a pause") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0")
+        val settings = shareConsumerSettings.withAutoRenewal(true)
+        val seen     = run(
+          SignallingRef[IO, Boolean](false).flatMap { paused =>
+            subscribed(settings.withPauseWhen(paused), topic) { consumer =>
+              consumer
+                .records
+                .evalMap { r =>
+                  val arrived = r.record.value -> r.offset.deliveryCount.toInt
+                  if (r.record.value == "0")
+                    // Held through several renewals while paused, then the pause ends.
+                    paused.set(true) *> IO.blocking(publish(topic, "1", "2")) *>
+                      IO.sleep(lock * 3) *> r.accept *> paused.set(false).as(arrived)
+                  else r.accept.as(arrived)
+                }
+                .take(3)
+                .compile
+                .toVector
+            }
+          }
+        )
+        seen should contain theSameElementsAs Vector("0" -> 1, "1" -> 1, "2" -> 1)
       }
     }
   }
