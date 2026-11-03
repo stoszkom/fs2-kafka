@@ -6,14 +6,18 @@
 
 package fs2.kafka.sync
 
+import scala.collection.immutable.SortedSet
 import scala.concurrent.duration.*
 
-import cats.effect.{IO, Ref}
+import cats.~>
+import cats.effect.{Deferred, IO, Ref}
 import cats.effect.syntax.all.*
 import cats.syntax.all.*
+import fs2.{Chunk, Stream}
 import fs2.concurrent.SignallingRef
 import fs2.kafka.*
-import fs2.Chunk
+
+import org.apache.kafka.common.config.ConfigException
 
 final class SyncShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
 
@@ -330,6 +334,636 @@ final class SyncShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         seen should contain theSameElementsAs Vector("0", "1", "2")
         assertSettled(topic, settings)
       }
+    }
+  }
+
+  // Runs `process` on the first poll only, then stops, returning its result.
+  private def firstPoll[A](settings: ShareConsumerSettings[IO, String, String], topic: String)(
+    process: Records => IO[A]
+  ): IO[A] =
+    Ref
+      .of[IO, Option[A]](None)
+      .flatMap { result =>
+        consumed(settings, topic) { consumer => records =>
+          process(records).flatMap(a => result.set(Some(a))) *> consumer.stopConsuming
+        } *> result.get.map(_.get)
+      }
+
+  // Handles each record with `handle`, one at a time, and stops once `count` were handled,
+  // returning values and delivery counts in the order handled.
+  private def handled(
+    settings: ShareConsumerSettings[IO, String, String],
+    topic: String,
+    count: Int
+  )(
+    handle: AcknowledgeableConsumerRecord[IO, String, String] => IO[Unit]
+  ): IO[Vector[(String, Int)]] =
+    Ref
+      .of[IO, Vector[(String, Int)]](Vector.empty)
+      .flatMap { seen =>
+        consumed(settings, topic) { consumer => records =>
+          records.traverse_ { r =>
+            handle(r) *> seen
+              .updateAndGet(_ :+ (r.record.value -> r.offset.deliveryCount.toInt))
+              .flatMap(s => consumer.stopConsuming.whenA(s.size >= count))
+          }
+        } *> seen.get
+      }
+
+  private val accepting: AcknowledgeType = AcknowledgeType.Accept
+
+  describe("creating share consumers") {
+    it("should fail for an unknown acknowledgement mode, as Java's consumer does") {
+      val result = run(
+        SyncShareConsumer
+          .resource(shareConsumerSettings.withProperty("share.acknowledgement.mode", "manual"))
+          .use_
+          .attempt
+      )
+      result.swap.toOption.get shouldBe a[ConfigException]
+    }
+
+    it("should accept share.acquire.mode in any case, as Kafka does") {
+      run(
+        SyncShareConsumer
+          .resource(shareConsumerSettings.withProperty("share.acquire.mode", "RECORD_LIMIT"))
+          .use_
+      )
+    }
+
+    it("should report the subscription") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        val subscription = run(
+          SyncShareConsumer
+            .resource(shareConsumerSettings)
+            .use(consumer => consumer.subscribeTo(topic) *> consumer.subscription)
+        )
+        subscription shouldBe SortedSet(topic)
+      }
+    }
+
+    it("should keep consuming across unsubscribe and a new subscription") {
+      withTopic { first =>
+        withTopic { second =>
+          createCustomTopic(first)
+          createCustomTopic(second)
+          publish(first, "first")
+          publish(second, "second")
+          val consumed = run(
+            Ref
+              .of[IO, Vector[String]](Vector.empty)
+              .flatMap { seen =>
+                SyncShareConsumer
+                  .resource(shareConsumerSettings)
+                  .use { consumer =>
+                    consumer.subscribeTo(first) *>
+                      consumer.consume(_.traverse_ { r =>
+                        r.accept *>
+                          (consumer.unsubscribe *> consumer.subscribeTo(second)).whenA(
+                            r.record.value == "first"
+                          ) *>
+                          seen
+                            .updateAndGet(_ :+ r.record.value)
+                            .flatMap(s => consumer.stopConsuming.whenA(s.size >= 2))
+                      }) *> seen.get
+                  }
+              }
+          )
+          consumed shouldBe Vector("first", "second")
+        }
+      }
+    }
+
+    it("should fail consume in implicit mode, and autoConsume in explicit mode") {
+      val implicitly                       = shareConsumerSettings.withProperty("share.acknowledgement.mode", "implicit")
+      val (explicitResult, implicitResult) = run(
+        (
+          SyncShareConsumer.resource(implicitly).use(_.consume(_ => IO.unit).attempt),
+          SyncShareConsumer.resource(shareConsumerSettings).use(_.autoConsume(_ => IO.unit).attempt)
+        ).tupled
+      )
+      explicitResult.swap.toOption.get shouldBe an[ImplicitAcknowledgementException]
+      implicitResult.swap.toOption.get shouldBe an[IllegalStateException]
+    }
+  }
+
+  describe("delivery") {
+    it("should not deliver accepted or rejected records again") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0", "1")
+        val settings = shareConsumerSettings
+        run(handled(settings, topic, 2)(r => if (r.record.value == "0") r.accept else r.reject))
+        assertSettled(topic, settings)
+      }
+    }
+
+    it("should deliver released records again, with a higher delivery count") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0")
+        val deliveries = run(
+          handled(shareConsumerSettings, topic, 2)(r =>
+            if (r.offset.deliveryCount == 1) r.release else r.accept
+          )
+        )
+        deliveries shouldBe Vector("0" -> 1, "0" -> 2)
+      }
+    }
+
+    it("should let two consumers process records of the same partition concurrently") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0", "1")
+        val settings = shareConsumerSettings.withMaxPollRecords(1)
+        val consumed = run(
+          (Deferred[IO, Unit], Ref.of[IO, Int](0)).flatMapN { (bothStarted, started) =>
+            val consume = firstPoll(settings, topic)(_.traverse { r =>
+              started.updateAndGet(_ + 1).flatMap(n => bothStarted.complete(()).whenA(n == 2)) *>
+                bothStarted.get *> r.accept.as(r.record.value)
+            })
+            IO.both(consume, consume)
+          }
+        )
+        (consumed._1 ++ consumed._2).toList.toSet shouldBe Set("0", "1")
+      }
+    }
+
+    it("should settle every record once with batch_optimized acquisition") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        val produced = (0 until 20).map(_.toString)
+        publish(topic, produced*)
+        val settings = shareConsumerSettings
+          .withProperty("share.acquire.mode", "batch_optimized")
+          .withMaxPollRecords(2)
+        val consumed = run(handled(settings, topic, produced.size)(_.accept))
+        consumed.map(_._1) should contain theSameElementsAs produced
+        all(consumed.map(_._2)) shouldBe 1
+      }
+    }
+  }
+
+  describe("acknowledging records") {
+    // The second record stays unacknowledged past its lock, and no poll runs while process does,
+    // so only the delay sends the first's acknowledgement in time.
+    it("should send pending acknowledgements after the max acknowledgement delay, without a poll") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0", "1")
+        val settings = shareConsumerSettings.withMaxPollRecords(2)
+        run(
+          firstPoll(settings.withMaxAcknowledgementDelay(100.millis), topic) { records =>
+            records.head.get.accept *> IO.sleep(lock + 1.second) *>
+              records.drop(1).traverse_(_.release.attempt)
+          }
+        )
+        publish(topic, "after")
+        readUntil(topic, settings, "after").map(_._1) shouldBe Vector("1", "after")
+      }
+    }
+
+    it("should send pending acknowledgements with the next poll, and the last ones when stopping") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, (0 until 10).map(_.toString)*)
+        val settings = shareConsumerSettings.withMaxPollRecords(5).withoutMaxAcknowledgementDelay
+        run(
+          Ref
+            .of[IO, Int](0)
+            .flatMap { count =>
+              consumed(settings, topic) { consumer => records =>
+                Stream
+                  .chunk(records)
+                  .map(_.offset -> accepting)
+                  .through(acknowledgeChunks[IO])
+                  .compile
+                  .drain *> count
+                  .updateAndGet(_ + records.size)
+                  .flatMap(n => consumer.stopConsuming.whenA(n >= 10))
+              }
+            }
+        )
+        assertSettled(topic, settings)
+      }
+    }
+
+    it("should let the last of several acknowledgements made together for a record win") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0")
+        val settings = shareConsumerSettings
+        run(
+          firstPoll(settings, topic) { records =>
+            Stream
+              .chunk(records)
+              .flatMap(r =>
+                Stream(
+                  r.offset -> accepting,
+                  r.offset -> (AcknowledgeType.Release: AcknowledgeType)
+                )
+              )
+              .through(acknowledgeChunks[IO])
+              .compile
+              .drain
+          }
+        )
+        val again = readUntil(topic, settings, "0")
+        again.map(_._1) shouldBe Vector("0")
+        again.head._2 should be >= 2
+      }
+    }
+
+    it("should fail an acknowledgement for a delivery whose acknowledgement was sent") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0")
+        // Without a delay, the acknowledgement is sent at once.
+        val late = run(
+          firstPoll(shareConsumerSettings.withMaxAcknowledgementDelay(Duration.Zero), topic)(
+            _.traverse(r => r.accept *> IO.sleep(1.second) *> r.reject.attempt).map(_.head.get)
+          )
+        )
+        late.swap.toOption.get shouldBe a[RecordNotInFlightException]
+      }
+    }
+
+    it("should fail an acknowledgement through the offset of an earlier delivery") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0")
+        val stale = run(
+          (
+            Ref.of[IO, Option[AcknowledgeableOffset[IO]]](None),
+            Ref.of[IO, Option[Either[Throwable, Unit]]](None)
+          ).flatMapN { (earlier, result) =>
+            consumed(shareConsumerSettings, topic) { consumer => records =>
+              records.traverse_ { r =>
+                earlier
+                  .get
+                  .flatMap {
+                    case None        => earlier.set(Some(r.offset)) *> r.release
+                    case Some(first) =>
+                      first.accept.attempt.flatMap(a => result.set(Some(a))) *> r.accept *>
+                        consumer.stopConsuming
+                  }
+              }
+            } *> result.get.map(_.get)
+          }
+        )
+        stale.swap.toOption.get shouldBe a[RecordNotInFlightException]
+      }
+    }
+  }
+
+  describe("acknowledgeChunks") {
+    it("should acknowledge offsets mapped with different functions through each") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0", "1")
+        val calls = run(
+          (Ref.of[IO, Set[String]](Set.empty), Ref.of[IO, Int](0)).flatMapN { (called, count) =>
+            def tagged(tag: String): IO ~> IO = new (IO ~> IO) {
+              def apply[A](io: IO[A]): IO[A] = called.update(_ + tag) *> io
+            }
+            val (first, second) = (tagged("first"), tagged("second"))
+            consumed(shareConsumerSettings, topic) { consumer => records =>
+              Stream
+                .chunk(records)
+                .map { r =>
+                  val f = if (r.record.value == "0") first else second
+                  r.offset.mapK(f) -> accepting
+                }
+                .through(acknowledgeChunks[IO])
+                .compile
+                .drain *> count
+                .updateAndGet(_ + records.size)
+                .flatMap(n => consumer.stopConsuming.whenA(n >= 2))
+            } *> called.get
+          }
+        )
+        calls shouldBe Set("first", "second")
+      }
+    }
+
+    it("should keep the last acknowledgement of a record reached through several acknowledgers") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0", "1")
+        // The first acknowledgement is slower, so that it would win if both were sent concurrently.
+        val slow = new (IO ~> IO) {
+          def apply[A](io: IO[A]): IO[A] = IO.sleep(1.second) *> io
+        }
+        val settings = shareConsumerSettings.withMaxPollRecords(2).withoutMaxAcknowledgementDelay
+        val seen     = run(
+          Ref
+            .of[IO, Vector[(String, Int)]](Vector.empty)
+            .flatMap { seen =>
+              consumed(settings, topic) { consumer => records =>
+                seen.update(
+                  _ ++ records.toVector.map(r => r.record.value -> r.offset.deliveryCount.toInt)
+                ) *>
+                  Stream
+                    .chunk(records)
+                    .flatMap { r =>
+                      val o = r.offset
+                      // The release replaces the accept, so "0" is delivered again.
+                      if (r.record.value == "0" && o.deliveryCount == 1)
+                        Stream.chunk(
+                          Chunk[(AcknowledgeableOffset[IO], AcknowledgeType)](
+                            o.mapK(slow) -> AcknowledgeType.Accept,
+                            o            -> AcknowledgeType.Release
+                          )
+                        )
+                      else Stream(o -> accepting)
+                    }
+                    .through(acknowledgeChunks[IO])
+                    .compile
+                    .drain *> seen.get.flatMap(s => consumer.stopConsuming.whenA(s.size >= 3))
+              } *> seen.get
+            }
+        )
+        seen should contain theSameElementsAs Vector("0" -> 1, "1" -> 1, "0" -> 2)
+      }
+    }
+
+    it("should settle every record once") {
+      withTopic { topic =>
+        createCustomTopic(topic, partitions = 2)
+        val produced = (0 until 30).map(_.toString)
+        publish(topic, produced*)
+        val consumed = run(
+          Ref
+            .of[IO, Vector[(String, Int)]](Vector.empty)
+            .flatMap { seen =>
+              this.consumed(shareConsumerSettings.withMaxPollRecords(5), topic) {
+                consumer => records =>
+                  Stream
+                    .chunk(records)
+                    .covary[IO]
+                    .parEvalMapUnordered(4) { r =>
+                      seen
+                        .update(_ :+ (r.record.value -> r.offset.deliveryCount.toInt))
+                        .as(r.offset -> accepting)
+                    }
+                    .through(acknowledgeChunks[IO])
+                    .compile
+                    .drain *> seen
+                    .get
+                    .flatMap(s => consumer.stopConsuming.whenA(s.size >= produced.size))
+              } *> seen.get
+            }
+        )
+        consumed.map(_._1) should contain theSameElementsAs produced
+        all(consumed.map(_._2)) shouldBe 1
+      }
+    }
+
+    it("should send a chunk's acknowledgements to each of its consumers") {
+      withTopic { topic =>
+        val other = topic + "-other"
+        createCustomTopic(topic)
+        createCustomTopic(other)
+        publish(topic, "a")
+        publish(other, "b")
+        val settings = shareConsumerSettings
+        run(
+          (Deferred[IO, Records], Deferred[IO, Records], Deferred[IO, Unit]).flatMapN {
+            (fromFirst, fromSecond, acknowledged) =>
+              // Each consumer hands its poll out and keeps processing it until both are acknowledged.
+              def holding(t: String, out: Deferred[IO, Records]) =
+                firstPoll(settings, t)(records => out.complete(records) *> acknowledged.get)
+              val acknowledgeBoth =
+                (fromFirst.get, fromSecond.get).flatMapN { (a, b) =>
+                  Stream
+                    .chunk(a ++ b)
+                    .map(_.offset -> accepting)
+                    .through(acknowledgeChunks[IO])
+                    .compile
+                    .drain *> acknowledged.complete(()).void
+                }
+              (holding(topic, fromFirst), holding(other, fromSecond), acknowledgeBoth)
+                .parTupled
+                .void
+          }
+        )
+        publish(topic, "after")
+        publish(other, "after")
+        readUntil(topic, settings, "after") shouldBe Vector("after" -> 1)
+        readUntil(other, settings, "after") shouldBe Vector("after" -> 1)
+      }
+    }
+  }
+
+  describe("renewal") {
+    it("should acknowledge a record right after a renewal") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0")
+        val settings = shareConsumerSettings
+        run(firstPoll(settings, topic)(_.traverse_(r => r.renew *> r.accept)))
+        assertSettled(topic, settings)
+      }
+    }
+
+    it("should finish stopping after an unsubscribe while a renewal is pending") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0", "1")
+        run(
+          consumed(shareConsumerSettings.withMaxPollRecords(2), topic) { consumer => records =>
+            records
+              .parTraverseN(2) { r =>
+                if (r.record.value == "0") r.renew
+                else IO.sleep(1.second) *> consumer.unsubscribe *> r.accept.attempt.void
+              }
+              .void *> consumer.stopConsuming
+          }.timeout(30.seconds)
+        )
+      }
+    }
+
+    it("should count the max processing time from the user's latest renewal") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0")
+        val settings = shareConsumerSettings
+        val result   = run(
+          firstPoll(settings.withMaxProcessingTime(3.seconds), topic)(
+            _.traverse(r =>
+              IO.sleep(2.seconds) *> r.renew *> IO.sleep(2.seconds) *> r.accept.attempt
+            )
+          )
+        )
+        result.toList shouldBe List(Right(()))
+        assertSettled(topic, settings)
+      }
+    }
+
+    it("should keep a record past its lock with manual renewals only") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0")
+        val settings = shareConsumerSettings
+        run(
+          firstPoll(settings.withAutoRenewal(false), topic)(
+            _.traverse_(r => (IO.sleep(lock / 3) *> r.renew).replicateA_(4) *> r.accept)
+          )
+        )
+        assertSettled(topic, settings)
+      }
+    }
+
+    // The consumer does not track lock expiry itself: the acknowledgement is accepted, and the broker
+    // rejects it once sent.
+    it("should lose a record past its lock without renewal") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0", "1")
+        val settings = shareConsumerSettings.withMaxPollRecords(2)
+        val late     = run(
+          firstPoll(settings.withAutoRenewal(false), topic)(records =>
+            IO.sleep(lock + 1.second) *> records.traverse(_.accept.attempt)
+          )
+        )
+        late.toList.distinct shouldBe List(Right(()))
+        all(readUntil(topic, settings, "1").map(_._2)) should be >= 2
+      }
+    }
+
+    it("should accept a renewed record without waiting for the next renewal of the others") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0", "1")
+        val elapsed = run(
+          firstPoll(shareConsumerSettings.withMaxPollRecords(2).withAutoRenewal(true), topic)(
+            records => records.traverse_(r => r.renew *> r.accept).timed.map(_._1)
+          )
+        )
+        elapsed should be < lock / 3
+      }
+    }
+
+    it("should accept the rest of a poll while one record outlives its lock") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0", "1", "2", "3")
+        val settings       = shareConsumerSettings.withMaxPollRecords(4).withAutoRenewal(true)
+        val acceptedBefore = run(
+          Ref
+            .of[IO, Vector[String]](Vector.empty)
+            .flatMap { accepted =>
+              firstPoll(settings, topic)(
+                _.parTraverseN(4) { r =>
+                    if (r.record.value == "0")
+                      IO.sleep(lock + 1.second) *> accepted.get.flatTap(_ => r.accept)
+                    else
+                      r.accept *> accepted.update(_ :+ r.record.value).as(Vector.empty[String])
+                  }
+                  .map(_.toVector.flatten)
+              )
+            }
+        )
+        acceptedBefore should contain theSameElementsAs Vector("1", "2", "3")
+        assertSettled(topic, settings)
+      }
+    }
+  }
+
+  describe("pausing") {
+    it("should send an acknowledgement made while paused") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0")
+        val settings = shareConsumerSettings.withoutMaxAcknowledgementDelay
+        run(
+          SignallingRef[IO, Boolean](false).flatMap { paused =>
+            // The pause comes before the acknowledgement, and process outlives the record's lock, so
+            // only the pause sends it.
+            firstPoll(settings.withPauseWhen(paused), topic)(
+              _.traverse_(r =>
+                paused.set(true) *> IO.sleep(1.second) *> r.accept *> IO.sleep(lock + 1.second)
+              )
+            )
+          }
+        )
+        assertSettled(topic, settings)
+      }
+    }
+
+    it("should accept a poll while paused in implicit mode") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0")
+        val settings = shareConsumerSettings.withProperty("share.acknowledgement.mode", "implicit")
+        run(
+          SignallingRef[IO, Boolean](false).flatMap { paused =>
+            SyncShareConsumer
+              .resource(settings.withPauseWhen(paused))
+              .use { consumer =>
+                consumer.subscribeTo(topic) *>
+                  consumer
+                    .autoConsume(_ => paused.set(true))
+                    .background
+                    // Past the record's lock, also after joining the group.
+                    .surround(IO.sleep(lock + 5.seconds)) *> consumer.stopConsuming
+              }
+          }
+        )
+        assertSettled(topic, settings.withProperty("share.acknowledgement.mode", "explicit"))
+      }
+    }
+  }
+
+  describe("stopping") {
+    it("should send the last acknowledgements before finishing after stopping") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0")
+        val settings = shareConsumerSettings
+        run(
+          consumed(settings, topic)(consumer =>
+            _.traverse_(r => consumer.stopConsuming *> r.accept)
+          )
+        )
+        assertSettled(topic, settings)
+      }
+    }
+
+    it("should release records still processing when consume is canceled") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0")
+        val settings = shareConsumerSettings
+        run(
+          Deferred[IO, Unit].flatMap { received =>
+            consumed(settings, topic)(_ => _ => received.complete(()) *> IO.never[Unit])
+              .race(received.get)
+              .void
+          }
+        )
+        readUntil(topic, settings, "0") shouldBe Vector("0" -> 2)
+      }
+    }
+  }
+
+  describe("several consumers") {
+    it("should return the union of the consumers' subscriptions") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        val subscription = run(
+          SyncShareConsumers
+            .resource(shareConsumerSettings, 2)
+            .use(consumers => consumers.consumers.last.subscribeTo(topic) *> consumers.subscription)
+        )
+        subscription shouldBe SortedSet(topic)
+      }
+    }
+
+    it("should fail for a non-positive number of consumers") {
+      val result = run(SyncShareConsumers.resource(shareConsumerSettings, 0).use_.attempt)
+      result.swap.toOption.get shouldBe a[ConfigException]
     }
   }
 
