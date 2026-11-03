@@ -17,7 +17,7 @@ import cats.Reducible
 import fs2.{Chunk, Stream}
 import fs2.concurrent.SignallingRef
 import fs2.kafka.*
-import fs2.kafka.consumer.{KafkaShareSubscription, MkShareConsumer}
+import fs2.kafka.consumer.{KafkaMetrics, KafkaShareSubscription, MkShareConsumer}
 import fs2.kafka.internal.actor.{
   Acknowledgement,
   Acknowledger,
@@ -29,6 +29,7 @@ import fs2.kafka.internal.converters.collection.*
 import fs2.kafka.internal.syntax.*
 import fs2.kafka.internal.WithShareConsumer
 
+import org.apache.kafka.common.{Metric, MetricName}
 import org.apache.kafka.common.errors.TimeoutException
 
 /**
@@ -37,7 +38,14 @@ import org.apache.kafka.common.errors.TimeoutException
   * straight into the Java consumer, under a mutex shared with the renewals and delayed sends which
   * run meanwhile.
   */
-sealed abstract class SyncShareConsumer[F[_], K, V] extends KafkaShareSubscription[F] {
+sealed abstract class SyncShareConsumer[F[_], K, V]
+    extends KafkaShareSubscription[F]
+    with KafkaMetrics[F] {
+
+  /**
+    * Returns the settings used to create the consumer instance.
+    */
+  def settings: ShareConsumerSettings[F, K, V]
 
   /**
     * Runs `process` on each poll, one poll at a time, until [[stopConsuming]], in explicit
@@ -116,7 +124,10 @@ object SyncShareConsumer {
       extends SyncShareConsumer[F, K, V]
       with Acknowledger[F] {
 
-    private val settings = config.settings
+    override val settings: ShareConsumerSettings[F, K, V] = config.settings
+
+    override def metrics: F[Map[MetricName, Metric]] =
+      withConsumer.blocking(_.metrics().asScala.toMap)
 
     // --- Subscription ---
 

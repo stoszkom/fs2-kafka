@@ -391,15 +391,21 @@ final class SyncShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       )
     }
 
-    it("should report the subscription") {
+    it("should report the subscription and metrics") {
       withTopic { topic =>
         createCustomTopic(topic)
-        val subscription = run(
+        publish(topic, "0")
+        val (subscription, metrics) = run(
           SyncShareConsumer
             .resource(shareConsumerSettings)
-            .use(consumer => consumer.subscribeTo(topic) *> consumer.subscription)
+            .use { consumer =>
+              consumer.subscribeTo(topic) *>
+                consumer.consume(_.traverse_(_.accept) *> consumer.stopConsuming) *>
+                (consumer.subscription, consumer.metrics).tupled
+            }
         )
         subscription shouldBe SortedSet(topic)
+        metrics should not be empty
       }
     }
 
@@ -958,6 +964,40 @@ final class SyncShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
             .use(consumers => consumers.consumers.last.subscribeTo(topic) *> consumers.subscription)
         )
         subscription shouldBe SortedSet(topic)
+      }
+    }
+
+    it("should settle every record once across consumers with suffixed client ids") {
+      withTopic { topic =>
+        createCustomTopic(topic, partitions = 3)
+        val produced = (0 until 30).map(_.toString)
+        publish(topic, produced*)
+        val (clientIds, consumed) = run(
+          Ref
+            .of[IO, Vector[String]](Vector.empty)
+            .flatMap { seen =>
+              SyncShareConsumers
+                .resource(shareConsumerSettings.withClientId("app").withMaxPollRecords(5), 3)
+                .use { consumers =>
+                  consumers.subscribeTo(topic) *>
+                    consumers.consume(
+                      _.parTraverseN(8) { r =>
+                          r.accept *> seen
+                            .updateAndGet(_ :+ r.record.value)
+                            .flatMap(s => consumers.stopConsuming.whenA(s.size >= produced.size))
+                        }
+                        .void
+                    ) *>
+                    seen
+                      .get
+                      .map(
+                        consumers.consumers.toVector.map(_.settings.properties("client.id")) -> _
+                      )
+                }
+            }
+        )
+        clientIds should contain theSameElementsAs Vector("app-0", "app-1", "app-2")
+        consumed should contain theSameElementsAs produced
       }
     }
 
