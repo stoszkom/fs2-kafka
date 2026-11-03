@@ -12,7 +12,7 @@ import fs2.{Chunk, Pipe}
 
 /**
   * Acknowledges the records of each chunk with one call per run of records of the same consumer,
-  * instead of one per record. A acknowledgement for a record the consumer no longer holds is
+  * instead of one per record. An acknowledgement for a record the consumer no longer holds is
   * skipped, as the record is delivered again.
   *
   * It pays off after steps which keep the stream's chunks, such as `map` or `evalMapChunk`, where a

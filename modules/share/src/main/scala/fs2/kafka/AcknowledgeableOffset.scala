@@ -39,13 +39,13 @@ sealed abstract class AcknowledgeableOffset[F[_]] { self =>
   private[kafka] def acknowledger: Acknowledger[F]
 
   /**
-    * Acknowledges the record in the Java consumer, as Java's `acknowledge` does; the
-    * acknowledgement is sent later. A later acknowledgement replaces it until it is sent, by the
-    * next poll, a commit, or after the [[ShareConsumerSettings.maxAcknowledgementDelay]]. Once
-    * sent, or for a delivery the consumer no longer holds, an acknowledgement fails with a
-    * [[RecordNotInFlightException]]. An acknowledgement for a record being renewed completes once a
-    * poll returns the record and Java recorded the acknowledgement, or fails if the record loses
-    * its lock first. In implicit acknowledgement mode, it fails with an
+    * Records the acknowledgement in the Java consumer, as Java's `acknowledge` does. It's sent with
+    * the next poll, or sooner: after the [[ShareConsumerSettings.maxAcknowledgementDelay]], at once
+    * while paused, and when the consumer stops or closes. Until it's sent, a later acknowledgement
+    * replaces it. Once sent, or for a delivery the consumer no longer holds, an acknowledgement
+    * fails with a [[RecordNotInFlightException]]. An acknowledgement for a record being renewed
+    * completes once a poll returns the record and Java recorded the acknowledgement, or fails if
+    * the record loses its lock first. In implicit acknowledgement mode, it fails with an
     * [[ImplicitAcknowledgementException]].
     */
   final def acknowledge(acknowledgeType: AcknowledgeType): F[Unit] =

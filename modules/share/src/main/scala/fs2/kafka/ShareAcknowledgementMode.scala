@@ -28,8 +28,9 @@ object ShareAcknowledgementMode {
   val Explicit: ShareAcknowledgementMode = ExplicitAcknowledgement
 
   /**
-    * The next poll, or a commit, accepts every record of the previous poll, which makes the stream
-    * at-most-once. Java's default.
+    * Every record of a poll is accepted once the stream has taken the poll, when the consumer next
+    * sends acknowledgements: with the next poll, at once while paused, or when it stops. This makes
+    * the stream at-most-once. Java's default.
     */
   val Implicit: ShareAcknowledgementMode = ImplicitAcknowledgement
 

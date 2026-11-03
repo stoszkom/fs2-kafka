@@ -41,8 +41,8 @@ final private[kafka] case class Waiter[F[_]](
 /**
   * @param held
   *   records whose acknowledgement Java has not sent, and renewed records not returned yet
-  * @param acknowledged
-  *   held records with a pending acknowledgement
+  * @param acked
+  *   held records with an acknowledgement recorded in Java but not yet sent
   * @param renewing
   *   held records whose renewal was sent, which a later poll returns
   * @param deferred
@@ -53,8 +53,8 @@ final private[kafka] case class Waiter[F[_]](
   *   the latest poll's records while the stream has not taken it
   * @param pollId
   *   the latest poll offered to the stream, to tell a late hand-out of an earlier one apart
-  * @param stagedSince
-  *   when the oldest pending acknowledgement was made
+  * @param unsentSince
+  *   when the oldest unsent acknowledgement was recorded
   * @param waiters
   *   requests completed once Java recorded their acknowledgements in `deferred`
   * @param paused
@@ -118,8 +118,8 @@ final private[kafka] case class ShareState[F[_]](
   // records come back only from a poll; one made once their renewal completed fetches no new records.
   def canPoll: Boolean = started && allSettled && (renewing.nonEmpty || admitting)
 
-  // Whether no held record is unacknowledged, without building `unacknowledged`: `acknowledged` and `renewing`
-  // are disjoint sets of held records.
+  // Whether every held record is acked or renewing. `acked` and `renewing` are disjoint sets of held
+  // records, so no need to build `unacked`.
   def allSettled: Boolean = held.size == acked.size + renewing.size
 
   // After stopping, once every record is acknowledged and the stream took the latest poll or ended. In
