@@ -308,8 +308,9 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
     * the consumer polls for no new records, so records are not acquired and their delivery count
     * does not grow while, for example, a service the processing needs is down. Records already
     * taken by the stream are processed and acknowledged as usual: their acknowledgements are sent
-    * at once, and auto-renewal keeps renewing them. Without records held, a pause longer than
-    * `max.poll.interval.ms` makes Java leave the share group, and the first poll after it rejoins.
+    * at once, and auto-renewal keeps renewing them; a new record a renewal poll still returns is
+    * released at once. Without records held, a pause longer than `max.poll.interval.ms` makes Java
+    * leave the share group, and the first poll after it rejoins.
     *
     * The circuit breaker deciding when to pause, such as one counting failures or checking a
     * service's health, is yours: set the signal, for example a `SignallingRef`. While processing

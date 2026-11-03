@@ -80,19 +80,17 @@ final private[kafka] case class ShareState[F[_]](
   lazy val unacked: Vector[(TopicPartitionOffset, Held)] =
     held.iterator.filterNot { case (p, _) => acked(p) || renewing(p) }.toVector
 
-  // Whether a poll's new records are handed out.
-  def admitting: Boolean = !stopping && !readerClosed && unpulled.isEmpty
-
-  // Whether a poll may acquire new records.
-  def acquiring: Boolean = admitting && !paused
+  // Whether a poll's new records are handed out, and a poll may acquire them. New records a renewal poll
+  // returns while paused are released.
+  def admitting: Boolean = !stopping && !readerClosed && !paused && unpulled.isEmpty
 
   // Whether the delivery is held.
   def holds(offset: TopicPartitionOffset, deliveryCount: Short): Boolean =
     held.get(offset).exists(_.deliveryCount == deliveryCount)
 
   // Java polls once every record has an acknowledgement or a renewal, and the stream took the poll. Renewed
-  // records come back only from a poll, which returns no new records while a renewal is pending.
-  def canPoll: Boolean = started && allSettled && (renewing.nonEmpty || acquiring)
+  // records come back only from a poll; one made once their renewal completed fetches no new records.
+  def canPoll: Boolean = started && allSettled && (renewing.nonEmpty || admitting)
 
   // Whether no held record is unacknowledged, without building `unacknowledged`: `acknowledged` and `renewing`
   // are disjoint sets of held records.
