@@ -80,12 +80,16 @@ final class ShareBenchmarkSpec extends ShareConsumerBaseKafkaSpec {
 
   // Sends the last pending acknowledgements with the final commit after stopping, as the Java loop commits,
   // before stopping the clock.
-  private def fs2Consumer(topic: String, count: Int)(
+  private def fs2Consumer(
+    topic: String,
+    count: Int,
+    settings: ShareConsumerSettings[IO, String, String] = shareConsumerSettings
+  )(
     pipe: Records => fs2.Stream[IO, Unit]
   ): Unit =
     run(
       KafkaShareConsumer
-        .resource(shareConsumerSettings)
+        .resource(settings)
         .use { consumer =>
           consumer.subscribeTo(topic) *>
             pipe(
@@ -186,6 +190,27 @@ final class ShareBenchmarkSpec extends ShareConsumerBaseKafkaSpec {
         createCustomTopic(topic).get
         publish(topic, (0 until count).map(_.toString)*)
         compare(topic, count, s"$parallelism in parallel, 20 ms of work", Some(20.millis))
+      }
+    }
+
+    // With a max processing time, each acknowledgement must not scan the poll's records.
+    it("should not slow down per-record acknowledgements with a max processing time") {
+      withTopic { topic =>
+        val count = 100000
+        createCustomTopic(topic).get
+        publish(topic, (0 until count).map(_.toString)*)
+        // A new share group for each run, so that each consumes every record.
+        def settings = shareConsumerSettings.withMaxPollRecords(2000)
+        List("warm-up, ", "").foreach { warmUp =>
+          time(s"fs2 per record, 2000 per poll, ${warmUp}no max processing time", count)(
+            fs2Consumer(topic, count, settings)(acknowledgePerRecord(None))
+          )
+          time(s"fs2 per record, 2000 per poll, ${warmUp}max processing time", count)(
+            fs2Consumer(topic, count, settings.withMaxProcessingTime(10.minutes))(
+              acknowledgePerRecord(None)
+            )
+          )
+        }
       }
     }
   }

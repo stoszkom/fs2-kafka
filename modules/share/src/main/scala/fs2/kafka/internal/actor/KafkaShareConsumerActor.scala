@@ -531,15 +531,13 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
 
   // --- Max processing time ---
 
-  // When the max processing time releases each unacknowledged record the stream took, counted from
-  // when it took it or the user's latest renewal.
-  private def limits(state: ShareState[F]): Vector[(TopicPartitionOffset, FiniteDuration)] =
-    config
-      .settings
-      .maxProcessingTime
-      .fold(Vector.empty[(TopicPartitionOffset, FiniteDuration)])(max =>
-        state.unacked.collect { case (p, h) if !state.unpulled(p) => p -> (h.heldSince + max) }
-      )
+  // The max processing time releases each unacknowledged record the stream took, counted from when it
+  // took it or the user's latest renewal.
+  private def overdue(state: ShareState[F], now: FiniteDuration): Vector[TopicPartitionOffset] =
+    config.settings.maxProcessingTime.fold(Vector.empty[TopicPartitionOffset])(state.overdue(_, now))
+
+  private def nextOverdue(state: ShareState[F]): Option[FiniteDuration] =
+    config.settings.maxProcessingTime.flatMap(state.nextOverdue)
 
   // Releases overdue records, so they are delivered again and the consumer can poll.
   private def releaseOverdue(
@@ -585,13 +583,13 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
         F.monotonic
           .flatMap { now =>
             val renewal = nextRenewal(current)
-            val limit   = limits(current)
-            val overdue = limit.collect { case (p, at) if at <= now => p }
+            val limit   = nextOverdue(current)
+            val late    = overdue(current, now)
             val send    = nextSend(current)
-            val wakeAt  = (renewal.toList ++ send ++ limit.map(_._2)).reduceOption(_ min _)
+            val wakeAt  = (renewal.toList ++ send ++ limit).reduceOption(_ min _)
             if (current.isFinished)
               commitSync(current, config.settings.commitTimeout).attempt
-            else if (overdue.nonEmpty) releaseOverdue(current, overdue).flatMap(loop)
+            else if (late.nonEmpty) releaseOverdue(current, late).flatMap(loop)
             // Stopping after the stream ended: nothing will acknowledge the rest.
             else if (current.stopping && current.readerClosed && current.unacked.nonEmpty)
               release(current, current.unacked.map(_._1)).flatMap(loop)
