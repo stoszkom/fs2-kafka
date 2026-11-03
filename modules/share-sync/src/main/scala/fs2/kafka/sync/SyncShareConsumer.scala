@@ -407,8 +407,10 @@ object SyncShareConsumer {
         .switchMap {
           case None     => Stream.empty
           case Some(at) =>
+            // `due` changes the deadline, which switches to a new inner stream: uncancelable, so
+            // that the switch can't stop it between a release and its send.
             Stream.eval(F.monotonic).flatMap(now => Stream.sleep_[F](at - now)) ++
-              Stream.exec(mutex.lock.surround(due))
+              Stream.exec(mutex.lock.surround(due).uncancelable)
         }
         .compile
         .drain
