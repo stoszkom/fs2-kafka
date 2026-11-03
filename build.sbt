@@ -27,7 +27,7 @@ lazy val root = project
     Test / console        := (core / Test / console).value
   )
   .enablePlugins(TypelevelMimaPlugin)
-  .aggregate(core, share, vulcan, `vulcan-testkit-munit`)
+  .aggregate(core, share, `share-sync`, vulcan, `vulcan-testkit-munit`)
 
 lazy val core = project
   .in(file("modules/core"))
@@ -72,6 +72,20 @@ lazy val share = project
     versionIntroduced("4.2.0")
   )
   .dependsOn(core % "compile->compile;test->test")
+
+// A synchronous share consumer, prototyped to compare with the actor in `share`; not published.
+lazy val `share-sync` = project
+  .in(file("modules/share-sync"))
+  .settings(
+    moduleName := "fs2-kafka-share-sync",
+    name       := moduleName.value,
+    dependencySettings,
+    noPublishSettings,
+    noMimaSettings,
+    scalaSettings,
+    testSettings
+  )
+  .dependsOn(share % "compile->compile;test->test")
 
 lazy val vulcan = project
   .in(file("modules/vulcan"))
