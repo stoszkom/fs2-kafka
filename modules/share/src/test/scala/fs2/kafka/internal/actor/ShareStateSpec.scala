@@ -30,10 +30,7 @@ final class ShareStateSpec extends BaseSpec {
 
   // The records the max processing time used to find by scanning the held ones.
   private def scanned(state: ShareState[IO]): Set[(FiniteDuration, TopicPartitionOffset)] =
-    state
-      .unacked
-      .collect { case (p, h) if !state.unpulled(p) => h.heldSince -> p }
-      .toSet
+    state.unacked.collect { case (p, h) if !state.unpulled(p) => h.heldSince -> p }.toSet
 
   private def record(value: Long): KafkaByteConsumerRecord =
     new ConsumerRecord[Array[Byte], Array[Byte]]("topic", 0, value, null, null)
@@ -48,22 +45,61 @@ final class ShareStateSpec extends BaseSpec {
       val s0  = checked(
         ShareState
           .initial[IO](implicitMode = false, paused = false)
-          .polled(Vector.empty, Vector(0L, 1L, 2L, 3L).map(p => offset(p) -> held(p)), Vector.empty, None)
+          .polled(
+            Vector.empty,
+            Vector(0L, 1L, 2L, 3L).map(p => offset(p) -> held(p)),
+            Vector.empty,
+            None
+          )
       )
       // Taken by the stream: all four are timed from 5.
       val s1 = checked(s0.withHandedOut(s0.pollId, 5.seconds))
       assert(s1.timed.size == 4 && s1.nextOverdue(10.seconds).contains(15.seconds))
       // Accepted, renewed by the user, and gone.
-      val s2 = checked(s1.withAcked(ack(0, AcknowledgeType.Accept), Set.empty, Vector.empty, 7.seconds, byUser = true))
-      val s3 = checked(s2.withAcked(ack(1, AcknowledgeType.Renew), Set(offset(2)), Vector.empty, 7.seconds, byUser = true))
+      val s2 = checked(
+        s1.withAcked(
+          ack(0, AcknowledgeType.Accept),
+          Set.empty,
+          Vector.empty,
+          7.seconds,
+          byUser = true
+        )
+      )
+      val s3 = checked(
+        s2.withAcked(
+          ack(1, AcknowledgeType.Renew),
+          Set(offset(2)),
+          Vector.empty,
+          7.seconds,
+          byUser = true
+        )
+      )
       assert(s3.overdue(10.seconds, 15.seconds) == Vector(offset(3)))
       // Released, then a poll returns the renewed record, timed from its renewal by the user.
-      val s4 = checked(s3.withAcked(ack(3, AcknowledgeType.Release), Set.empty, Vector.empty, 8.seconds, byUser = false))
+      val s4 = checked(
+        s3.withAcked(
+          ack(3, AcknowledgeType.Release),
+          Set.empty,
+          Vector.empty,
+          8.seconds,
+          byUser = false
+        )
+      )
       val s5 = checked(s4.polled(Vector(offset(1) -> record(1)), Vector.empty, Vector.empty, None))
       assert(s5.timed.toVector == Vector(7.seconds -> offset(1)))
       // A new poll the stream does not take is timed once it is released.
-      val s6 = checked(s5.withAcked(ack(1, AcknowledgeType.Accept), Set.empty, Vector.empty, 9.seconds, byUser = true))
-      val s7 = checked(s6.polled(Vector.empty, Vector(offset(4) -> held(4)), Vector(offset(5) -> held(5)), None))
+      val s6 = checked(
+        s5.withAcked(
+          ack(1, AcknowledgeType.Accept),
+          Set.empty,
+          Vector.empty,
+          9.seconds,
+          byUser = true
+        )
+      )
+      val s7 = checked(
+        s6.polled(Vector.empty, Vector(offset(4) -> held(4)), Vector(offset(5) -> held(5)), None)
+      )
       assert(s7.timed.map(_._2) == SortedSet(offset(5)))
       checked(s7.withoutUnpulled._1)
     }
@@ -112,6 +148,7 @@ final class ShareStateSpec extends BaseSpec {
         .initial[IO](implicitMode = true, paused = false)
         .polled(Vector.empty, Vector(offset(0) -> held(0)), Vector.empty, None)
       assert(polled.held.isEmpty && polled.unpulled == Set(offset(0)) && !polled.acceptPending)
+      assert(polled.inFlight == 1)
       assert(polled.withHandedOut(polled.pollId, Duration.Zero).acceptPending)
       assert(!polled.withHandedOut(polled.pollId - 1, Duration.Zero).acceptPending)
     }

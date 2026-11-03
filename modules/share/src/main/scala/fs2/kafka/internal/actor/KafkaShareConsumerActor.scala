@@ -419,7 +419,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
         if (admitting) Vector.empty else fresh.map { case (p, r) => p -> held(r, acquiredAt, now) }
       next = state.polled(returned, admitted.map(_._1), rejected, lock)
       _   <- logging
-             .log(ShareLogEntry.Polled(records.size, returned.size, next.held.size))
+             .log(ShareLogEntry.Polled(records.size, returned.size, next.inFlight))
              .whenA(records.nonEmpty)
       _ <-
         output.offer(Some(next.pollId -> Chunk.from(admitted.map(_._2)))).whenA(admitted.nonEmpty)
@@ -534,7 +534,10 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
   // The max processing time releases each unacknowledged record the stream took, counted from when it
   // took it or the user's latest renewal.
   private def overdue(state: ShareState[F], now: FiniteDuration): Vector[TopicPartitionOffset] =
-    config.settings.maxProcessingTime.fold(Vector.empty[TopicPartitionOffset])(state.overdue(_, now))
+    config
+      .settings
+      .maxProcessingTime
+      .fold(Vector.empty[TopicPartitionOffset])(state.overdue(_, now))
 
   private def nextOverdue(state: ShareState[F]): Option[FiniteDuration] =
     config.settings.maxProcessingTime.flatMap(state.nextOverdue)

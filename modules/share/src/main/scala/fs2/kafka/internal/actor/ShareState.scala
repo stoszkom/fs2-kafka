@@ -64,8 +64,8 @@ final private[kafka] case class Waiter[F[_]](
   * @param implicitMode
   *   whether Java accepts each poll itself, so that new records are not held
   * @param timed
-  *   the unacknowledged records the stream took, which are neither renewing nor in an untaken poll, by
-  *   when they were taken or last renewed by the user, so that the max processing time finds the
+  *   the unacknowledged records the stream took, which are neither renewing nor in an untaken poll,
+  *   by when they were taken or last renewed by the user, so that the max processing time finds the
   *   earliest without scanning the held records
   */
 final private[kafka] case class ShareState[F[_]](
@@ -106,6 +106,9 @@ final private[kafka] case class ShareState[F[_]](
 
   private def timedEntries(offsets: Iterable[TopicPartitionOffset]) =
     offsets.flatMap(p => held.get(p).map(h => h.heldSince -> p))
+
+  // The records acquired and not yet acknowledged: in implicit mode, the untaken poll is not held.
+  def inFlight: Int = held.size + (if (implicitMode) unpulled.size else 0)
 
   // Whether the delivery is held.
   def holds(offset: TopicPartitionOffset, deliveryCount: Short): Boolean =
@@ -191,8 +194,8 @@ final private[kafka] case class ShareState[F[_]](
     val (stillRenewing, lost) =
       if (fresh.nonEmpty) (Set.empty[TopicPartitionOffset], notReturned)
       else (notReturned, Set.empty[TopicPartitionOffset])
-    val nextUnpulled          = if (admitted.isEmpty) unpulled -- lost else admitted.map(_._1).toSet
-    val newlyHeld             = returned ++ rejected ++ (if (implicitMode) Vector.empty else admitted)
+    val nextUnpulled = if (admitted.isEmpty) unpulled -- lost else admitted.map(_._1).toSet
+    val newlyHeld    = returned ++ rejected ++ (if (implicitMode) Vector.empty else admitted)
     copy(
       // Only the records of this poll are held besides the renewing ones, which are not timed.
       timed = SortedSet.empty[(FiniteDuration, TopicPartitionOffset)] ++ newlyHeld.collect {
@@ -220,7 +223,8 @@ final private[kafka] case class ShareState[F[_]](
     else
       copy(
         held = held ++ unpulled.flatMap(p => held.get(p).map(h => p -> h.copy(heldSince = at))),
-        timed = timed ++ unpulled.filter(p => held.contains(p) && !acked(p) && !renewing(p)).map(at -> _),
+        timed =
+          timed ++ unpulled.filter(p => held.contains(p) && !acked(p) && !renewing(p)).map(at -> _),
         unpulled = Set.empty,
         acceptPending = acceptPending || implicitMode
       )
