@@ -150,6 +150,27 @@ final class SyncShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       }
     }
 
+    // No poll follows a failed process, so the releases are sent at once: the record is delivered
+    // again well before its lock ends, while the consumer stays open.
+    it("should send the releases at once when process fails") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0")
+        val settings         = shareConsumerSettings
+        val (elapsed, again) = run(
+          SyncShareConsumer
+            .resource(settings)
+            .use { consumer =>
+              consumer.subscribeTo(topic) *>
+                consumer.consume(_ => IO.raiseError[Unit](new RuntimeException("boom"))).attempt *>
+                IO.blocking(readUntil(topic, settings, "0")).timed
+            }
+        )
+        elapsed should be < lock / 2
+        again shouldBe Vector("0" -> 2)
+      }
+    }
+
     it("should fail an acknowledgement made after process returned") {
       withTopic { topic =>
         createCustomTopic(topic)

@@ -258,7 +258,9 @@ object SyncShareConsumer {
               .flatMap { chunk =>
                 // The timers only end by failing, which cancels `process` and fails `consume`.
                 F.race(F.both(timers, sendsWhenPaused) *> F.never[Unit], process(chunk)).void
-              }).guarantee(mutex.lock.surround(releaseUnacked))
+              }).guaranteeCase(outcome =>
+            mutex.lock.surround(releaseUnacked(ended = !outcome.isSuccess))
+          )
         }
 
     private def decode(record: KafkaByteConsumerRecord): F[AcknowledgeableConsumerRecord[F, K, V]] =
@@ -272,13 +274,15 @@ object SyncShareConsumer {
           )
         }
 
-    // The records `process` left are released, sent at once while paused, or else with the next poll.
-    // The poll is then closed, so that a late acknowledgement fails rather than replace a release.
-    private def releaseUnacked: F[Unit] =
+    // The records `process` left are released, sent with the next poll, or at once while paused or
+    // when `consume` ended, as no poll follows. The poll is then closed, so that a late
+    // acknowledgement fails rather than replace a release.
+    private def releaseUnacked(ended: Boolean): F[Unit] =
       state
         .get
         .flatMap { s =>
-          release(s.unacked) *> paused.ifM(send, F.unit) *> state.update(_.closed)
+          release(s.unacked) *> (if (ended) send else paused.ifM(send, F.unit)) *>
+            state.update(_.closed)
         }
 
     // --- Acknowledgements ---
