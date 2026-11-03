@@ -12,6 +12,7 @@ import scala.concurrent.duration.*
 import cats.~>
 import cats.effect.{Deferred, IO, Ref}
 import cats.syntax.all.*
+import fs2.{Chunk, Stream}
 import fs2.concurrent.SignallingRef
 
 import org.apache.kafka.common.config.ConfigException
@@ -423,6 +424,49 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
             }
         )
         calls shouldBe Set("first", "second")
+      }
+    }
+
+    it("should keep the last acknowledgement of a record reached through several acknowledgers") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0", "1")
+        // The first acknowledgement is slower, so that it would win if both were sent concurrently.
+        val slow = new (IO ~> IO) {
+          def apply[A](io: IO[A]): IO[A] = IO.sleep(1.second) *> io
+        }
+        val settings = shareConsumerSettings.withMaxPollRecords(2).withoutMaxAcknowledgementDelay
+        val seen     = run(
+          Ref
+            .of[IO, Vector[(String, Int)]](Vector.empty)
+            .flatMap { seen =>
+              subscribed(settings, topic) { consumer =>
+                consumer
+                  .records
+                  .take(3)
+                  .evalTap(r => seen.update(_ :+ (r.record.value -> r.offset.deliveryCount.toInt)))
+                  .flatMap { r =>
+                    val o = r.offset
+                    // The unacknowledged "1" holds back the poll, so the release replaces the accept,
+                    // and "0" is delivered again.
+                    if (r.record.value == "0" && o.deliveryCount == 1)
+                      Stream.chunk(
+                        Chunk[(AcknowledgeableOffset[IO], AcknowledgeType)](
+                          o.mapK(slow) -> AcknowledgeType.Accept,
+                          o            -> AcknowledgeType.Release
+                        )
+                      )
+                    else Stream(o -> (AcknowledgeType.Accept: AcknowledgeType))
+                  }
+                  .through(acknowledgeChunks[IO])
+                  .compile
+                  .drain
+                  // An accepted record is not delivered again.
+                  .timeoutTo(20.seconds, IO.unit)
+              } *> seen.get
+            }
+        )
+        seen shouldBe Vector("0" -> 1, "1" -> 1, "0" -> 2)
       }
     }
 
