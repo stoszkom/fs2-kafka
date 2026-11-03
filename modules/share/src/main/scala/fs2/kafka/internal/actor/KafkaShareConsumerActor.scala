@@ -375,7 +375,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
             else
               Some(
                 consumer.poll(config.settings.pollTimeout.toJava).iterator().asScala.toVector ->
-                  ShareTimeouts.acquisitionLock(consumer)
+                  acquisitionLock(consumer)
               )
           }
           .flatMap {
@@ -668,6 +668,10 @@ private[kafka] object KafkaShareConsumerActor {
 
   def offsetOf(record: KafkaByteConsumerRecord): TopicPartitionOffset =
     new TopicPartition(record.topic, record.partition) -> record.offset
+
+  // The acquisition lock duration last reported by the broker.
+  def acquisitionLock(consumer: KafkaByteShareConsumer): Option[FiniteDuration] =
+    consumer.acquisitionLockTimeoutMs().toScala.map(_.intValue.millis)
 
   def deliveryCountOf(record: KafkaByteConsumerRecord): Short =
     record.deliveryCount().toScala.fold(1: Short)(_.shortValue)
