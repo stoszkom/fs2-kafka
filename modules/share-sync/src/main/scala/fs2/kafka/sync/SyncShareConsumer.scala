@@ -182,8 +182,15 @@ object SyncShareConsumer {
 
     // Polls until stopped, waiting while paused, and gives each poll to `run` with when it started.
     private def loop(run: (Vector[KafkaByteConsumerRecord], FiniteDuration) => F[Unit]): F[Unit] = {
+      // A stop already requested wins: racing it against a wait which is already complete could pick
+      // the wait and poll again.
       lazy val next: F[Unit] =
-        F.race(stop.get, unpaused)
+        stop
+          .tryGet
+          .flatMap {
+            case Some(_) => F.pure(().asLeft[Unit])
+            case None    => F.race(stop.get, unpaused)
+          }
           .flatMap {
             case Left(_)  => finalCommit
             case Right(_) =>
