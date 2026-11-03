@@ -53,6 +53,27 @@ final class ShareStateSpec extends BaseSpec {
       val (afterReturned, completed) = afterLost.settled(offset(0), 2, Right(()))
       assert(completed.size == 1 && afterReturned.waiters.isEmpty)
     }
+
+    it("should release an untaken poll, its renewing records once a poll returns them") {
+      val state = ShareState[IO](
+        held = Map(offset(0) -> held(0), offset(1) -> held(1), offset(2) -> held(2)),
+        acked = Set(offset(2)),
+        renewing = Set(offset(1)),
+        unpulled = Set(offset(0), offset(1), offset(2))
+      )
+      val (next, toRelease) = state.withoutUnpulled
+      assert(toRelease == Vector(offset(0)) && next.unpulled.isEmpty)
+      assert(next.deferred == Map(offset(1) -> AcknowledgeType.Release))
+    }
+
+    it("should hold no new records in implicit mode, and accept a poll once the stream took it") {
+      val polled = ShareState
+        .initial[IO](implicitMode = true, paused = false)
+        .polled(Vector.empty, Vector(offset(0) -> held(0)), Vector.empty, None)
+      assert(polled.held.isEmpty && polled.unpulled == Set(offset(0)) && !polled.acceptPending)
+      assert(polled.withHandedOut(polled.pollId, Duration.Zero).acceptPending)
+      assert(!polled.withHandedOut(polled.pollId - 1, Duration.Zero).acceptPending)
+    }
   }
 
 }

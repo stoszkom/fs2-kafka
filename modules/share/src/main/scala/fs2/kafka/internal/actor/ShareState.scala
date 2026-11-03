@@ -59,6 +59,8 @@ final private[kafka] case class Waiter[F[_]](
   *   whether the pause signal holds back polls for new records
   * @param acceptPending
   *   in implicit mode, whether the stream took a poll which no poll or commit accepted yet
+  * @param implicitMode
+  *   whether Java accepts each poll itself, so that new records are not held
   */
 final private[kafka] case class ShareState[F[_]](
   held: Map[TopicPartitionOffset, Held] = Map.empty,
@@ -74,7 +76,8 @@ final private[kafka] case class ShareState[F[_]](
   readerClosed: Boolean = false,
   waiters: Vector[Waiter[F]] = Vector.empty[Waiter[F]],
   paused: Boolean = false,
-  acceptPending: Boolean = false
+  acceptPending: Boolean = false,
+  implicitMode: Boolean = false
 ) {
 
   // Held records without an acknowledgement or a renewal.
@@ -102,9 +105,38 @@ final private[kafka] case class ShareState[F[_]](
   def isFinished: Boolean =
     stopping && held.keySet.subsetOf(acked) && (unpulled.isEmpty || readerClosed)
 
-  // Renewals restart their records' locks at `at`, and a user's renewal the time held.
+  def withStarted: ShareState[F] = copy(started = true)
+
+  def withStopping: ShareState[F] = copy(stopping = true)
+
+  def withPaused(paused: Boolean): ShareState[F] = copy(paused = paused)
+
+  def withReaderClosed: ShareState[F] = copy(readerClosed = true)
+
+  def withWaiters(more: Vector[Waiter[F]]): ShareState[F] = copy(waiters = waiters ++ more)
+
+  // Acknowledgements given to Java once a poll returned their records.
+  def withoutDeferred(offsets: Vector[TopicPartitionOffset]): ShareState[F] =
+    copy(deferred = deferred -- offsets)
+
+  // The stream will not take the latest poll: renewing records of it are released once a poll returns
+  // them; the unacknowledged rest are returned, to release now.
+  def withoutUnpulled: (ShareState[F], Vector[TopicPartitionOffset]) = {
+    val unackedOffsets = unacked.map(_._1).toSet
+    (
+      copy(
+        unpulled = Set.empty,
+        deferred = deferred ++ unpulled.filter(renewing).map(_ -> AcknowledgeType.Release)
+      ),
+      unpulled.filter(unackedOffsets).toVector
+    )
+  }
+
+  // Renewals restart their records' locks at `at`, and a user's renewal the time held. Records Java no
+  // longer holds count as acknowledged, so that they are dropped once sent.
   def withAcked(
     last: Map[TopicPartitionOffset, AcknowledgeType],
+    gone: Set[TopicPartitionOffset],
     waiting: Vector[Acknowledgement],
     at: FiniteDuration,
     byUser: Boolean
@@ -116,22 +148,23 @@ final private[kafka] case class ShareState[F[_]](
         .map { p =>
           p -> held(p).copy(lockedSince = at, heldSince = if (byUser) at else held(p).heldSince)
         },
-      acked = acked ++ final_.keySet -- renewed.keySet,
+      acked = acked ++ final_.keySet -- renewed.keySet ++ gone,
       unsentSince = unsentSince.orElse(if (final_.isEmpty) None else Some(at)),
       renewing = renewing ++ renewed.keySet,
       deferred = deferred ++ waiting.map(a => a.offset -> a.acknowledgeType)
     )
   }
 
-  // A poll sent the pending acknowledgements and returned renewed and new records.
+  // A poll sent the pending acknowledgements and returned renewed and new records. A renewed record's
+  // lock runs from when its renewal was sent.
   def polled(
-    returned: Vector[(TopicPartitionOffset, Held)],
+    returnedRecords: Vector[(TopicPartitionOffset, KafkaByteConsumerRecord)],
     admitted: Vector[(TopicPartitionOffset, Held)],
     rejected: Vector[(TopicPartitionOffset, Held)],
-    reportedLock: Option[FiniteDuration],
-    holdAdmitted: Boolean
+    reportedLock: Option[FiniteDuration]
   ): ShareState[F] = {
-    val fresh = admitted.map(_._1) ++ rejected.map(_._1)
+    val returned = returnedRecords.map { case (p, r) => p -> held(p).copy(record = r) }
+    val fresh    = admitted.map(_._1) ++ rejected.map(_._1)
     // A poll with new records means no renewal is pending: those not returned failed.
     val notReturned           = renewing -- returned.map(_._1)
     val (stillRenewing, lost) =
@@ -140,7 +173,7 @@ final private[kafka] case class ShareState[F[_]](
     copy(
       // In implicit mode nothing is held; rejected records only until released.
       held = held.filterKeysStrict(stillRenewing) ++ returned ++ rejected ++
-        (if (holdAdmitted) admitted else Vector.empty),
+        (if (implicitMode) Vector.empty else admitted),
       acked = Set.empty,
       unsentSince = None,
       renewing = stillRenewing,
@@ -153,13 +186,15 @@ final private[kafka] case class ShareState[F[_]](
     )
   }
 
-  // The stream took the poll; the max processing time counts from now.
+  // The stream took the poll; the max processing time counts from now. In implicit mode, the next poll
+  // or commit accepts it.
   def withHandedOut(id: Long, at: FiniteDuration): ShareState[F] =
     if (id != pollId) this
     else
       copy(
         held = held ++ unpulled.flatMap(p => held.get(p).map(h => p -> h.copy(heldSince = at))),
-        unpulled = Set.empty
+        unpulled = Set.empty,
+        acceptPending = acceptPending || implicitMode
       )
 
   // The pending acknowledgements were sent.
@@ -205,5 +240,12 @@ final private[kafka] case class ShareState[F[_]](
         unpulled = unpulled -- lost
       )
   }
+
+}
+
+private[kafka] object ShareState {
+
+  def initial[F[_]](implicitMode: Boolean, paused: Boolean): ShareState[F] =
+    ShareState[F](implicitMode = implicitMode, paused = paused)
 
 }

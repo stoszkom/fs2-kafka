@@ -197,16 +197,11 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
       case ShareRequest.Start() =>
         withConsumer
           .blocking(_.subscription().isEmpty)
-          .ifM(F.raiseError(NotSubscribedException()), F.pure(state.copy(started = true)))
-      case ShareRequest.Stop()        => F.pure(state.copy(stopping = true))
-      case ShareRequest.HandedOut(id) =>
-        F.monotonic
-          .map(state.withHandedOut(id, _))
-          .map(s =>
-            if (config.implicitMode && id == state.pollId) s.copy(acceptPending = true) else s
-          )
-      case ShareRequest.Paused(paused)  => F.pure(state.copy(paused = paused))
-      case ShareRequest.ReaderClosed()  => releaseUnpulled(state.copy(readerClosed = true))
+          .ifM(F.raiseError(NotSubscribedException()), F.pure(state.withStarted))
+      case ShareRequest.Stop()          => F.pure(state.withStopping)
+      case ShareRequest.HandedOut(id)   => F.monotonic.map(state.withHandedOut(id, _))
+      case ShareRequest.Paused(paused)  => F.pure(state.withPaused(paused))
+      case ShareRequest.ReaderClosed()  => releaseUnpulled(state.withReaderClosed)
       case ShareRequest.Ack(acks, done) =>
         ackAll(state, Vector(acks -> done), send = false, byUser = true)
     }
@@ -216,15 +211,8 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
   private def releaseUnpulled(state: ShareState[F]): F[ShareState[F]] =
     if (config.implicitMode) F.pure(state)
     else {
-      val unacked  = state.unacked.map(_._1).toSet
-      val renewing = state.unpulled.filter(state.renewing)
-      release(
-        state.copy(
-          unpulled = Set.empty,
-          deferred = state.deferred ++ renewing.map(_ -> AcknowledgeType.Release)
-        ),
-        state.unpulled.filter(unacked).toVector
-      )
+      val (next, unacked) = state.withoutUnpulled
+      release(next, unacked)
     }
 
   private def release(
@@ -276,7 +264,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
           case (request, Right(_)) if request.waiting.nonEmpty => F.unit
           case (request, result)                               => request.done(result)
         }
-        .as(acked.copy(waiters = acked.waiters ++ waiters))
+        .as(acked.withWaiters(waiters))
     }
 
   // Gives the requests' acknowledgements to Java, with each request's result; once Java failed, it completes
@@ -337,17 +325,15 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
       .flatMap {
         case (at, Right(results)) =>
           // Tracks what Java recorded, also of a request that failed part-way. The last one wins.
-          // Records Java no longer holds count as acknowledged, so that they are dropped once sent.
           val outcomes = ackings.zip(results)
           val last     = outcomes
             .flatMap { case (_, (done, _, _)) => done }
             .map(a => a.offset -> a.acknowledgeType)
             .toMap
-          val gone     = outcomes.flatMap { case (_, (_, gone, _)) => gone.map(_.offset) }.toSet
-          val waiting  = outcomes.collect { case (request, (_, _, None)) => request.waiting }.flatten
-          val withLast = state.withAcked(last, waiting, at, byUser)
-          val acked    = withLast.copy(acked = withLast.acked ++ gone)
-          val answers  = outcomes.map { case (request, (_, gone, error)) =>
+          val gone    = outcomes.flatMap { case (_, (_, gone, _)) => gone.map(_.offset) }.toSet
+          val waiting = outcomes.collect { case (request, (_, _, None)) => request.waiting }.flatten
+          val acked   = state.withAcked(last, gone, waiting, at, byUser)
+          val answers = outcomes.map { case (request, (_, gone, error)) =>
             request -> error
               .orElse(
                 (gone ++ request.notHeld)
@@ -431,15 +417,8 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
       // Held only to be released below.
       rejected =
         if (admitting) Vector.empty else fresh.map { case (p, r) => p -> held(r, acquiredAt, now) }
-      next = state.polled(
-               // A renewed record's lock runs from when its renewal was sent.
-               returned.map { case (p, r) => p -> state.held(p).copy(record = r) },
-               admitted.map(_._1),
-               rejected,
-               lock,
-               holdAdmitted = !config.implicitMode
-             )
-      _ <- logging
+      next = state.polled(returned, admitted.map(_._1), rejected, lock)
+      _   <- logging
              .log(ShareLogEntry.Polled(records.size, returned.size, next.held.size))
              .whenA(records.nonEmpty)
       _ <-
@@ -459,7 +438,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
         if (batch.isEmpty) F.pure(next)
         else
           ackResults(
-            next.copy(deferred = next.deferred -- waiting.map(_._1)),
+            next.withoutDeferred(waiting.map(_._1)),
             batch,
             send = true,
             byUser = true
@@ -634,12 +613,17 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
     config
       .settings
       .pauseWhen
-      .fold(loop(ShareState[F]())) { signal =>
+      .fold(loop(ShareState.initial[F](config.implicitMode, paused = false))) { signal =>
         val changes =
           signal.discrete.evalMap(p => requests.offer(ShareRequest.Paused(p))).compile.drain
         signal
           .get
-          .flatMap(paused => F.race(changes *> F.never[Unit], loop(ShareState[F](paused = paused))))
+          .flatMap(paused =>
+            F.race(
+              changes *> F.never[Unit],
+              loop(ShareState.initial[F](config.implicitMode, paused))
+            )
+          )
           .flatMap {
             case Right(result) => F.pure(result)
             case Left(_)       => F.never[Either[Throwable, Unit]]
