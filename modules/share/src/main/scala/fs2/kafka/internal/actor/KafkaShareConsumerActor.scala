@@ -308,12 +308,13 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
                   }
               }
           }
-          // A failed send fails the actor. A renewal waits for the broker, up to the renewal margin; one
-          // still pending after it is returned by a poll which also fetches, as with `commitAsync`.
+          // A failed send fails the actor. A renewal waits for the broker, up to the renewal margin and at
+          // most half the lock; one still pending after it is returned by a poll which also fetches, as with
+          // `commitAsync`.
           if (renewal)
             Either
               .catchOnly[TimeoutException](
-                consumer.commitSync(config.settings.renewalMargin.toJava)
+                consumer.commitSync(renewalWait(state.lock).toJava)
               )
               .void
               .getOrElse(())
@@ -497,6 +498,10 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
       Some(unacked.min + state.lock.fold(unknownLockRenewalInterval)(renewalInterval))
     else None
   }
+
+  // How long a renewal waits for the broker: past the margin, or half the lock, the lock has likely ended.
+  private def renewalWait(lock: Option[FiniteDuration]): FiniteDuration =
+    lock.fold(config.settings.renewalMargin)(_ / 2).min(config.settings.renewalMargin)
 
   // The renewal margin before the lock ends, or half the lock, early enough for
   // `max.poll.interval.ms`.
