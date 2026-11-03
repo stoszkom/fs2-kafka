@@ -269,7 +269,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
       // Completes once a poll returns the renewing records and Java recorded their acknowledgements.
       val waiters = outcomes.collect {
         case (request, Right(_)) if request.waiting.nonEmpty =>
-          Waiter(request.waiting.map(_.offset).toSet, request.done)
+          Waiter(request.waiting.map(a => a.offset -> a.deliveryCount).toSet, request.done)
       }
       outcomes
         .traverse_ {
@@ -445,9 +445,11 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
       _ <-
         output.offer(Some(next.pollId -> Chunk.from(admitted.map(_._2)))).whenA(admitted.nonEmpty)
       // Waiting acknowledgements are the user's, sent at once rather than behind the slowest record.
-      waiting = returned.flatMap { case (p, _) => next.deferred.get(p).map(p -> _) }
+      waiting = returned.flatMap { case (p, r) =>
+                  next.deferred.get(p).map(kind => (p, deliveryCountOf(r), kind))
+                }
       // One request per waiting acknowledgement, to settle its waiters with its own result.
-      waitingBatch = waiting.map { case (p, kind) =>
+      waitingBatch = waiting.map { case (p, _, kind) =>
                        Chunk.singleton(ack(next, p, kind)) -> noCallback
                      }
       releases = rejected.map { case (p, _) => ack(next, p, AcknowledgeType.Release) }
@@ -465,11 +467,11 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
             val (waitingResults, releaseResults) = results.map(_._2).splitAt(waiting.size)
             val (settled, effects)               =
               waiting
-                .map(_._1)
                 .zip(waitingResults)
-                .foldLeft((s, Vector.empty[F[Unit]])) { case ((current, done), (p, result)) =>
-                  val (next, more) = current.settled(p, result)
-                  (next, done ++ more)
+                .foldLeft((s, Vector.empty[F[Unit]])) {
+                  case ((current, done), ((p, count, _), result)) =>
+                    val (next, more) = current.settled(p, count, result)
+                    (next, done ++ more)
                 }
             // A failed release fails the actor.
             effects.sequence_ *> releaseResults.traverse_(_.liftTo[F]).as(settled)

@@ -29,9 +29,10 @@ final private[kafka] case class Held(
   heldSince: FiniteDuration
 )
 
-// A request completed once Java recorded its acknowledgements for renewing records.
+// A request completed once Java recorded its acknowledgements for renewing records, by delivery, so that a
+// new delivery of the same offset does not complete it.
 final private[kafka] case class Waiter[F[_]](
-  offsets: Set[TopicPartitionOffset],
+  deliveries: Set[(TopicPartitionOffset, Short)],
   done: Either[Throwable, Unit] => F[Unit]
 )
 
@@ -165,27 +166,30 @@ final private[kafka] case class ShareState[F[_]](
   def withoutAcked: ShareState[F] =
     copy(held = held -- acked, acked = Set.empty, unsentSince = None, acceptPending = false)
 
-  // Completes the requests waiting for an acknowledgement on the offset with its result, as the
+  // Completes the requests waiting for an acknowledgement on the delivery with its result, as the
   // effects to run.
   def settled(
     offset: TopicPartitionOffset,
+    deliveryCount: Short,
     result: Either[Throwable, Unit]
   ): (ShareState[F], Vector[F[Unit]]) = {
-    val (hit, rest)   = waiters.partition(_.offsets(offset))
-    val left          = hit.map(w => w.copy(offsets = w.offsets - offset))
+    val delivery      = offset -> deliveryCount
+    val (hit, rest)   = waiters.partition(_.deliveries(delivery))
+    val left          = hit.map(w => w.copy(deliveries = w.deliveries - delivery))
     val (ready, keep) =
-      if (result.isLeft) (hit, Vector.empty) else left.partition(_.offsets.isEmpty)
+      if (result.isLeft) (hit, Vector.empty) else left.partition(_.deliveries.isEmpty)
     (copy(waiters = rest ++ keep), ready.map(_.done(result)))
   }
 
-  // Fails the waiting acknowledgements whose record lost its lock before a poll returned it.
+  // Fails the waiting acknowledgements whose delivery lost its lock before a poll returned it, also when
+  // a new delivery of the record is held and waits again.
   def settledLost: (ShareState[F], Vector[F[Unit]]) =
     waiters
-      .flatMap(_.offsets)
+      .flatMap(_.deliveries)
       .distinct
-      .filterNot(deferred.contains)
-      .foldLeft((this, Vector.empty[F[Unit]])) { case ((s, effects), p) =>
-        val (next, more) = s.settled(p, Left(RecordNotInFlightException(p._1, p._2)))
+      .filterNot { case (p, count) => deferred.contains(p) && holds(p, count) }
+      .foldLeft((this, Vector.empty[F[Unit]])) { case ((s, effects), (p, count)) =>
+        val (next, more) = s.settled(p, count, Left(RecordNotInFlightException(p._1, p._2)))
         (next, effects ++ more)
       }
 
