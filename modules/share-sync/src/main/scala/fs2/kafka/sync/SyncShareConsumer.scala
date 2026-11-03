@@ -256,11 +256,12 @@ object SyncShareConsumer {
         }
 
     // The records `process` left are released, sent at once while paused, or else with the next poll.
+    // The poll is then closed, so that a late acknowledgement fails rather than replace a release.
     private def releaseUnacked: F[Unit] =
       state
         .get
         .flatMap { s =>
-          release(s.unacked) *> paused.ifM(send, F.unit)
+          release(s.unacked) *> paused.ifM(send, F.unit) *> state.update(_.closed)
         }
 
     // --- Acknowledgements ---

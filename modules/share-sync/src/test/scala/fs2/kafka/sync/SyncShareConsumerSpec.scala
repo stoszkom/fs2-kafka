@@ -141,6 +141,34 @@ final class SyncShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       }
     }
 
+    // Records of a finished poll stay in the state while the next polls return nothing: a renewal
+    // of one must fail rather than reach Java, whose poll would acquire records outside the loop.
+    it("should fail a renewal made after process returned") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0")
+        val renewal = run(
+          SignallingRef
+            .of[IO, Option[AcknowledgeableConsumerRecord[IO, String, String]]](None)
+            .flatMap { kept =>
+              SyncShareConsumer
+                .resource(shareConsumerSettings)
+                .use { consumer =>
+                  consumer.subscribeTo(topic) *>
+                    consumer
+                      .consume(_.traverse_(r => r.accept *> kept.set(Some(r))))
+                      .background
+                      .use(_ =>
+                        kept.waitUntil(_.isDefined) *> IO.sleep(3.seconds) *>
+                          kept.get.flatMap(_.get.renew.attempt)
+                      )
+                }
+            }
+        )
+        renewal.left.toOption.get shouldBe a[RecordNotInFlightException]
+      }
+    }
+
     it("should release a record past the max processing time") {
       withTopic { topic =>
         createCustomTopic(topic)

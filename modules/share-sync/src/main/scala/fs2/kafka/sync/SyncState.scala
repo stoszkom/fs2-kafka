@@ -102,6 +102,9 @@ final private[sync] case class SyncState(
   def withoutHeld(offsets: Iterable[TopicPartitionOffset]): SyncState =
     copy(held = held -- offsets, acked = acked -- offsets, timed = timed -- timedEntries(offsets))
 
+  // The poll's processing ended: its records can no longer be acknowledged or renewed.
+  def closed: SyncState = SyncState.empty.withLock(lock)
+
   /**
     * A renewal sent the pending acknowledgements and renewed the unacknowledged records at `at`.
     * Those a poll returned are held again; the rest lost their lock. Records the user renewed
