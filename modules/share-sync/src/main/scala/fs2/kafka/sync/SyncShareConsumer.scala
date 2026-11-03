@@ -24,7 +24,13 @@ import fs2.kafka.internal.actor.{
   ShareActorConfig,
   TopicPartitionOffset
 }
-import fs2.kafka.internal.actor.KafkaShareConsumerActor.{acquisitionLock, deliveryCountOf, offsetOf}
+import fs2.kafka.internal.actor.KafkaShareConsumerActor.{
+  acquisitionLock,
+  deliveryCountOf,
+  offsetOf,
+  subscriptionCheckInterval,
+  unknownLockRenewalInterval
+}
 import fs2.kafka.internal.converters.collection.*
 import fs2.kafka.internal.syntax.*
 import fs2.kafka.internal.WithShareConsumer
@@ -103,12 +109,6 @@ object SyncShareConsumer {
     F: Async[F],
     mk: MkShareConsumer[F]
   ): Stream[F, SyncShareConsumer[F, K, V]] = Stream.resource(resource(settings))
-
-  // How often an unsubscribed consumer checks for a subscription.
-  private val subscriptionCheckInterval: FiniteDuration = 50.millis
-
-  // How often records are renewed before the broker reported the lock.
-  private val unknownLockRenewalInterval: FiniteDuration = 500.millis
 
   final private class Impl[F[_], K, V](
     config: ShareActorConfig[F, K, V],
