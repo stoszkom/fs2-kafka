@@ -421,28 +421,27 @@ object SyncShareConsumer {
         .compile
         .drain
 
-    private def nextDeadline(s: SyncState): Option[FiniteDuration] =
-      List(
-        if (settings.autoRenewal) s.nextRenewal(config.renewalInterval(s.lock)) else None,
-        settings.maxAcknowledgementDelay.flatMap(s.nextSend),
-        settings.maxProcessingTime.flatMap(s.nextOverdue)
-      ).flatten.reduceOption(_ min _)
+    // The one place the timers' deadlines are computed, so that a wake-up always finds what is due.
+    private def deadlines(s: SyncState): Deadlines =
+      Deadlines(
+        renewal =
+          if (settings.autoRenewal) s.nextRenewal(config.renewalInterval(s.lock)) else None,
+        send = settings.maxAcknowledgementDelay.flatMap(s.nextSend),
+        overdue = settings.maxProcessingTime.flatMap(s.nextOverdue)
+      )
+
+    private def nextDeadline(s: SyncState): Option[FiniteDuration] = deadlines(s).next
 
     private def due: F[Unit] =
       (state.get, F.monotonic)
         .tupled
         .flatMap { case (s, now) =>
-          val overdue = settings
-            .maxProcessingTime
-            .fold(Vector.empty[TopicPartitionOffset])(s.overdue(_, now))
-          val renewal = settings.autoRenewal && s
-            .nextRenewal(config.renewalInterval(s.lock))
-            .exists(_ <= now)
-          val sending = settings.maxAcknowledgementDelay.flatMap(s.nextSend).exists(_ <= now)
+          val d = deadlines(s)
           // Overdue records are released and sent at once, so that a late acknowledgement can't replace it.
-          if (overdue.nonEmpty) release(overdue) *> send
-          else if (renewal) renew(Set.empty)
-          else if (sending) send
+          if (d.overdue.exists(_ <= now))
+            settings.maxProcessingTime.traverse_(max => release(s.overdue(max, now))) *> send
+          else if (d.renewal.exists(_ <= now)) renew(Set.empty)
+          else if (d.send.exists(_ <= now)) send
           else F.unit
         }
 

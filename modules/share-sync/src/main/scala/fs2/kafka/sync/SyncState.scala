@@ -28,6 +28,20 @@ final private[sync] case class Delivery(
 )
 
 /**
+  * When the timers next renew the unacknowledged records, send the pending acknowledgements, and
+  * release the first record past the max processing time, each if it applies.
+  */
+final private[sync] case class Deadlines(
+  renewal: Option[FiniteDuration],
+  send: Option[FiniteDuration],
+  overdue: Option[FiniteDuration]
+) {
+
+  def next: Option[FiniteDuration] = List(renewal, send, overdue).flatten.reduceOption(_ min _)
+
+}
+
+/**
   * The records of the poll being processed. Only one poll is processed at a time, and a renewal
   * renews every unacknowledged record at once, so they all share one lock start.
   *
