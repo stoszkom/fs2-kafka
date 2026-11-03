@@ -6,24 +6,24 @@
 
 package fs2.kafka
 
-import scala.collection.immutable.SortedSet
-
+import cats.Reducible
 import cats.data.NonEmptyVector
-import cats.effect.{Async, Resource}
+import cats.effect.Async
+import cats.effect.Resource
 import cats.effect.instances.spawn.*
 import cats.effect.std.Dispatcher
 import cats.syntax.all.*
-import cats.Reducible
+import fs2.Stream
 import fs2.kafka.consumer.*
+import fs2.kafka.internal.WithShareConsumer
 import fs2.kafka.internal.actor.KafkaShareConsumerActor
 import fs2.kafka.internal.converters.collection.*
 import fs2.kafka.internal.syntax.*
-import fs2.kafka.internal.WithShareConsumer
-import fs2.Stream
-
 import org.apache.kafka.clients.consumer.ConsumerConfig
-import org.apache.kafka.common.{Metric, MetricName}
+import org.apache.kafka.common.Metric
+import org.apache.kafka.common.MetricName
 import org.apache.kafka.common.config.ConfigException
+import scala.collection.immutable.SortedSet
 
 /**
   * [[KafkaShareConsumer]] is a consumer in a Kafka share group, wrapping Java's
@@ -52,10 +52,10 @@ import org.apache.kafka.common.config.ConfigException
   * Experimental: this API targets Kafka's share groups and may change in minor releases.
   */
 sealed abstract class KafkaShareConsumer[F[_], K, V]
-    extends KafkaShareConsume[F, K, V]
-    with KafkaShareSubscription[F]
-    with KafkaMetrics[F]
-    with KafkaConsumerLifecycle[F] {
+  extends KafkaShareConsume[F, K, V]
+  with KafkaShareSubscription[F]
+  with KafkaMetrics[F]
+  with KafkaConsumerLifecycle[F] {
 
   /**
     * Returns the settings used to create the consumer instance.
@@ -82,8 +82,7 @@ object KafkaShareConsumer {
 
       override val settings: ShareConsumerSettings[F, K, V] = _settings
 
-      override private[kafka] def polls
-        : Stream[F, Stream[F, AcknowledgeableConsumerRecord[F, K, V]]] =
+      override private[kafka] def polls: Stream[F, Stream[F, AcknowledgeableConsumerRecord[F, K, V]]] =
         actor.polls
 
       override def stream: Stream[F, AcknowledgeableConsumerRecord[F, K, V]] = actor.records
@@ -117,20 +116,20 @@ object KafkaShareConsumer {
     settings: ShareConsumerSettings[F, K, V]
   )(implicit F: Async[F], mk: MkShareConsumer[F]): Resource[F, KafkaShareConsumer[F, K, V]] =
     for {
-      keyDeserializer   <- settings.keyDeserializer
+      keyDeserializer <- settings.keyDeserializer
       valueDeserializer <- settings.valueDeserializer
-      id                <- Resource.eval(F.delay(new Object().hashCode))
+      id <- Resource.eval(F.delay(new Object().hashCode))
       // Created before the Java consumer, as closing it can still report results to the actor.
-      dispatcher   <- Dispatcher.sequential[F]
+      dispatcher <- Dispatcher.sequential[F]
       withConsumer <- WithShareConsumer(mk, settings)
-      actor        <- KafkaShareConsumerActor.resource(
-                 settings,
-                 keyDeserializer,
-                 valueDeserializer,
-                 withConsumer,
-                 dispatcher,
-                 id
-               )
+      actor <- KafkaShareConsumerActor.resource(
+        settings,
+        keyDeserializer,
+        valueDeserializer,
+        withConsumer,
+        dispatcher,
+        id
+      )
     } yield createKafkaShareConsumer(settings, actor, withConsumer, id)
 
   /**
@@ -165,8 +164,7 @@ object KafkaShareConsumer {
     settings: ShareConsumerSettings[F, K, V],
     index: Int
   ): ShareConsumerSettings[F, K, V] =
-    settings
-      .properties
+    settings.properties
       .get(ConsumerConfig.CLIENT_ID_CONFIG)
       .fold(settings)(id => settings.withClientId(s"$id-$index"))
 

@@ -8,7 +8,6 @@ package fs2.kafka
 
 import cats.Eq
 import cats.Show
-
 import org.apache.kafka.clients.consumer.AcknowledgeType as KafkaAcknowledgeType
 
 /**
@@ -30,28 +29,28 @@ object AcknowledgeType {
   private[kafka] case object AcceptAcknowledgeType extends AcknowledgeType {
 
     override val asJava: KafkaAcknowledgeType = KafkaAcknowledgeType.ACCEPT
-    override def toString: String             = "Accept"
+    override def toString: String = "Accept"
 
   }
 
   private[kafka] case object ReleaseAcknowledgeType extends AcknowledgeType {
 
     override val asJava: KafkaAcknowledgeType = KafkaAcknowledgeType.RELEASE
-    override def toString: String             = "Release"
+    override def toString: String = "Release"
 
   }
 
   private[kafka] case object RejectAcknowledgeType extends AcknowledgeType {
 
     override val asJava: KafkaAcknowledgeType = KafkaAcknowledgeType.REJECT
-    override def toString: String             = "Reject"
+    override def toString: String = "Reject"
 
   }
 
   private[kafka] case object RenewAcknowledgeType extends AcknowledgeType {
 
     override val asJava: KafkaAcknowledgeType = KafkaAcknowledgeType.RENEW
-    override def toString: String             = "Renew"
+    override def toString: String = "Renew"
 
   }
 

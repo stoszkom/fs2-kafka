@@ -6,19 +6,19 @@
 
 package fs2.kafka.sync
 
-import scala.collection.immutable.SortedSet
-
+import cats.Reducible
 import cats.data.NonEmptyVector
-import cats.effect.{Async, Resource}
+import cats.effect.Async
+import cats.effect.Resource
 import cats.effect.instances.spawn.*
 import cats.syntax.all.*
-import cats.Reducible
-import fs2.kafka.*
-import fs2.kafka.consumer.{KafkaShareSubscription, MkShareConsumer}
 import fs2.Chunk
-
+import fs2.kafka.*
+import fs2.kafka.consumer.KafkaShareSubscription
+import fs2.kafka.consumer.MkShareConsumer
 import org.apache.kafka.clients.consumer.ConsumerConfig
 import org.apache.kafka.common.config.ConfigException
+import scala.collection.immutable.SortedSet
 
 /**
   * Share consumers of the same share group, each with its own Java consumer and its own loop, so
@@ -70,15 +70,14 @@ object SyncShareConsumers {
     settings: ShareConsumerSettings[F, K, V],
     index: Int
   ): ShareConsumerSettings[F, K, V] =
-    settings
-      .properties
+    settings.properties
       .get(ConsumerConfig.CLIENT_ID_CONFIG)
       .fold(settings)(id => settings.withClientId(s"$id-$index"))
 
   final private class Impl[F[_], K, V](
     override val consumers: NonEmptyVector[SyncShareConsumer[F, K, V]]
   )(implicit F: Async[F])
-      extends SyncShareConsumers[F, K, V] {
+    extends SyncShareConsumers[F, K, V] {
 
     override def subscribe[G[_]: Reducible](topics: G[String]): F[Unit] =
       consumers.traverse_(_.subscribe(topics))

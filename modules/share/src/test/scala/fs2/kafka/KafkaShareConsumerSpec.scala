@@ -6,16 +6,17 @@
 
 package fs2.kafka
 
+import cats.effect.Deferred
+import cats.effect.IO
+import cats.effect.Ref
+import cats.syntax.all.*
+import cats.~>
+import fs2.Chunk
+import fs2.Stream
+import fs2.concurrent.SignallingRef
+import org.apache.kafka.common.config.ConfigException
 import scala.collection.immutable.SortedSet
 import scala.concurrent.duration.*
-
-import cats.~>
-import cats.effect.{Deferred, IO, Ref}
-import cats.syntax.all.*
-import fs2.{Chunk, Stream}
-import fs2.concurrent.SignallingRef
-
-import org.apache.kafka.common.config.ConfigException
 
 final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
 
@@ -40,7 +41,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
 
     it("should report the subscription and metrics") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0")
         val (subscription, metrics) = run(
           subscribed(shareConsumerSettings, topic) { consumer =>
@@ -56,8 +57,8 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
     it("should keep streaming across unsubscribe and a new subscription") {
       withTopic { first =>
         withTopic { second =>
-          createCustomTopic(first)
-          createCustomTopic(second)
+          createTopic(first)
+          createTopic(second)
           publish(first, "first")
           publish(second, "second")
           val consumed = run(
@@ -65,8 +66,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
               .resource(shareConsumerSettings)
               .use { consumer =>
                 consumer.subscribeTo(first) *>
-                  consumer
-                    .records
+                  consumer.records
                     .evalMap { r =>
                       r.accept *>
                         (consumer.unsubscribe *> consumer.subscribeTo(second))
@@ -94,18 +94,14 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
 
     it("should end the record stream normally once the consumer is closed") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         val result = run(
           KafkaShareConsumer
             .resource(shareConsumerSettings)
             .allocated
             .flatMap { case (consumer, close) =>
               consumer.subscribeTo(topic) *>
-                consumer
-                  .records
-                  .compile
-                  .drain
-                  .start
+                consumer.records.compile.drain.start
                   .flatMap { stream =>
                     IO.sleep(2.seconds) *> close *> stream.joinWithNever.attempt.timeout(10.seconds)
                   }
@@ -117,7 +113,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
 
     it("should fail with ConsumerShutdownException once closed after a failure") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0")
         val settings = ShareConsumerSettings(
           Deserializer[IO, String],
@@ -135,14 +131,12 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
                 .resource(settings)
                 .allocated
                 .flatMap { case (consumer, close) =>
-                  (consumer.subscribeTo(topic) *> consumer
-                    .records
+                  (consumer.subscribeTo(topic) *> consumer.records
                     .evalMap(r => first.set(Some(r)) *> r.accept *> IO(publish(topic, "bad")))
                     .compile
                     .drain
-                    .attempt).flatMap(failure =>
-                    close *> first.get.flatMap(_.get.accept.attempt).tupleLeft(failure)
-                  )
+                    .attempt)
+                    .flatMap(failure => close *> first.get.flatMap(_.get.accept.attempt).tupleLeft(failure))
                 }
             }
         )
@@ -159,12 +153,11 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
 
     it("should fail a second record stream") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0")
         val result = run(
           subscribed(shareConsumerSettings, topic) { consumer =>
-            consumer
-              .records
+            consumer.records
               .take(1)
               .evalMap(r => consumer.records.compile.drain.attempt <* r.accept)
               .compile
@@ -179,7 +172,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
   describe("KafkaShareConsumer#records") {
     it("should consume all records, across partitions") {
       withTopic { topic =>
-        createCustomTopic(topic, partitions = 3)
+        createTopic(topic, partitions = 3)
         val produced = (0 until 9).map(_.toString)
         publish(topic, produced*)
         val consumed = run(
@@ -198,7 +191,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
 
     it("should not deliver accepted or rejected records again") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0", "1")
         val settings = shareConsumerSettings
         run(
@@ -220,7 +213,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
 
     it("should deliver released records again, with a higher delivery count") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0")
         val deliveries = run(
           KafkaShareConsumer
@@ -244,7 +237,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
 
     it("should let two consumers process records of the same partition concurrently") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0", "1")
         val settings = shareConsumerSettings.withMaxPollRecords(1)
         val consumed = run(
@@ -280,14 +273,12 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
     // in time; only the delay does. The second is then delivered again, the first is not.
     it("should send pending acknowledgements after the max acknowledgement delay, without a poll") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0", "1")
         val settings = shareConsumerSettings.withMaxPollRecords(2)
         run(
           subscribed(settings.withMaxAcknowledgementDelay(100.millis), topic) { consumer =>
-            consumer
-              .records
-              .zipWithIndex
+            consumer.records.zipWithIndex
               .evalMap {
                 case (r, 0) => r.accept.as(None)
                 case (r, _) => IO.pure(Some(r))
@@ -306,13 +297,12 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
 
     it("should send pending acknowledgements with the next poll, and the last ones when closing") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, (0 until 10).map(_.toString)*)
         val settings = shareConsumerSettings.withMaxPollRecords(5)
         run(
           subscribed(settings, topic) { consumer =>
-            consumer
-              .records
+            consumer.records
               .map(_.offset -> (AcknowledgeType.Accept: AcknowledgeType))
               .take(10)
               .through(acknowledgeChunks[IO])
@@ -325,13 +315,12 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
     }
     it("should let the last of several acknowledgements made together for a record win") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0")
         val settings = shareConsumerSettings
         run(
           subscribed(settings, topic) { consumer =>
-            consumer
-              .records
+            consumer.records
               .take(1)
               .flatMap(r =>
                 fs2.Stream(
@@ -352,18 +341,16 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
     }
     it("should fail an acknowledgement for a delivery whose acknowledgement was sent") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0")
         // Without a delay, the acknowledgement is sent at once.
         val late = run(
-          subscribed(shareConsumerSettings.withMaxAcknowledgementDelay(Duration.Zero), topic) {
-            consumer =>
-              consumer
-                .records
-                .take(1)
-                .evalMap(r => r.accept *> IO.sleep(1.second) *> r.reject.attempt)
-                .compile
-                .lastOrError
+          subscribed(shareConsumerSettings.withMaxAcknowledgementDelay(Duration.Zero), topic) { consumer =>
+            consumer.records
+              .take(1)
+              .evalMap(r => r.accept *> IO.sleep(1.second) *> r.reject.attempt)
+              .compile
+              .lastOrError
           }
         )
         late.swap.toOption.get shouldBe a[RecordNotInFlightException]
@@ -371,7 +358,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
     }
     it("should fail an acknowledgement through the offset of an earlier delivery") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0")
         val stale = run(
           KafkaShareConsumer
@@ -399,7 +386,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
   describe("acknowledgeChunks") {
     it("should acknowledge offsets mapped with different functions through each") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0", "1")
         val calls = run(
           Ref
@@ -410,8 +397,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
               }
               val (first, second) = (tagged("first"), tagged("second"))
               subscribed(shareConsumerSettings, topic) { consumer =>
-                consumer
-                  .records
+                consumer.records
                   .take(2)
                   .map { r =>
                     val f = if (r.record.value == "0") first else second
@@ -429,20 +415,19 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
 
     it("should keep the last acknowledgement of a record reached through several acknowledgers") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0", "1")
         // The first acknowledgement is slower, so that it would win if both were sent concurrently.
         val slow = new (IO ~> IO) {
           def apply[A](io: IO[A]): IO[A] = IO.sleep(1.second) *> io
         }
         val settings = shareConsumerSettings.withMaxPollRecords(2).withoutMaxAcknowledgementDelay
-        val seen     = run(
+        val seen = run(
           Ref
             .of[IO, Vector[(String, Int)]](Vector.empty)
             .flatMap { seen =>
               subscribed(settings, topic) { consumer =>
-                consumer
-                  .records
+                consumer.records
                   .take(3)
                   .evalTap(r => seen.update(_ :+ (r.record.value -> r.offset.deliveryCount.toInt)))
                   .flatMap { r =>
@@ -453,7 +438,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
                       Stream.chunk(
                         Chunk[(AcknowledgeableOffset[IO], AcknowledgeType)](
                           o.mapK(slow) -> AcknowledgeType.Accept,
-                          o            -> AcknowledgeType.Release
+                          o -> AcknowledgeType.Release
                         )
                       )
                     else Stream(o -> (AcknowledgeType.Accept: AcknowledgeType))
@@ -472,7 +457,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
 
     it("should settle every record once") {
       withTopic { topic =>
-        createCustomTopic(topic, partitions = 2)
+        createTopic(topic, partitions = 2)
         val produced = (0 until 30).map(_.toString)
         publish(topic, produced*)
         val consumed = run(
@@ -483,8 +468,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
                 .of[IO, Vector[(String, Int)]](Vector.empty)
                 .flatMap { seen =>
                   consumer.subscribeTo(topic) *>
-                    consumer
-                      .records
+                    consumer.records
                       .parEvalMapUnordered(4) { r =>
                         seen
                           .updateAndGet(_ :+ (r.record.value -> r.offset.deliveryCount.toInt))
@@ -505,21 +489,18 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
     it("should send a chunk's acknowledgements to each of its consumers") {
       withTopic { topic =>
         val other = topic + "-other"
-        createCustomTopic(topic)
-        createCustomTopic(other)
+        createTopic(topic)
+        createTopic(other)
         publish(topic, "a")
         publish(other, "b")
         val settings = shareConsumerSettings
         run(
-          (KafkaShareConsumer.resource(settings), KafkaShareConsumer.resource(settings))
-            .tupled
+          (KafkaShareConsumer.resource(settings), KafkaShareConsumer.resource(settings)).tupled
             .use { case (first, second) =>
               first.subscribeTo(topic) *> second.subscribeTo(other) *>
-                (first.records.take(1).compile.toList, second.records.take(1).compile.toList)
-                  .parTupled
+                (first.records.take(1).compile.toList, second.records.take(1).compile.toList).parTupled
                   .flatMap { case (a, b) =>
-                    fs2
-                      .Stream
+                    fs2.Stream
                       .emits((a ++ b).map(_.offset -> (AcknowledgeType.Accept: AcknowledgeType)))
                       .through(acknowledgeChunks[IO])
                       .compile
@@ -548,14 +529,13 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
 
     it("should accept the records of a poll once they have all been handed out") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         val produced = (0 until 6).map(_.toString)
         publish(topic, produced*)
         val settings = implicitSettings
         val consumed = run(
           subscribed(settings, topic) { consumer =>
-            consumer
-              .records
+            consumer.records
               .map(_.record.value)
               .evalTap(value => consumer.stopConsuming.whenA(value == produced.last))
               .compile
@@ -570,7 +550,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
 
     it("should not accept a poll whose records were not all handed out when the stream ends") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0", "1", "2")
         val settings = implicitSettings
         run(KafkaShareConsumer.stream(settings).subscribeTo(topic).records.take(1).compile.drain)
@@ -580,7 +560,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
 
     it("should fail acknowledgements with an ImplicitAcknowledgementException") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0")
         val result = run(
           KafkaShareConsumer
@@ -600,7 +580,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
   describe("batch_optimized acquisition") {
     it("should settle every record once") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         val produced = (0 until 20).map(_.toString)
         publish(topic, produced*)
         val consumed = run(
@@ -626,13 +606,12 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
   describe("renewal") {
     it("should acknowledge a record right after a renewal once the record is returned") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0")
         val settings = shareConsumerSettings
         run(
           subscribed(settings, topic) { consumer =>
-            consumer
-              .records
+            consumer.records
               .take(1)
               .evalMap(r =>
                 r.renew *>
@@ -647,14 +626,13 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
     }
     it("should send an acknowledgement for a renewed record while another record is slow") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0", "1")
         // The slow record outlives its lock too, so it needs automatic renewal.
         val settings = shareConsumerSettings.withAutoRenewal(true)
         run(
           subscribed(settings, topic) { consumer =>
-            consumer
-              .records
+            consumer.records
               .take(2)
               .parEvalMapUnordered(2) { r =>
                 if (r.record.value == "0")
@@ -672,12 +650,11 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
 
     it("should finish stopping after an unsubscribe while a renewal is pending") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0", "1")
         run(
           subscribed(shareConsumerSettings.withMaxPollRecords(2), topic) { consumer =>
-            consumer
-              .records
+            consumer.records
               .take(2)
               .parEvalMapUnordered(2) { r =>
                 if (r.record.value == "0") r.renew
@@ -692,13 +669,12 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
 
     it("should release a record held past the max processing time") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0")
         val settings = shareConsumerSettings
-        val late     = run(
+        val late = run(
           subscribed(settings.withMaxProcessingTime(3.seconds), topic) { consumer =>
-            consumer
-              .records
+            consumer.records
               .take(1)
               .evalMap(r => IO.sleep(5.seconds) *> r.accept.attempt)
               .compile
@@ -711,13 +687,12 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
     }
     it("should count the max processing time from the user's latest renewal") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0")
         val settings = shareConsumerSettings
-        val result   = run(
+        val result = run(
           subscribed(settings.withMaxProcessingTime(3.seconds), topic) { consumer =>
-            consumer
-              .records
+            consumer.records
               .take(1)
               .evalMap(r =>
                 IO.sleep(2.seconds) *> r.renew *>
@@ -733,10 +708,10 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
     }
     it("should renew a record automatically while it is processed past its lock") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0")
         val settings = shareConsumerSettings.withAutoRenewal(true)
-        val count    = run(
+        val count = run(
           KafkaShareConsumer
             .stream(settings)
             .subscribeTo(topic)
@@ -753,13 +728,12 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
 
     it("should keep renewing records processed downstream after the stream ended") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0", "1")
         val settings = shareConsumerSettings.withAutoRenewal(true)
-        val counts   = run(
+        val counts = run(
           subscribed(settings, topic) { consumer =>
-            consumer
-              .records
+            consumer.records
               .take(2)
               .parEvalMapUnordered(2)(r =>
                 IO.sleep(lock + 1.second) *> r.accept.as(r.offset.deliveryCount.toInt)
@@ -775,7 +749,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
 
     it("should keep a record past its lock with manual renewals only") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0")
         val settings = shareConsumerSettings
         run(
@@ -800,13 +774,12 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
     // rejects it once sent.
     it("should lose a record past its lock without renewal") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0", "1")
         val settings = shareConsumerSettings.withMaxPollRecords(2)
-        val late     = run(
+        val late = run(
           subscribed(settings.withAutoRenewal(false), topic) { consumer =>
-            consumer
-              .records
+            consumer.records
               .take(1)
               .evalMap(r => IO.sleep(lock + 1.second) *> r.accept.attempt)
               .compile
@@ -820,7 +793,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
 
     it("should accept a renewed record without waiting for the next renewal of the others") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0", "1")
         val elapsed = run(
           Deferred[IO, FiniteDuration].flatMap { first =>
@@ -841,9 +814,9 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
 
     it("should accept the rest of a poll while one record outlives its lock") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0", "1", "2", "3")
-        val settings       = shareConsumerSettings.withMaxPollRecords(4).withAutoRenewal(true)
+        val settings = shareConsumerSettings.withMaxPollRecords(4).withAutoRenewal(true)
         val acceptedBefore = run(
           Ref
             .of[IO, Vector[String]](Vector.empty)
@@ -873,7 +846,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
   describe("pausing") {
     it("should acquire no records while paused") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0")
         val (whilePaused, count) = run(
           SignallingRef[IO, Boolean](true).flatMap { paused =>
@@ -881,8 +854,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
               .of[IO, Option[Int]](None)
               .flatMap { seen =>
                 subscribed(shareConsumerSettings.withPauseWhen(paused), topic) { consumer =>
-                  consumer
-                    .records
+                  consumer.records
                     .take(1)
                     .evalMap(r => seen.set(Some(r.offset.deliveryCount.toInt)) *> r.accept)
                     .compile
@@ -890,11 +862,9 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
                     .background
                     .use(done =>
                       // Longer than joining the group and a first poll take.
-                      IO.sleep(10.seconds) *> seen
-                        .get
+                      IO.sleep(10.seconds) *> seen.get
                         .flatMap(before =>
-                          paused.set(false) *> done.flatMap(_.embedNever) *> seen
-                            .get
+                          paused.set(false) *> done.flatMap(_.embedNever) *> seen.get
                             .tupleLeft(before)
                         )
                     )
@@ -909,7 +879,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
 
     it("should send an acknowledgement made while paused") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0")
         val settings = shareConsumerSettings.withoutMaxAcknowledgementDelay
         run(
@@ -917,12 +887,9 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
             subscribed(settings.withPauseWhen(paused), topic) { consumer =>
               // The pause reaches the consumer before the acknowledgement, so that no poll sends it, and
               // the consumer stays open past the record's lock.
-              consumer
-                .records
+              consumer.records
                 .take(1)
-                .evalMap(r =>
-                  paused.set(true) *> IO.sleep(1.second) *> r.accept *> IO.sleep(lock + 1.second)
-                )
+                .evalMap(r => paused.set(true) *> IO.sleep(1.second) *> r.accept *> IO.sleep(lock + 1.second))
                 .compile
                 .drain
             }
@@ -934,14 +901,13 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
 
     it("should accept a taken poll while paused in implicit mode") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0")
         val settings = shareConsumerSettings.withProperty("share.acknowledgement.mode", "implicit")
         run(
           SignallingRef[IO, Boolean](false).flatMap { paused =>
             subscribed(settings.withPauseWhen(paused), topic) { consumer =>
-              consumer
-                .records
+              consumer.records
                 .evalMap(_ => paused.set(true))
                 .compile
                 .drain
@@ -958,14 +924,13 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
     // raises their delivery count, until the broker archives them unprocessed.
     it("should not raise the delivery count of new records while renewing during a pause") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0")
         val settings = shareConsumerSettings.withAutoRenewal(true)
-        val seen     = run(
+        val seen = run(
           SignallingRef[IO, Boolean](false).flatMap { paused =>
             subscribed(settings.withPauseWhen(paused), topic) { consumer =>
-              consumer
-                .records
+              consumer.records
                 .evalMap { r =>
                   val arrived = r.record.value -> r.offset.deliveryCount.toInt
                   if (r.record.value == "0")
@@ -988,10 +953,10 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
   describe("stopping") {
     it("should release the records of a poll the stream never took") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, (0 until 4).map(_.toString)*)
         // The stream ends after the first poll, so a second poll, if any, is never taken.
-        val settings          = shareConsumerSettings.withMaxPollRecords(2)
+        val settings = shareConsumerSettings.withMaxPollRecords(2)
         val (elapsed, others) = run(
           subscribed(settings, topic) { consumer =>
             consumer.records.take(2).evalMap(_.accept).compile.drain *> IO
@@ -1005,7 +970,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
     }
     it("should send the last acknowledgements before finishing after stopping") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0")
         val settings = shareConsumerSettings
         run(
@@ -1018,13 +983,12 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
     }
     it("should drain the records already polled on stopConsuming") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0", "1", "2")
         val settings = shareConsumerSettings.withMaxPollRecords(3)
-        val first    = run(
+        val first = run(
           subscribed(settings, topic) { consumer =>
-            consumer
-              .records
+            consumer.records
               .evalMap(r => consumer.stopConsuming *> r.accept.as(r.record.value))
               .compile
               .toVector <* consumer.awaitTermination
@@ -1039,7 +1003,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
 
     it("should release unacknowledged records on stopConsuming after the stream ended") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0", "1")
         val settings = shareConsumerSettings.withMaxPollRecords(2)
         run(
@@ -1054,7 +1018,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
 
     it("should release records never handed out when the stream ends") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0", "1", "2")
         val settings = shareConsumerSettings.withMaxPollRecords(3)
         run(
@@ -1068,7 +1032,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
             .drain
         )
         val start = System.nanoTime
-        val rest  = readUntil(topic, settings, "2")
+        val rest = readUntil(topic, settings, "2")
         (System.nanoTime - start).nanos should be < lock / 2
         rest shouldBe Vector("1" -> 2, "2" -> 2)
       }
@@ -1076,7 +1040,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
 
     it("should release records still processing when the consumer is closed") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         publish(topic, "0")
         val settings = shareConsumerSettings
         run(
@@ -1099,7 +1063,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
   describe("several consumers") {
     it("should return the union of the consumers' subscriptions") {
       withTopic { topic =>
-        createCustomTopic(topic)
+        createTopic(topic)
         val subscription = run(
           KafkaShareConsumer
             .resource(shareConsumerSettings, 2)
@@ -1113,7 +1077,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
 
     it("should settle every record once across merged records, with suffixed client ids") {
       withTopic { topic =>
-        createCustomTopic(topic, partitions = 3)
+        createTopic(topic, partitions = 3)
         val produced = (0 until 30).map(_.toString)
         publish(topic, produced*)
         val (clientIds, consumed) = run(
@@ -1121,8 +1085,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
             .resource(shareConsumerSettings.withClientId("app").withMaxPollRecords(5), 3)
             .use { consumers =>
               consumers.subscribeTo(topic) *>
-                consumers
-                  .records
+                consumers.records
                   .parEvalMapUnordered(8)(r => r.accept.as(r.record.value))
                   .take(produced.size.toLong)
                   .compile
@@ -1137,7 +1100,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
 
     it("should settle every record once with per-consumer records") {
       withTopic { topic =>
-        createCustomTopic(topic, partitions = 2)
+        createTopic(topic, partitions = 2)
         val produced = (0 until 20).map(_.toString)
         publish(topic, produced*)
         val consumed = run(
@@ -1145,8 +1108,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
             .resource(shareConsumerSettings.withMaxPollRecords(4), 2)
             .use { consumers =>
               consumers.subscribeTo(topic) *>
-                consumers
-                  .perConsumerRecords
+                consumers.perConsumerRecords
                   .map(
                     _.parEvalMapUnordered(4)(r => r.accept.as(r.record.value))
                   )

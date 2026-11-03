@@ -6,15 +6,15 @@
 
 package fs2.kafka
 
-import scala.collection.immutable.SortedSet
-
-import cats.data.NonEmptyVector
-import cats.effect.instances.spawn.*
-import cats.effect.Async
-import cats.syntax.all.*
 import cats.Reducible
-import fs2.kafka.consumer.{KafkaConsumerLifecycle, KafkaShareSubscription}
+import cats.data.NonEmptyVector
+import cats.effect.Async
+import cats.effect.instances.spawn.*
+import cats.syntax.all.*
 import fs2.Stream
+import fs2.kafka.consumer.KafkaConsumerLifecycle
+import fs2.kafka.consumer.KafkaShareSubscription
+import scala.collection.immutable.SortedSet
 
 /**
   * Share consumers of the same share group. Each has its own Java consumer underneath.
@@ -22,8 +22,8 @@ import fs2.Stream
   * Experimental: this API targets Kafka's share groups and may change in minor releases.
   */
 sealed abstract class KafkaShareConsumers[F[_], K, V]
-    extends KafkaShareSubscription[F]
-    with KafkaConsumerLifecycle[F] {
+  extends KafkaShareSubscription[F]
+  with KafkaConsumerLifecycle[F] {
 
   /**
     * The share consumers, in the order they were created.
@@ -101,8 +101,7 @@ object KafkaShareConsumers {
       override def records: Stream[F, AcknowledgeableConsumerRecord[F, K, V]] =
         Stream.emits(values.toVector).map(_.polls).parJoin(values.length).flatten
 
-      override def perConsumerRecords
-        : Stream[F, Stream[F, AcknowledgeableConsumerRecord[F, K, V]]] =
+      override def perConsumerRecords: Stream[F, Stream[F, AcknowledgeableConsumerRecord[F, K, V]]] =
         Stream.emits(values.toVector.map(_.records))
 
       override def stopConsuming: F[Unit] = values.parTraverse_(_.stopConsuming)

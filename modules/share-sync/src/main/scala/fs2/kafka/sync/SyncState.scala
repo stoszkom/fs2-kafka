@@ -6,12 +6,12 @@
 
 package fs2.kafka.sync
 
-import scala.collection.immutable.SortedSet
-import scala.concurrent.duration.{Duration, FiniteDuration}
-
+import fs2.kafka.KafkaByteConsumerRecord
 import fs2.kafka.instances.fs2KafkaTopicPartitionOrdering
 import fs2.kafka.internal.actor.TopicPartitionOffset
-import fs2.kafka.KafkaByteConsumerRecord
+import scala.collection.immutable.SortedSet
+import scala.concurrent.duration.Duration
+import scala.concurrent.duration.FiniteDuration
 
 /**
   * A delivery of a record of the poll being processed.
@@ -168,8 +168,8 @@ private[sync] object SyncState {
       unsentSince = None,
       lockedSince = polledAt,
       lock = reportedLock.orElse(previous.lock),
-      timed = SortedSet.empty[(FiniteDuration, TopicPartitionOffset)] ++ deliveries.map {
-        case (p, d) => d.heldSince -> p
+      timed = SortedSet.empty[(FiniteDuration, TopicPartitionOffset)] ++ deliveries.map { case (p, d) =>
+        d.heldSince -> p
       }
     )
 

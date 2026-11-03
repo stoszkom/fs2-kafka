@@ -6,8 +6,12 @@
 
 package fs2.kafka
 
-import cats.{Applicative, Bitraverse, Eq, Eval, Show, Traverse}
-import cats.~>
+import cats.Applicative
+import cats.Bitraverse
+import cats.Eq
+import cats.Eval
+import cats.Show
+import cats.Traverse
 import cats.syntax.bifoldable.*
 import cats.syntax.bitraverse.*
 import cats.syntax.eq.*
@@ -15,6 +19,7 @@ import cats.syntax.foldable.*
 import cats.syntax.functor.*
 import cats.syntax.show.*
 import cats.syntax.traverse.*
+import cats.~>
 
 /**
   * [[AcknowledgeableConsumerRecord]] is a Kafka record along with an instance of
@@ -126,8 +131,7 @@ object AcknowledgeableConsumerRecord {
       )(f: A => G[C], g: B => G[D])(implicit
         G: Applicative[G]
       ): G[AcknowledgeableConsumerRecord[F, C, D]] =
-        fab
-          .record
+        fab.record
           .bitraverse(f, g)
           .map { (cd: ConsumerRecord[C, D]) =>
             AcknowledgeableConsumerRecord(cd, fab.offset)

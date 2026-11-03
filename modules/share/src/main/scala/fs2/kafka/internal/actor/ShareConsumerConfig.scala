@@ -6,12 +6,10 @@
 
 package fs2.kafka.internal.actor
 
-import scala.concurrent.duration.*
-
 import cats.effect.Sync
 import fs2.kafka.ShareConsumerSettings
-
 import org.apache.kafka.clients.consumer.ConsumerConfig
+import scala.concurrent.duration.*
 
 /**
   * What a share consumer reads from its settings and the Java consumer's properties, resolved once.
@@ -64,10 +62,8 @@ private[kafka] object ShareConsumerConfig {
 
       ShareConsumerConfig(
         settings = if (implicitMode) settings.withAutoRenewal(false) else settings,
-        maxPollInterval = property(ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG, 300000L)(_.toLong)
-          .millis,
-        apiTimeout = property(ConsumerConfig.DEFAULT_API_TIMEOUT_MS_CONFIG, 60000L)(_.toLong)
-          .millis,
+        maxPollInterval = property(ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG, 300000L)(_.toLong).millis,
+        apiTimeout = property(ConsumerConfig.DEFAULT_API_TIMEOUT_MS_CONFIG, 60000L)(_.toLong).millis,
         implicitMode = implicitMode
       )
     }

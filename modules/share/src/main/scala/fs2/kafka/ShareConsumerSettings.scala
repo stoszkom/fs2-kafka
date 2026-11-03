@@ -6,12 +6,10 @@
 
 package fs2.kafka
 
-import scala.concurrent.duration.*
-
 import cats.effect.Resource
 import fs2.concurrent.Signal
-
 import org.apache.kafka.clients.consumer.ConsumerConfig
+import scala.concurrent.duration.*
 
 /**
   * [[ShareConsumerSettings]] contain settings necessary to create a [[KafkaShareConsumer]]. At the
@@ -132,7 +130,7 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
     withProperty(
       ConsumerConfig.SHARE_ACQUIRE_MODE_CONFIG,
       mode match {
-        case ShareAcquireMode.RecordLimitAcquire    => "record_limit"
+        case ShareAcquireMode.RecordLimitAcquire => "record_limit"
         case ShareAcquireMode.BatchOptimizedAcquire => "batch_optimized"
       }
     )
@@ -418,10 +416,10 @@ object ShareConsumerSettings {
       copy(pauseWhen = None)
 
     override def toString: String =
-      s"ShareConsumerSettings(closeTimeout = $closeTimeout, pollTimeout = $pollTimeout, commitTimeout = $commitTimeout, autoRenewal = $autoRenewal, renewalMargin = $renewalMargin, maxProcessingTime = $maxProcessingTime, maxAcknowledgementDelay = $maxAcknowledgementDelay, pauseWhen = ${if (
-          pauseWhen.isDefined
-        ) "Some(<signal>)"
-        else "None"})"
+      s"ShareConsumerSettings(closeTimeout = $closeTimeout, pollTimeout = $pollTimeout, commitTimeout = $commitTimeout, autoRenewal = $autoRenewal, renewalMargin = $renewalMargin, maxProcessingTime = $maxProcessingTime, maxAcknowledgementDelay = $maxAcknowledgementDelay, pauseWhen = ${
+          if (pauseWhen.isDefined) "Some(<signal>)"
+          else "None"
+        })"
 
   }
 

@@ -6,9 +6,10 @@
 
 package fs2.kafka
 
-import cats.syntax.all.*
 import cats.MonadThrow
-import fs2.{Chunk, Pipe}
+import cats.syntax.all.*
+import fs2.Chunk
+import fs2.Pipe
 
 /**
   * Acknowledges the records of each chunk with one call per run of records of the same consumer,
@@ -40,11 +41,9 @@ object acknowledgeChunks {
   private def acknowledge[F[_]](
     acks: Vector[(AcknowledgeableOffset[F], AcknowledgeType)]
   )(implicit F: MonadThrow[F]): F[Unit] =
-    acks
-      .headOption
+    acks.headOption
       .traverse_(
-        _._1
-          .acknowledger
+        _._1.acknowledger
           .acknowledge(Chunk.from(acks.map { case (offset, kind) => offset.ack(kind) }))
       )
       .recover { case _: RecordNotInFlightException => () }

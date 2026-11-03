@@ -17,9 +17,9 @@ import org.apache.kafka.common.TopicPartition
   * again, so the acknowledgement can usually be dropped.
   */
 sealed abstract class RecordNotInFlightException(topicPartition: TopicPartition, offset: Long)
-    extends KafkaException(
-      s"record at offset $offset of $topicPartition is not in flight on this share consumer"
-    )
+  extends KafkaException(
+    s"record at offset $offset of $topicPartition is not in flight on this share consumer"
+  )
 
 private[kafka] object RecordNotInFlightException {
 

@@ -6,11 +6,10 @@
 
 package fs2.kafka
 
-import scala.concurrent.duration.*
-
-import cats.effect.unsafe.implicits.global
 import cats.effect.IO
+import cats.effect.unsafe.implicits.global
 import fs2.kafka.internal.actor.ShareConsumerConfig
+import scala.concurrent.duration.*
 
 final class ShareConsumerConfigSpec extends BaseSpec {
 
@@ -46,8 +45,7 @@ final class ShareConsumerConfigSpec extends BaseSpec {
       val c = config(settings)
       assert(c.renewalInterval(Some(30.seconds)) == 25.seconds)
       assert(
-        config(settings.withRenewalMargin(40.seconds)).renewalInterval(Some(30.seconds)) == 15
-          .seconds
+        config(settings.withRenewalMargin(40.seconds)).renewalInterval(Some(30.seconds)) == 15.seconds
       )
       assert(c.renewalInterval(None) == ShareConsumerConfig.unknownLockRenewalInterval)
     }

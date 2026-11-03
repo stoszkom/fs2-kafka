@@ -6,10 +6,11 @@
 
 package fs2.kafka.internal.actor
 
+import fs2.kafka.internal.LogEntry
+import fs2.kafka.internal.LogLevel
+import fs2.kafka.internal.LogLevel.Debug
+import fs2.kafka.internal.LogLevel.Warn
 import scala.concurrent.duration.FiniteDuration
-
-import fs2.kafka.internal.{LogEntry, LogLevel}
-import fs2.kafka.internal.LogLevel.{Debug, Warn}
 
 /**
   * What a [[KafkaShareConsumerActor]] logs, like `LogEntry` for `KafkaConsumerActor`.

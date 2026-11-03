@@ -6,10 +6,9 @@
 
 package fs2.kafka.consumer
 
-import scala.collection.immutable.SortedSet
-
-import cats.data.NonEmptyList
 import cats.Reducible
+import cats.data.NonEmptyList
+import scala.collection.immutable.SortedSet
 
 trait KafkaShareSubscription[F[_]] {
 

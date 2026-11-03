@@ -6,14 +6,14 @@
 
 package fs2.kafka
 
-import cats.~>
-import cats.syntax.all.*
 import cats.Eq
 import cats.Show
-import fs2.kafka.instances.*
-import fs2.kafka.internal.actor.{Acknowledgement, Acknowledger}
+import cats.syntax.all.*
+import cats.~>
 import fs2.Chunk
-
+import fs2.kafka.instances.*
+import fs2.kafka.internal.actor.Acknowledgement
+import fs2.kafka.internal.actor.Acknowledger
 import org.apache.kafka.common.TopicPartition
 
 /**
@@ -94,8 +94,7 @@ object AcknowledgeableOffset {
   ) extends AcknowledgeableOffset[F] {
 
     override def toString: String =
-      s"AcknowledgeableOffset(${topicPartition.show} -> $offset, deliveryCount = ${deliveryCount
-          .toInt})"
+      s"AcknowledgeableOffset(${topicPartition.show} -> $offset, deliveryCount = ${deliveryCount.toInt})"
 
   }
 

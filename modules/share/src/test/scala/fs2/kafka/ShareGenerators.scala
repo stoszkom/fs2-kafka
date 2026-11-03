@@ -7,10 +7,12 @@
 package fs2.kafka
 
 import cats.ApplicativeThrow
-import fs2.kafka.internal.actor.{Acknowledgement, Acknowledger}
 import fs2.Chunk
-
-import org.scalacheck.{Arbitrary, Cogen, Gen}
+import fs2.kafka.internal.actor.Acknowledgement
+import fs2.kafka.internal.actor.Acknowledger
+import org.scalacheck.Arbitrary
+import org.scalacheck.Cogen
+import org.scalacheck.Gen
 import org.scalacheck.rng.Seed
 
 trait ShareGenerators extends BaseGenerators {
@@ -23,13 +25,12 @@ trait ShareGenerators extends BaseGenerators {
   def genAcknowledgeableOffset[F[_]: ApplicativeThrow]: Gen[AcknowledgeableOffset[F]] =
     for {
       topicPartition <- genTopicPartition
-      offset         <- Gen.posNum[Long]
-      deliveryCount  <- Gen.choose[Short](1, 10)
-      acknowledger   <- genAcknowledger[F]
+      offset <- Gen.posNum[Long]
+      deliveryCount <- Gen.choose[Short](1, 10)
+      acknowledger <- genAcknowledger[F]
     } yield AcknowledgeableOffset[F](topicPartition, offset, deliveryCount, acknowledger)
 
-  implicit def arbAcknowledgeableOffset[F[_]: ApplicativeThrow]
-    : Arbitrary[AcknowledgeableOffset[F]] =
+  implicit def arbAcknowledgeableOffset[F[_]: ApplicativeThrow]: Arbitrary[AcknowledgeableOffset[F]] =
     Arbitrary(genAcknowledgeableOffset[F])
 
   implicit def cogenAcknowledgeableOffset[F[_]]: Cogen[AcknowledgeableOffset[F]] =

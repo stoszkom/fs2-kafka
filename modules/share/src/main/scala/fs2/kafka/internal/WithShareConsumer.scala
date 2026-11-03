@@ -6,9 +6,11 @@
 
 package fs2.kafka.internal
 
-import cats.effect.{Async, Resource}
+import cats.effect.Async
+import cats.effect.Resource
 import cats.syntax.all.*
-import fs2.kafka.{KafkaByteShareConsumer, ShareConsumerSettings}
+import fs2.kafka.KafkaByteShareConsumer
+import fs2.kafka.ShareConsumerSettings
 import fs2.kafka.consumer.MkShareConsumer
 import fs2.kafka.internal.syntax.*
 

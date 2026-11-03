@@ -6,37 +6,38 @@
 
 package fs2.kafka.sync
 
-import scala.collection.immutable.SortedSet
-import scala.concurrent.duration.*
-
-import cats.effect.{Async, Deferred, Ref, Resource}
+import cats.Reducible
+import cats.effect.Async
+import cats.effect.Deferred
+import cats.effect.Ref
+import cats.effect.Resource
 import cats.effect.std.Mutex
 import cats.effect.syntax.all.*
 import cats.syntax.all.*
-import cats.Reducible
-import fs2.{Chunk, Stream}
+import fs2.Chunk
+import fs2.Stream
 import fs2.concurrent.SignallingRef
 import fs2.kafka.*
-import fs2.kafka.consumer.{KafkaMetrics, KafkaShareSubscription, MkShareConsumer}
-import fs2.kafka.internal.actor.{
-  Acknowledgement,
-  Acknowledger,
-  ShareConsumerConfig,
-  TopicPartitionOffset
-}
-import fs2.kafka.internal.actor.KafkaShareConsumerActor.{
-  acquisitionLock,
-  commitSync,
-  deliveryCountOf,
-  offsetOf,
-  subscriptionCheckInterval
-}
+import fs2.kafka.consumer.KafkaMetrics
+import fs2.kafka.consumer.KafkaShareSubscription
+import fs2.kafka.consumer.MkShareConsumer
+import fs2.kafka.internal.WithShareConsumer
+import fs2.kafka.internal.actor.Acknowledgement
+import fs2.kafka.internal.actor.Acknowledger
+import fs2.kafka.internal.actor.KafkaShareConsumerActor.acquisitionLock
+import fs2.kafka.internal.actor.KafkaShareConsumerActor.commitSync
+import fs2.kafka.internal.actor.KafkaShareConsumerActor.deliveryCountOf
+import fs2.kafka.internal.actor.KafkaShareConsumerActor.offsetOf
+import fs2.kafka.internal.actor.KafkaShareConsumerActor.subscriptionCheckInterval
+import fs2.kafka.internal.actor.ShareConsumerConfig
+import fs2.kafka.internal.actor.TopicPartitionOffset
 import fs2.kafka.internal.converters.collection.*
 import fs2.kafka.internal.syntax.*
-import fs2.kafka.internal.WithShareConsumer
-
-import org.apache.kafka.common.{Metric, MetricName}
+import org.apache.kafka.common.Metric
+import org.apache.kafka.common.MetricName
 import org.apache.kafka.common.errors.TimeoutException
+import scala.collection.immutable.SortedSet
+import scala.concurrent.duration.*
 
 /**
   * A share consumer which runs Java's loop: it polls, runs `process` on the poll's records, and
@@ -44,9 +45,7 @@ import org.apache.kafka.common.errors.TimeoutException
   * straight into the Java consumer, under a mutex shared with the renewals and delayed sends which
   * run meanwhile.
   */
-sealed abstract class SyncShareConsumer[F[_], K, V]
-    extends KafkaShareSubscription[F]
-    with KafkaMetrics[F] {
+sealed abstract class SyncShareConsumer[F[_], K, V] extends KafkaShareSubscription[F] with KafkaMetrics[F] {
 
   /**
     * Returns the settings used to create the consumer instance.
@@ -87,11 +86,11 @@ object SyncShareConsumer {
     settings: ShareConsumerSettings[F, K, V]
   )(implicit F: Async[F], mk: MkShareConsumer[F]): Resource[F, SyncShareConsumer[F, K, V]] =
     for {
-      keyDeserializer   <- settings.keyDeserializer
+      keyDeserializer <- settings.keyDeserializer
       valueDeserializer <- settings.valueDeserializer
-      config            <- Resource.eval(ShareConsumerConfig.from(settings))
-      withConsumer      <- WithShareConsumer(mk, settings)
-      consumer          <-
+      config <- Resource.eval(ShareConsumerConfig.from(settings))
+      withConsumer <- WithShareConsumer(mk, settings)
+      consumer <-
         Resource.eval(
           (
             Mutex[F],
@@ -122,8 +121,8 @@ object SyncShareConsumer {
     // In implicit mode, after `process` failed: any poll or commit would accept its records.
     poisoned: Ref[F, Boolean]
   )(implicit F: Async[F])
-      extends SyncShareConsumer[F, K, V]
-      with Acknowledger[F] {
+    extends SyncShareConsumer[F, K, V]
+    with Acknowledger[F] {
 
     override val settings: ShareConsumerSettings[F, K, V] = config.settings
 
@@ -170,19 +169,17 @@ object SyncShareConsumer {
         )
 
     private def exclusively(run: F[Unit]): F[Unit] =
-      poisoned
-        .get
+      poisoned.get
         .ifM(
           F.raiseError(
             new IllegalStateException(
               "process failed in implicit mode: close the consumer, which releases its records"
             )
           ),
-          stop
-            .tryGet
+          stop.tryGet
             .flatMap {
               case Some(_) => F.raiseError(new IllegalStateException("the consumer was stopped"))
-              case None    => consumingOnce(run)
+              case None => consumingOnce(run)
             }
         )
 
@@ -205,19 +202,18 @@ object SyncShareConsumer {
       // A stop already requested wins: racing it against a wait which is already complete could pick
       // the wait and poll again.
       lazy val next: F[Unit] =
-        stop
-          .tryGet
+        stop.tryGet
           .flatMap {
             case Some(_) => F.pure(().asLeft[Unit])
-            case None    => F.race(stop.get, unpaused)
+            case None => F.race(stop.get, unpaused)
           }
           .flatMap {
-            case Left(_)  => finalCommit
+            case Left(_) => finalCommit
             case Right(_) =>
               F.monotonic
                 .flatMap { start =>
                   poll.flatMap {
-                    case None                  => F.sleep(subscriptionCheckInterval) *> next
+                    case None => F.sleep(subscriptionCheckInterval) *> next
                     case Some((records, lock)) =>
                       run(records, start, lock).whenA(records.nonEmpty) *> next
                   }
@@ -263,9 +259,7 @@ object SyncShareConsumer {
               .flatMap { chunk =>
                 // The timers only end by failing, which cancels `process` and fails `consume`.
                 F.race(F.both(timers, sendsWhenPaused) *> F.never[Unit], process(chunk)).void
-              }).guaranteeCase(outcome =>
-            mutex.lock.surround(releaseUnacked(ended = !outcome.isSuccess))
-          )
+              }).guaranteeCase(outcome => mutex.lock.surround(releaseUnacked(ended = !outcome.isSuccess)))
         }
 
     private def decode(record: KafkaByteConsumerRecord): F[AcknowledgeableConsumerRecord[F, K, V]] =
@@ -283,8 +277,7 @@ object SyncShareConsumer {
     // when `consume` ended, as no poll follows. The poll is then closed, so that a late
     // acknowledgement fails rather than replace a release.
     private def releaseUnacked(ended: Boolean): F[Unit] =
-      state
-        .get
+      state.get
         .flatMap { s =>
           release(s.unacked) *> (if (ended) send else paused.ifM(send, F.unit)) *>
             state.update(_.closed)
@@ -294,20 +287,17 @@ object SyncShareConsumer {
 
     // The last acknowledgement of a delivery wins, as in Java.
     override def acknowledge(acks: Chunk[Acknowledgement]): F[Unit] =
-      mutex
-        .lock
+      mutex.lock
         .surround(
-          state
-            .get
+          state.get
             .flatMap { s =>
-              val last            = acks.toVector.map(a => a.offset -> a).toMap.values.toVector
+              val last = acks.toVector.map(a => a.offset -> a).toMap.values.toVector
               val (held, notHeld) = last.partition(a => s.holds(a.offset, a.deliveryCount))
               val (renewals, now) = held.partition(_.acknowledgeType == AcknowledgeType.Renew)
               recordInJava(s, now.map(a => a.offset -> a.acknowledgeType)).flatMap { gone =>
                 renew(renewals.map(_.offset).toSet).whenA(renewals.nonEmpty) *>
                   paused.ifM(send, F.unit) *>
-                  (notHeld.map(_.offset) ++ gone)
-                    .headOption
+                  (notHeld.map(_.offset) ++ gone).headOption
                     .traverse_(p => F.raiseError[Unit](RecordNotInFlightException(p._1, p._2)))
               }
             }
@@ -343,8 +333,7 @@ object SyncShareConsumer {
       state.get.flatMap(s => recordInJava(s, offsets.map(_ -> AcknowledgeType.Release))).void
 
     private def send: F[Unit] =
-      state
-        .get
+      state.get
         .flatMap(s =>
           (withConsumer.blocking(_.commitAsync()) *> state.update(_.withoutAcked)).whenA(
             s.hasUnsent
@@ -359,11 +348,10 @@ object SyncShareConsumer {
       * records count as lost. The wait is the renewal margin, at most half the lock.
       */
     private def renew(byUser: Set[TopicPartitionOffset]): F[Unit] =
-      (state.get, F.monotonic)
-        .tupled
+      (state.get, F.monotonic).tupled
         .flatMap { case (s, at) =>
           val renewing = (s.unacked.toSet ++ byUser).toVector
-          val timeout  = config.renewalWait(s.lock)
+          val timeout = config.renewalWait(s.lock)
           withConsumer
             .blocking { consumer =>
               val failed = renewing.filter { p =>
@@ -384,7 +372,7 @@ object SyncShareConsumer {
               )
             }
             .flatMap { case (failed, polled, lock) =>
-              val asked             = renewing.toSet -- failed
+              val asked = renewing.toSet -- failed
               val (returned, stray) = polled.partition { r =>
                 val p = offsetOf(r)
                 asked(p) && s.holds(p, deliveryCountOf(r))
@@ -406,12 +394,11 @@ object SyncShareConsumer {
     // Wakes at the earliest of the renewal, the delayed send and the max processing time, and does
     // what is due. The deadline is recomputed when the state changes it.
     private def timers: F[Unit] =
-      state
-        .discrete
+      state.discrete
         .map(nextDeadline)
         .changes(cats.Eq.fromUniversalEquals[Option[FiniteDuration]])
         .switchMap {
-          case None     => Stream.empty
+          case None => Stream.empty
           case Some(at) =>
             // `due` changes the deadline, which switches to a new inner stream: uncancelable, so
             // that the switch can't stop it between a release and its send.
@@ -433,8 +420,7 @@ object SyncShareConsumer {
     private def nextDeadline(s: SyncState): Option[FiniteDuration] = deadlines(s).next
 
     private def due: F[Unit] =
-      (state.get, F.monotonic)
-        .tupled
+      (state.get, F.monotonic).tupled
         .flatMap { case (s, now) =>
           val d = deadlines(s)
           // Overdue records are released and sent at once, so that a late acknowledgement can't replace it.
@@ -447,8 +433,7 @@ object SyncShareConsumer {
 
     // While paused, no poll sends acknowledgements: those pending as the pause starts are sent then.
     private def sendsWhenPaused: F[Unit] =
-      settings
-        .pauseWhen
+      settings.pauseWhen
         .traverse_(
           _.discrete.filter(identity).evalMap(_ => mutex.lock.surround(send)).compile.drain
         )

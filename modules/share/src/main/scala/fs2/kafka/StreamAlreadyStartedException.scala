@@ -13,7 +13,7 @@ import org.apache.kafka.common.KafkaException
   * started more than once. Each share consumer has a single record stream.
   */
 sealed abstract class StreamAlreadyStartedException
-    extends KafkaException("the record stream of this share consumer has already been started")
+  extends KafkaException("the record stream of this share consumer has already been started")
 
 private[kafka] object StreamAlreadyStartedException {
 

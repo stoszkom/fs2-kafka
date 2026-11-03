@@ -6,12 +6,13 @@
 
 package fs2.kafka.internal.actor
 
-import scala.collection.immutable.SortedSet
-import scala.concurrent.duration.FiniteDuration
-
-import fs2.kafka.{AcknowledgeType, KafkaByteConsumerRecord, RecordNotInFlightException}
+import fs2.kafka.AcknowledgeType
+import fs2.kafka.KafkaByteConsumerRecord
+import fs2.kafka.RecordNotInFlightException
 import fs2.kafka.instances.fs2KafkaTopicPartitionOrdering
 import fs2.kafka.internal.syntax.*
+import scala.collection.immutable.SortedSet
+import scala.concurrent.duration.FiniteDuration
 
 /**
   * A delivery of a record held by the consumer.
@@ -167,8 +168,7 @@ final private[kafka] case class ShareState[F[_]](
     val (renewed, final_) = last.partition(_._2 == AcknowledgeType.Renew)
     copy(
       timed = timed -- timedEntries(last.keySet ++ gone),
-      held = held ++ renewed
-        .keySet
+      held = held ++ renewed.keySet
         .map { p =>
           p -> held(p).copy(lockedSince = at, heldSince = if (byUser) at else held(p).heldSince)
         },
@@ -188,14 +188,14 @@ final private[kafka] case class ShareState[F[_]](
     reportedLock: Option[FiniteDuration]
   ): ShareState[F] = {
     val returned = returnedRecords.map { case (p, r) => p -> held(p).copy(record = r) }
-    val fresh    = admitted.map(_._1) ++ rejected.map(_._1)
+    val fresh = admitted.map(_._1) ++ rejected.map(_._1)
     // A poll with new records means no renewal is pending: those not returned failed.
-    val notReturned           = renewing -- returned.map(_._1)
+    val notReturned = renewing -- returned.map(_._1)
     val (stillRenewing, lost) =
       if (fresh.nonEmpty) (Set.empty[TopicPartitionOffset], notReturned)
       else (notReturned, Set.empty[TopicPartitionOffset])
     val nextUnpulled = if (admitted.isEmpty) unpulled -- lost else admitted.map(_._1).toSet
-    val newlyHeld    = returned ++ rejected ++ (if (implicitMode) Vector.empty else admitted)
+    val newlyHeld = returned ++ rejected ++ (if (implicitMode) Vector.empty else admitted)
     copy(
       // Only the records of this poll are held besides the renewing ones, which are not timed.
       timed = SortedSet.empty[(FiniteDuration, TopicPartitionOffset)] ++ newlyHeld.collect {
@@ -223,8 +223,7 @@ final private[kafka] case class ShareState[F[_]](
     else
       copy(
         held = held ++ unpulled.flatMap(p => held.get(p).map(h => p -> h.copy(heldSince = at))),
-        timed =
-          timed ++ unpulled.filter(p => held.contains(p) && !acked(p) && !renewing(p)).map(at -> _),
+        timed = timed ++ unpulled.filter(p => held.contains(p) && !acked(p) && !renewing(p)).map(at -> _),
         unpulled = Set.empty,
         acceptPending = acceptPending || implicitMode
       )
@@ -240,9 +239,9 @@ final private[kafka] case class ShareState[F[_]](
     deliveryCount: Short,
     result: Either[Throwable, Unit]
   ): (ShareState[F], Vector[F[Unit]]) = {
-    val delivery      = offset -> deliveryCount
-    val (hit, rest)   = waiters.partition(_.deliveries(delivery))
-    val left          = hit.map(w => w.copy(deliveries = w.deliveries - delivery))
+    val delivery = offset -> deliveryCount
+    val (hit, rest) = waiters.partition(_.deliveries(delivery))
+    val left = hit.map(w => w.copy(deliveries = w.deliveries - delivery))
     val (ready, keep) =
       if (result.isLeft) (hit, Vector.empty) else left.partition(_.deliveries.isEmpty)
     (copy(waiters = rest ++ keep), ready.map(_.done(result)))

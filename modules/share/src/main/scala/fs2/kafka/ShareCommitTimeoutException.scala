@@ -6,9 +6,8 @@
 
 package fs2.kafka
 
-import scala.concurrent.duration.FiniteDuration
-
 import org.apache.kafka.common.errors.TimeoutException
+import scala.concurrent.duration.FiniteDuration
 
 /**
   * [[ShareCommitTimeoutException]] indicates that the broker did not confirm a share consumer's
@@ -16,7 +15,7 @@ import org.apache.kafka.common.errors.TimeoutException
   * pending acknowledgements may still have been applied.
   */
 sealed abstract class ShareCommitTimeoutException(timeout: FiniteDuration, cause: Throwable)
-    extends TimeoutException(s"share commit timeout after $timeout") {
+  extends TimeoutException(s"share commit timeout after $timeout") {
 
   initCause(cause)
 

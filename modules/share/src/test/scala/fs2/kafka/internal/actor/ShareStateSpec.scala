@@ -6,15 +6,15 @@
 
 package fs2.kafka.internal.actor
 
-import scala.collection.immutable.SortedSet
-import scala.concurrent.duration.*
-
 import cats.effect.IO
-import fs2.kafka.{AcknowledgeType, BaseSpec, KafkaByteConsumerRecord}
+import fs2.kafka.AcknowledgeType
+import fs2.kafka.BaseSpec
+import fs2.kafka.KafkaByteConsumerRecord
 import fs2.kafka.instances.fs2KafkaTopicPartitionOrdering
-
 import org.apache.kafka.clients.consumer.ConsumerRecord
 import org.apache.kafka.common.TopicPartition
+import scala.collection.immutable.SortedSet
+import scala.concurrent.duration.*
 
 final class ShareStateSpec extends BaseSpec {
 
@@ -42,7 +42,7 @@ final class ShareStateSpec extends BaseSpec {
         state
       }
       val ack = (p: Long, kind: AcknowledgeType) => Map(offset(p) -> kind)
-      val s0  = checked(
+      val s0 = checked(
         ShareState
           .initial[IO](implicitMode = false, paused = false)
           .polled(

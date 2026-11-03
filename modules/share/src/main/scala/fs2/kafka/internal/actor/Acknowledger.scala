@@ -7,8 +7,8 @@
 package fs2.kafka.internal.actor
 
 import cats.~>
-import fs2.kafka.AcknowledgeType
 import fs2.Chunk
+import fs2.kafka.AcknowledgeType
 
 // An acknowledgement for one delivery of a record.
 final private[kafka] case class Acknowledgement(
@@ -29,7 +29,7 @@ private[kafka] trait Acknowledger[F[_]] {
 private[kafka] object Acknowledger {
 
   final private case class Mapped[F[_], G[_]](underlying: Acknowledger[F], f: F ~> G)
-      extends Acknowledger[G] {
+    extends Acknowledger[G] {
 
     override def acknowledge(acks: Chunk[Acknowledgement]): G[Unit] = f(
       underlying.acknowledge(acks)

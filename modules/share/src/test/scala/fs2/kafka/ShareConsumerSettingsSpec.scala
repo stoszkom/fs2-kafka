@@ -6,9 +6,8 @@
 
 package fs2.kafka
 
-import scala.concurrent.duration.*
-
 import cats.effect.IO
+import scala.concurrent.duration.*
 
 final class ShareConsumerSettingsSpec extends BaseSpec {
 
@@ -18,7 +17,7 @@ final class ShareConsumerSettingsSpec extends BaseSpec {
     it("should default to explicit acknowledgement, record_limit acquisition and no renewal") {
       settings.properties shouldBe Map(
         "share.acknowledgement.mode" -> "explicit",
-        "share.acquire.mode"         -> "record_limit"
+        "share.acquire.mode" -> "record_limit"
       )
       settings.autoRenewal shouldBe false
       settings.withAutoRenewal(true).autoRenewal shouldBe true
@@ -42,7 +41,7 @@ final class ShareConsumerSettingsSpec extends BaseSpec {
         .withAcquireMode(ShareAcquireMode.BatchOptimized)
         .properties shouldBe Map(
         "share.acknowledgement.mode" -> "implicit",
-        "share.acquire.mode"         -> "batch_optimized"
+        "share.acquire.mode" -> "batch_optimized"
       )
       settings
         .withAcknowledgementMode(ShareAcknowledgementMode.Explicit)

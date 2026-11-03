@@ -14,9 +14,9 @@ import org.apache.kafka.common.KafkaException
   * commit instead, as with Java's share consumer.
   */
 sealed abstract class ImplicitAcknowledgementException
-    extends KafkaException(
-      "records cannot be acknowledged with share.acknowledgement.mode=implicit; they are accepted by the next poll"
-    )
+  extends KafkaException(
+    "records cannot be acknowledged with share.acknowledgement.mode=implicit; they are accepted by the next poll"
+  )
 
 private[kafka] object ImplicitAcknowledgementException {
 

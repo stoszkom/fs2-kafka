@@ -6,8 +6,8 @@
 
 package fs2.kafka.consumer
 
-import fs2.kafka.AcknowledgeableConsumerRecord
 import fs2.Stream
+import fs2.kafka.AcknowledgeableConsumerRecord
 
 trait KafkaShareConsume[F[_], K, V] {
 
