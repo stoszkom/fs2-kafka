@@ -216,6 +216,7 @@ Deciding when to pause is up to us: a circuit breaker, a health check, or failur
 
 - Records already taken by the stream are processed and acknowledged as usual. As no poll comes, their acknowledgements are sent at once, and in implicit mode, a poll the stream took is accepted with a commit, as no poll accepts it. Auto-renewal keeps renewing records still held; the polls which return renewed records fetch no new ones, and a new record one still returns, e.g. after a renewal timed out, is released at once.
 - With no records held, a pause longer than `max.poll.interval.ms` makes Java leave the share group; the first poll after it rejoins. Nothing is acquired meanwhile, so nothing is lost.
+- If the last poll before the pause returned nothing, Java keeps fetching in the background until it acquires records, once. Those records wait in its buffer until their lock expires, and are delivered after the pause with a delivery count one higher.
 - `stopConsuming` still finishes, with its final commit.
 
 Pausing stops new records. For a record whose processing fails while the service is down, retry it rather than releasing it: keep it unacknowledged, with auto-renewal holding its lock, so that its delivery count does not grow.
