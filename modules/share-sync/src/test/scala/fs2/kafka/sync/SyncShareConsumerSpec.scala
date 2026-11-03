@@ -171,6 +171,23 @@ final class SyncShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       }
     }
 
+    it("should fail to consume again once stopped") {
+      withTopic { topic =>
+        createCustomTopic(topic)
+        publish(topic, "0")
+        val again = run(
+          SyncShareConsumer
+            .resource(shareConsumerSettings)
+            .use { consumer =>
+              consumer.subscribeTo(topic) *>
+                consumer.consume(_.traverse_(_.accept) *> consumer.stopConsuming) *>
+                consumer.consume(_ => IO.unit).attempt
+            }
+        )
+        again.left.toOption.map(_.getMessage) shouldBe Some("the consumer was stopped")
+      }
+    }
+
     it("should fail an acknowledgement made after process returned") {
       withTopic { topic =>
         createCustomTopic(topic)

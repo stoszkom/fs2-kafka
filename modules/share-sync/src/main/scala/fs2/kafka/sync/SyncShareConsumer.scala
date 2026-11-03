@@ -68,7 +68,8 @@ sealed abstract class SyncShareConsumer[F[_], K, V]
 
   /**
     * Makes [[consume]] or [[autoConsume]] return once the poll being processed is done and the last
-    * acknowledgements are sent.
+    * acknowledgements are sent. Stopping is final: consuming again fails with an
+    * `IllegalStateException`; create a new consumer instead.
     */
   def stopConsuming: F[Unit]
 
@@ -177,7 +178,12 @@ object SyncShareConsumer {
               "process failed in implicit mode: close the consumer, which releases its records"
             )
           ),
-          consumingOnce(run)
+          stop
+            .tryGet
+            .flatMap {
+              case Some(_) => F.raiseError(new IllegalStateException("the consumer was stopped"))
+              case None    => consumingOnce(run)
+            }
         )
 
     private def consumingOnce(run: F[Unit]): F[Unit] =
