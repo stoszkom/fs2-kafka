@@ -255,9 +255,9 @@ object SyncShareConsumer {
               .from(records)
               .traverse(decode)
               .flatMap { chunk =>
-                F.both(timers, sendsWhenPaused)
-                  .background
-                  .surround(process(chunk))
+                // The timers only end by failing, which cancels `process` and fails `consume`.
+                F.race(F.both(timers, sendsWhenPaused) *> F.never[Unit], process(chunk))
+                  .void
                   .guarantee(mutex.lock.surround(releaseUnacked))
               }
         }
