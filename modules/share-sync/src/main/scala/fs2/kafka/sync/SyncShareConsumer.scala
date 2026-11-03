@@ -148,7 +148,7 @@ object SyncShareConsumer {
       process: Chunk[AcknowledgeableConsumerRecord[F, K, V]] => F[Unit]
     ): F[Unit] =
       if (config.implicitMode) F.raiseError(ImplicitAcknowledgementException())
-      else exclusively(loop((records, start) => processed(records, start, process)))
+      else exclusively(loop((records, start, lock) => processed(records, start, lock, process)))
 
     override def autoConsume(process: Chunk[ConsumerRecord[K, V]] => F[Unit]): F[Unit] =
       if (!config.implicitMode)
@@ -157,7 +157,7 @@ object SyncShareConsumer {
         )
       else
         exclusively(
-          loop { case (records, _) =>
+          loop { case (records, _, _) =>
             // Accepting at once, rather than with the next poll, also covers a pause after it.
             Chunk
               .from(records)
@@ -197,8 +197,11 @@ object SyncShareConsumer {
             .guarantee(consuming.set(false))
         )
 
-    // Polls until stopped, waiting while paused, and gives each poll to `run` with when it started.
-    private def loop(run: (Vector[KafkaByteConsumerRecord], FiniteDuration) => F[Unit]): F[Unit] = {
+    // Polls until stopped, waiting while paused, and gives each poll to `run` with when it started
+    // and the lock the broker reported.
+    private def loop(
+      run: (Vector[KafkaByteConsumerRecord], FiniteDuration, Option[FiniteDuration]) => F[Unit]
+    ): F[Unit] = {
       // A stop already requested wins: racing it against a wait which is already complete could pick
       // the wait and poll again.
       lazy val next: F[Unit] =
@@ -216,8 +219,7 @@ object SyncShareConsumer {
                   poll.flatMap {
                     case None                  => F.sleep(subscriptionCheckInterval) *> next
                     case Some((records, lock)) =>
-                      state.update(_.withLock(lock)) *>
-                        run(records, start).whenA(records.nonEmpty) *> next
+                      run(records, start, lock).whenA(records.nonEmpty) *> next
                   }
                 }
           }
@@ -247,13 +249,14 @@ object SyncShareConsumer {
     private def processed(
       records: Vector[KafkaByteConsumerRecord],
       start: FiniteDuration,
+      lock: Option[FiniteDuration],
       process: Chunk[AcknowledgeableConsumerRecord[F, K, V]] => F[Unit]
     ): F[Unit] =
       F.monotonic
         .flatMap { now =>
           val deliveries = records.map(r => offsetOf(r) -> Delivery(r, deliveryCountOf(r), now))
           // Also when decoding fails: the poll is held from the state update on.
-          (state.update(SyncState.polled(deliveries, start, None, _)) *>
+          (state.update(SyncState.polled(deliveries, start, lock, _)) *>
             Chunk
               .from(records)
               .traverse(decode)
