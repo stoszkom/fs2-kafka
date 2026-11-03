@@ -14,8 +14,7 @@ import fs2.kafka.ShareConsumerSettings
 import org.apache.kafka.clients.consumer.ConsumerConfig
 
 /**
-  * What a [[KafkaShareConsumerActor]] reads from its settings and the Java consumer's properties,
-  * resolved once.
+  * What a share consumer reads from its settings and the Java consumer's properties, resolved once.
   *
   * @param settings
   *   the settings, with automatic renewal off in implicit acknowledgement mode, where Java does not
@@ -23,18 +22,37 @@ import org.apache.kafka.clients.consumer.ConsumerConfig
   * @param implicitMode
   *   whether Java accepts a poll's records on the next poll (`share.acknowledgement.mode`)
   */
-final private[kafka] case class ShareActorConfig[F[_], K, V](
+final private[kafka] case class ShareConsumerConfig[F[_], K, V](
   settings: ShareConsumerSettings[F, K, V],
   maxPollInterval: FiniteDuration,
   apiTimeout: FiniteDuration,
   implicitMode: Boolean
-)
+) {
 
-private[kafka] object ShareActorConfig {
+  // How long a renewal waits for the broker: past the margin, or half the lock, the lock has likely
+  // ended.
+  def renewalWait(lock: Option[FiniteDuration]): FiniteDuration =
+    lock.fold(settings.renewalMargin)(_ / 2).min(settings.renewalMargin)
+
+  // The renewal margin before the lock ends, or half the lock, early enough for
+  // `max.poll.interval.ms`.
+  def renewalInterval(lock: Option[FiniteDuration]): FiniteDuration =
+    lock.fold(ShareConsumerConfig.unknownLockRenewalInterval) { lock =>
+      val byMargin =
+        if (settings.renewalMargin < lock) lock - settings.renewalMargin else lock / 2
+      byMargin.min(maxPollInterval / 2)
+    }
+
+}
+
+private[kafka] object ShareConsumerConfig {
+
+  // Half of the shortest lock a broker allows, while the broker has not reported the lock.
+  val unknownLockRenewalInterval: FiniteDuration = 500.millis
 
   def from[F[_], K, V](
     settings: ShareConsumerSettings[F, K, V]
-  )(implicit F: Sync[F]): F[ShareActorConfig[F, K, V]] =
+  )(implicit F: Sync[F]): F[ShareConsumerConfig[F, K, V]] =
     F.delay {
       def property[A](key: String, default: A)(parse: String => A): A =
         settings.properties.get(key).fold(default)(v => parse(v.trim))
@@ -44,7 +62,7 @@ private[kafka] object ShareActorConfig {
           _ == "implicit"
         )
 
-      ShareActorConfig(
+      ShareConsumerConfig(
         settings = if (implicitMode) settings.withAutoRenewal(false) else settings,
         maxPollInterval = property(ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG, 300000L)(_.toLong)
           .millis,

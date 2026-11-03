@@ -11,6 +11,7 @@ import scala.concurrent.duration.*
 import cats.effect.{Async, Deferred, Ref, Resource}
 import cats.effect.std.{Dispatcher, Queue}
 import cats.syntax.all.*
+import cats.MonadThrow
 import fs2.{Chunk, Stream}
 import fs2.kafka.*
 import fs2.kafka.internal.{Logging, WithShareConsumer}
@@ -37,7 +38,7 @@ import org.apache.kafka.common.TopicPartition
   * acknowledgement for it waits in the actor until then, and the record is not handed out again.
   */
 final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
-  config: ShareActorConfig[F, K, V],
+  config: ShareConsumerConfig[F, K, V],
   keyDeserializer: KeyDeserializer[F, K],
   valueDeserializer: ValueDeserializer[F, V],
   withConsumer: WithShareConsumer[F],
@@ -314,7 +315,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
           if (renewal)
             Either
               .catchOnly[TimeoutException](
-                consumer.commitSync(renewalWait(state.lock).toJava)
+                consumer.commitSync(config.renewalWait(state.lock).toJava)
               )
               .void
               .getOrElse(())
@@ -359,11 +360,7 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
   private def commitSync(state: ShareState[F], timeout: FiniteDuration): F[Unit] =
     if (holdsUntakenPoll(state)) F.unit
     else
-      withConsumer
-        .blocking(consumer => consumer.commitSync(timeout.toJava): Unit)
-        .adaptError { case error: TimeoutException =>
-          ShareCommitTimeoutException(timeout, error)
-        }
+      KafkaShareConsumerActor.commitSync(withConsumer, timeout)
 
   // --- Polling ---
 
@@ -495,20 +492,8 @@ final private[kafka] class KafkaShareConsumerActor[F[_], K, V](
     else if (state.deferred.nonEmpty) Some(unacked.min)
     // Also after the stream ended, as records may still be processed downstream.
     else if (config.settings.autoRenewal)
-      Some(unacked.min + state.lock.fold(unknownLockRenewalInterval)(renewalInterval))
+      Some(unacked.min + config.renewalInterval(state.lock))
     else None
-  }
-
-  // How long a renewal waits for the broker: past the margin, or half the lock, the lock has likely ended.
-  private def renewalWait(lock: Option[FiniteDuration]): FiniteDuration =
-    lock.fold(config.settings.renewalMargin)(_ / 2).min(config.settings.renewalMargin)
-
-  // The renewal margin before the lock ends, or half the lock, early enough for
-  // `max.poll.interval.ms`.
-  private def renewalInterval(lock: FiniteDuration): FiniteDuration = {
-    val byMargin =
-      if (config.settings.renewalMargin < lock) lock - config.settings.renewalMargin else lock / 2
-    byMargin.min(config.maxPollInterval / 2)
   }
 
   private def renew(state: ShareState[F]): F[ShareState[F]] =
@@ -707,8 +692,13 @@ private[kafka] object KafkaShareConsumerActor {
   // How often an unsubscribed consumer checks for a subscription.
   val subscriptionCheckInterval: FiniteDuration = 50.millis
 
-  // Half of the shortest lock a broker allows, while the broker has not reported the lock.
-  val unknownLockRenewalInterval: FiniteDuration = 500.millis
+  // Java's `commitSync`, failing with a ShareCommitTimeoutException once the timeout passed.
+  def commitSync[F[_]](withConsumer: WithShareConsumer[F], timeout: FiniteDuration)(implicit
+    F: MonadThrow[F]
+  ): F[Unit] =
+    withConsumer
+      .blocking(consumer => consumer.commitSync(timeout.toJava): Unit)
+      .adaptError { case error: TimeoutException => ShareCommitTimeoutException(timeout, error) }
 
   def resource[F[_], K, V](
     settings: ShareConsumerSettings[F, K, V],
@@ -729,7 +719,7 @@ private[kafka] object KafkaShareConsumerActor {
       readerStarted <- Resource.eval(Ref.of[F, Boolean](false))
       shutdown      <- Resource.eval(Deferred[F, Unit])
       finished      <- Resource.eval(Deferred[F, Ended])
-      config        <- Resource.eval(ShareActorConfig.from(settings))
+      config        <- Resource.eval(ShareConsumerConfig.from(settings))
       actor          = new KafkaShareConsumerActor(
                 config,
                 keyDeserializer,

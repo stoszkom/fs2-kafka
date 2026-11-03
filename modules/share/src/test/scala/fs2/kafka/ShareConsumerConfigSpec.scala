@@ -10,16 +10,16 @@ import scala.concurrent.duration.*
 
 import cats.effect.unsafe.implicits.global
 import cats.effect.IO
-import fs2.kafka.internal.actor.ShareActorConfig
+import fs2.kafka.internal.actor.ShareConsumerConfig
 
-final class ShareActorConfigSpec extends BaseSpec {
+final class ShareConsumerConfigSpec extends BaseSpec {
 
   private val settings = ShareConsumerSettings[IO, String, String]
 
   private def config(s: ShareConsumerSettings[IO, String, String]) =
-    ShareActorConfig.from(s).unsafeRunSync()
+    ShareConsumerConfig.from(s).unsafeRunSync()
 
-  describe("ShareActorConfig") {
+  describe("ShareConsumerConfig") {
     it("should read the library's defaults") {
       val c = config(settings)
       assert(!c.implicitMode)
@@ -40,6 +40,28 @@ final class ShareActorConfigSpec extends BaseSpec {
           .withProperty("default.api.timeout.ms", "2000")
       )
       assert(c.maxPollInterval == 1.second && c.apiTimeout == 2.seconds)
+    }
+
+    it("should renew the margin before the lock ends, or at half the lock") {
+      val c = config(settings)
+      assert(c.renewalInterval(Some(30.seconds)) == 25.seconds)
+      assert(
+        config(settings.withRenewalMargin(40.seconds)).renewalInterval(Some(30.seconds)) == 15
+          .seconds
+      )
+      assert(c.renewalInterval(None) == ShareConsumerConfig.unknownLockRenewalInterval)
+    }
+
+    it("should renew within half of max.poll.interval.ms") {
+      val c = config(settings.withProperty("max.poll.interval.ms", "20000"))
+      assert(c.renewalInterval(Some(30.seconds)) == 10.seconds)
+    }
+
+    it("should wait for a renewal up to the margin, and at most half the lock") {
+      val c = config(settings)
+      assert(c.renewalWait(Some(30.seconds)) == 5.seconds)
+      assert(c.renewalWait(Some(6.seconds)) == 3.seconds)
+      assert(c.renewalWait(None) == 5.seconds)
     }
   }
 

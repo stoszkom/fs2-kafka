@@ -21,15 +21,15 @@ import fs2.kafka.consumer.{KafkaMetrics, KafkaShareSubscription, MkShareConsumer
 import fs2.kafka.internal.actor.{
   Acknowledgement,
   Acknowledger,
-  ShareActorConfig,
+  ShareConsumerConfig,
   TopicPartitionOffset
 }
 import fs2.kafka.internal.actor.KafkaShareConsumerActor.{
   acquisitionLock,
+  commitSync,
   deliveryCountOf,
   offsetOf,
-  subscriptionCheckInterval,
-  unknownLockRenewalInterval
+  subscriptionCheckInterval
 }
 import fs2.kafka.internal.converters.collection.*
 import fs2.kafka.internal.syntax.*
@@ -89,7 +89,7 @@ object SyncShareConsumer {
     for {
       keyDeserializer   <- settings.keyDeserializer
       valueDeserializer <- settings.valueDeserializer
-      config            <- Resource.eval(ShareActorConfig.from(settings))
+      config            <- Resource.eval(ShareConsumerConfig.from(settings))
       withConsumer      <- WithShareConsumer(mk, settings)
       consumer          <-
         Resource.eval(
@@ -111,7 +111,7 @@ object SyncShareConsumer {
   ): Stream[F, SyncShareConsumer[F, K, V]] = Stream.resource(resource(settings))
 
   final private class Impl[F[_], K, V](
-    config: ShareActorConfig[F, K, V],
+    config: ShareConsumerConfig[F, K, V],
     keyDeserializer: KeyDeserializer[F, K],
     valueDeserializer: ValueDeserializer[F, V],
     withConsumer: WithShareConsumer[F],
@@ -240,11 +240,7 @@ object SyncShareConsumer {
       }
 
     private def finalCommit: F[Unit] =
-      withConsumer
-        .blocking(consumer => consumer.commitSync(settings.commitTimeout.toJava): Unit)
-        .adaptError { case error: TimeoutException =>
-          ShareCommitTimeoutException(settings.commitTimeout, error)
-        }
+      commitSync(withConsumer, settings.commitTimeout)
 
     // --- One poll in explicit mode ---
 
@@ -364,9 +360,7 @@ object SyncShareConsumer {
         .tupled
         .flatMap { case (s, at) =>
           val renewing = (s.unacked.toSet ++ byUser).toVector
-          val timeout  = s
-            .lock
-            .fold(settings.renewalMargin)(lock => settings.renewalMargin.min(lock / 2))
+          val timeout  = config.renewalWait(s.lock)
           withConsumer
             .blocking { consumer =>
               val failed = renewing.filter { p =>
@@ -426,7 +420,7 @@ object SyncShareConsumer {
 
     private def nextDeadline(s: SyncState): Option[FiniteDuration] =
       List(
-        if (settings.autoRenewal) s.nextRenewal(renewalInterval(s.lock)) else None,
+        if (settings.autoRenewal) s.nextRenewal(config.renewalInterval(s.lock)) else None,
         settings.maxAcknowledgementDelay.flatMap(s.nextSend),
         settings.maxProcessingTime.flatMap(s.nextOverdue)
       ).flatten.reduceOption(_ min _)
@@ -439,7 +433,7 @@ object SyncShareConsumer {
             .maxProcessingTime
             .fold(Vector.empty[TopicPartitionOffset])(s.overdue(_, now))
           val renewal = settings.autoRenewal && s
-            .nextRenewal(renewalInterval(s.lock))
+            .nextRenewal(config.renewalInterval(s.lock))
             .exists(_ <= now)
           val sending = settings.maxAcknowledgementDelay.flatMap(s.nextSend).exists(_ <= now)
           // Overdue records are released and sent at once, so that a late acknowledgement can't replace it.
@@ -456,15 +450,6 @@ object SyncShareConsumer {
         .traverse_(
           _.discrete.filter(identity).evalMap(_ => mutex.lock.surround(send)).compile.drain
         )
-
-    // The renewal margin before the lock ends, or half the lock, early enough for
-    // `max.poll.interval.ms`.
-    private def renewalInterval(lock: Option[FiniteDuration]): FiniteDuration =
-      lock.fold(unknownLockRenewalInterval) { lock =>
-        val byMargin =
-          if (settings.renewalMargin < lock) lock - settings.renewalMargin else lock / 2
-        byMargin.min(config.maxPollInterval / 2)
-      }
 
   }
 
