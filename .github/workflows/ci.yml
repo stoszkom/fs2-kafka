@@ -74,11 +74,11 @@ jobs:
 
       - name: Make target directories
         if: github.event_name != 'pull_request' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main')
-        run: mkdir -p unidocs/target modules/vulcan-testkit-munit/target modules/core/target modules/vulcan/target project/target
+        run: mkdir -p unidocs/target modules/share/target modules/vulcan-testkit-munit/target modules/core/target modules/vulcan/target project/target
 
       - name: Compress target directories
         if: github.event_name != 'pull_request' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main')
-        run: tar cf targets.tar unidocs/target modules/vulcan-testkit-munit/target modules/core/target modules/vulcan/target project/target
+        run: tar cf targets.tar unidocs/target modules/share/target modules/vulcan-testkit-munit/target modules/core/target modules/vulcan/target project/target
 
       - name: Upload target directories
         if: github.event_name != 'pull_request' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main')
@@ -205,7 +205,7 @@ jobs:
       - name: Submit Dependencies
         uses: scalacenter/sbt-dependency-submission@v2
         with:
-          modules-ignore: root_2.12 root_2.13 root_3 docs_3
+          modules-ignore: root_2.12 root_2.13 root_3 docs_3 fs2-kafka-share-sync_2.12 fs2-kafka-share-sync_2.13 fs2-kafka-share-sync_3
           configs-ignore: test scala-tool scala-doc-tool test-internal
 
   site:
