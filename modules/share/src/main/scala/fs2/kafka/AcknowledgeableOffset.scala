@@ -12,8 +12,8 @@ import cats.syntax.all.*
 import cats.~>
 import fs2.Chunk
 import fs2.kafka.instances.*
-import fs2.kafka.internal.actor.Acknowledgement
-import fs2.kafka.internal.actor.Acknowledger
+import fs2.kafka.internal.Acknowledgement
+import fs2.kafka.internal.Acknowledger
 import org.apache.kafka.common.TopicPartition
 
 /**

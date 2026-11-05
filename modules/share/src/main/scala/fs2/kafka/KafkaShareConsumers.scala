@@ -9,21 +9,21 @@ package fs2.kafka
 import cats.Reducible
 import cats.data.NonEmptyVector
 import cats.effect.Async
+import cats.effect.Resource
 import cats.effect.instances.spawn.*
 import cats.syntax.all.*
-import fs2.Stream
-import fs2.kafka.consumer.KafkaConsumerLifecycle
+import fs2.Chunk
 import fs2.kafka.consumer.KafkaShareSubscription
+import fs2.kafka.consumer.MkShareConsumer
+import org.apache.kafka.clients.consumer.ConsumerConfig
+import org.apache.kafka.common.config.ConfigException
 import scala.collection.immutable.SortedSet
 
 /**
-  * Share consumers of the same share group. Each has its own Java consumer underneath.
-  *
-  * Experimental: this API targets Kafka's share groups and may change in minor releases.
+  * Share consumers of the same share group, each with its own Java consumer and its own loop, so
+  * that polls are processed in parallel across consumers, one at a time within each.
   */
-sealed abstract class KafkaShareConsumers[F[_], K, V]
-  extends KafkaShareSubscription[F]
-  with KafkaConsumerLifecycle[F] {
+sealed abstract class KafkaShareConsumers[F[_], K, V] extends KafkaShareSubscription[F] {
 
   /**
     * The share consumers, in the order they were created.
@@ -31,87 +31,70 @@ sealed abstract class KafkaShareConsumers[F[_], K, V]
   def consumers: NonEmptyVector[KafkaShareConsumer[F, K, V]]
 
   /**
-    * Returns the topics any of the consumers is subscribed to. The consumers are subscribed one
-    * after another, so they differ only after a `subscribe` or `unsubscribe` failed part-way.
+    * Runs [[KafkaShareConsumer.consume]] on every consumer until [[stopConsuming]]. If one fails,
+    * the others are canceled, which releases the records they hold, and the error is raised.
     */
-  override def subscription: F[SortedSet[String]]
+  def consume(process: Chunk[AcknowledgeableConsumerRecord[F, K, V]] => F[Unit]): F[Unit]
 
   /**
-    * `Stream` of the records of all consumers, merged into a single `Stream` of
-    * [[AcknowledgeableConsumerRecord]]s. A poll counts as handed out only once it leaves the merge,
-    * so polls still buffered in the merge when this `Stream` ends are released.<br><br>
-    *
-    * If you want to process the records of each consumer in its own pipeline, use
-    * [[perConsumerRecords]] instead.
-    *
-    * @note
-    *   you have to first use `subscribe` before using this `Stream`. If you forgot to subscribe,
-    *   there will be a [[NotSubscribedException]] raised in the `Stream`. The record `Stream` of
-    *   each consumer can be started only once, so use either this `Stream` or
-    *   [[perConsumerRecords]], once, or there will be a [[StreamAlreadyStartedException]] raised.
-    * @see
-    *   [[perConsumerRecords]]
+    * Runs [[KafkaShareConsumer.autoConsume]] on every consumer until [[stopConsuming]].
     */
-  def records: Stream[F, AcknowledgeableConsumerRecord[F, K, V]]
+  def autoConsume(process: Chunk[ConsumerRecord[K, V]] => F[Unit]): F[Unit]
 
-  /**
-    * `Stream` where the elements themselves are `Stream`s of the records of a single consumer.
-    * These `Stream`s will have to be processed in parallel, using `parJoin` or `parJoinUnbounded`,
-    * for example `perConsumerRecords.map(_.parEvalMapUnordered(8)(process)).parJoinUnbounded`. Note
-    * that when using `parJoin(n)` and `n` is smaller than the number of consumers, the remaining
-    * consumers won't consume records until one of the processed `Stream`s ends. For that reason,
-    * prefer `parJoinUnbounded`.<br><br>
-    *
-    * If you want the records of all consumers in a single `Stream`, use [[records]] instead.
-    *
-    * @note
-    *   you have to first use `subscribe` before using this `Stream`. If you forgot to subscribe,
-    *   there will be a [[NotSubscribedException]] raised in the `Stream`. The record `Stream` of
-    *   each consumer can be started only once, so use either this `Stream` or [[records]], once, or
-    *   there will be a [[StreamAlreadyStartedException]] raised.
-    * @see
-    *   [[records]]
-    */
-  def perConsumerRecords: Stream[F, Stream[F, AcknowledgeableConsumerRecord[F, K, V]]]
-
-  /**
-    * Stops polling new records on every consumer, see [[KafkaShareConsumer.stopConsuming]].
-    */
   def stopConsuming: F[Unit]
 
 }
 
 object KafkaShareConsumers {
 
-  private[kafka] def apply[F[_], K, V](
-    values: NonEmptyVector[KafkaShareConsumer[F, K, V]]
-  )(implicit F: Async[F]): KafkaShareConsumers[F, K, V] =
-    new KafkaShareConsumers[F, K, V] {
+  /**
+    * Creates `consumers` share consumers with the same settings; a client id gets the consumer's
+    * index as a suffix.
+    */
+  def resource[F[_], K, V](settings: ShareConsumerSettings[F, K, V], consumers: Int)(implicit
+    F: Async[F],
+    mk: MkShareConsumer[F]
+  ): Resource[F, KafkaShareConsumers[F, K, V]] =
+    if (consumers < 1)
+      Resource.raiseError[F, KafkaShareConsumers[F, K, V], Throwable](
+        new ConfigException(s"consumers must be positive, was $consumers")
+      )
+    else
+      NonEmptyVector
+        .fromVectorUnsafe(Vector.range(0, consumers))
+        .parTraverse(index => KafkaShareConsumer.resource(indexed(settings, index)))
+        .map(new Impl(_))
 
-      override val consumers: NonEmptyVector[KafkaShareConsumer[F, K, V]] = values
+  private def indexed[F[_], K, V](
+    settings: ShareConsumerSettings[F, K, V],
+    index: Int
+  ): ShareConsumerSettings[F, K, V] =
+    settings.properties
+      .get(ConsumerConfig.CLIENT_ID_CONFIG)
+      .fold(settings)(id => settings.withClientId(s"$id-$index"))
 
-      override def subscribe[G[_]: Reducible](topics: G[String]): F[Unit] =
-        values.traverse_(_.subscribe(topics))
+  final private class Impl[F[_], K, V](
+    override val consumers: NonEmptyVector[KafkaShareConsumer[F, K, V]]
+  )(implicit F: Async[F])
+    extends KafkaShareConsumers[F, K, V] {
 
-      override def unsubscribe: F[Unit] = values.traverse_(_.unsubscribe)
+    override def subscribe[G[_]: Reducible](topics: G[String]): F[Unit] =
+      consumers.traverse_(_.subscribe(topics))
 
-      override def subscription: F[SortedSet[String]] =
-        values.traverse(_.subscription).map(_.reduceLeft(_ ++ _))
+    override def unsubscribe: F[Unit] = consumers.traverse_(_.unsubscribe)
 
-      override def records: Stream[F, AcknowledgeableConsumerRecord[F, K, V]] =
-        Stream.emits(values.toVector).map(_.polls).parJoin(values.length).flatten
+    override def subscription: F[SortedSet[String]] =
+      consumers.traverse(_.subscription).map(_.reduceLeft(_ ++ _))
 
-      override def perConsumerRecords: Stream[F, Stream[F, AcknowledgeableConsumerRecord[F, K, V]]] =
-        Stream.emits(values.toVector.map(_.records))
+    override def consume(
+      process: Chunk[AcknowledgeableConsumerRecord[F, K, V]] => F[Unit]
+    ): F[Unit] = consumers.parTraverse_(_.consume(process))
 
-      override def stopConsuming: F[Unit] = values.parTraverse_(_.stopConsuming)
+    override def autoConsume(process: Chunk[ConsumerRecord[K, V]] => F[Unit]): F[Unit] =
+      consumers.parTraverse_(_.autoConsume(process))
 
-      override def terminate: F[Unit] = values.parTraverse_(_.terminate)
+    override def stopConsuming: F[Unit] = consumers.traverse_(_.stopConsuming)
 
-      override def awaitTermination: F[Unit] = values.parTraverse_(_.awaitTermination)
-
-      override def toString: String = s"KafkaShareConsumers(${values.length})"
-
-    }
+  }
 
 }

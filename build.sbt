@@ -61,7 +61,7 @@ inThisBuild(
 lazy val root = project
   .in(file("."))
   .enablePlugins(NoPublishPlugin)
-  .aggregate(core, share, `share-sync`, unidocs)
+  .aggregate(core, share, unidocs)
 
 lazy val core = project
   .in(file("modules/core"))
@@ -100,18 +100,6 @@ lazy val share = project
     testSettings,
     Test / javaOptions += s"-Dfs2.kafka.test.image=apache/kafka:$kafkaVersion",
     tlVersionIntroduced := List("2.12", "2.13", "3").map(_ -> "4.2.1").toMap
-  )
-
-// A synchronous share consumer, prototyped to compare with the actor in `share`; not published.
-lazy val `share-sync` = project
-  .in(file("modules/share-sync"))
-  .enablePlugins(NoPublishPlugin)
-  .dependsOn(share % "compile->compile;test->test")
-  .settings(
-    name := "fs2-kafka-share-sync",
-    headerSettings,
-    testSettings,
-    Test / javaOptions += s"-Dfs2.kafka.test.image=apache/kafka:$kafkaVersion"
   )
 
 lazy val docs = project

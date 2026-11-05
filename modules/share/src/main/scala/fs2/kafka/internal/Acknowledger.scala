@@ -4,11 +4,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-package fs2.kafka.internal.actor
+package fs2.kafka.internal
 
 import cats.~>
 import fs2.Chunk
 import fs2.kafka.AcknowledgeType
+import fs2.kafka.internal.ShareConsumerState.TopicPartitionOffset
 
 // An acknowledgement for one delivery of a record.
 final private[kafka] case class Acknowledgement(

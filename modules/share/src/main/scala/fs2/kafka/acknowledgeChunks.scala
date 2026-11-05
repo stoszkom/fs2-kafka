@@ -16,9 +16,10 @@ import fs2.Pipe
   * instead of one per record. An acknowledgement for a record the consumer no longer holds is
   * skipped, as the record is delivered again.
   *
-  * It pays off after steps which keep the stream's chunks, such as `map` or `evalMapChunk`, where a
-  * chunk is a whole poll. After `parEvalMap`, chunks mostly hold one record; acknowledge each
-  * record there, or group the acknowledgements first with `groupWithin(n, d).unchunks`.
+  * It pays off when a chunk holds many records, such as a whole poll acknowledged at once with
+  * `Stream.chunk(records).map(_.offset -> AcknowledgeType.Accept).through(acknowledgeChunks)`.
+  * After `parEvalMap`, chunks mostly hold one record; acknowledge each record there, or group the
+  * acknowledgements first with `groupWithin(n, d).unchunks`.
   */
 object acknowledgeChunks {
 

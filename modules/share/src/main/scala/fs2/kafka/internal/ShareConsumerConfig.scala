@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-package fs2.kafka.internal.actor
+package fs2.kafka.internal
 
 import cats.effect.Sync
 import fs2.kafka.ShareConsumerSettings

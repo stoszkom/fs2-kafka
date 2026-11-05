@@ -14,16 +14,16 @@ trait KafkaShareSubscription[F[_]] {
 
   /**
     * Subscribes the share consumer to the specified topics. Note that you have to use one of the
-    * `subscribe` functions to subscribe to one or more topics before using any of the provided
-    * `Stream`s, or a [[NotSubscribedException]] will be raised in the `Stream`s.
+    * `subscribe` functions to subscribe to one or more topics before consuming, or a
+    * [[NotSubscribedException]] will be raised.
     */
   def subscribeTo(firstTopic: String, remainingTopics: String*): F[Unit] =
     subscribe(NonEmptyList.of(firstTopic, remainingTopics*))
 
   /**
     * Subscribes the share consumer to the specified topics. Note that you have to use one of the
-    * `subscribe` functions to subscribe to one or more topics before using any of the provided
-    * `Stream`s, or a [[NotSubscribedException]] will be raised in the `Stream`s.
+    * `subscribe` functions to subscribe to one or more topics before consuming, or a
+    * [[NotSubscribedException]] will be raised.
     *
     * @param topics
     *   the topics to which the consumer should subscribe

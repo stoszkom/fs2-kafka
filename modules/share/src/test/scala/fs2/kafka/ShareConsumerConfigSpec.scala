@@ -8,7 +8,7 @@ package fs2.kafka
 
 import cats.effect.IO
 import cats.effect.unsafe.implicits.global
-import fs2.kafka.internal.actor.ShareConsumerConfig
+import fs2.kafka.internal.ShareConsumerConfig
 import scala.concurrent.duration.*
 
 final class ShareConsumerConfigSpec extends BaseSpec {

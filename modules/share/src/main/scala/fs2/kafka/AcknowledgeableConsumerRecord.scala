@@ -28,10 +28,8 @@ import cats.~>
   * acknowledgement before its consumer can poll new records; the next poll sends the
   * acknowledgements. Many records can be acknowledged together with [[acknowledgeChunks]].
   *
-  * In implicit acknowledgement mode, records cannot be acknowledged. Instead, the consumer polls
-  * again once every record of the previous poll has been emitted by the stream, and that poll
-  * accepts them, even if they are still being processed. A record whose processing fails is
-  * therefore not delivered again (at-most-once). See the share consumers documentation for details.
+  * In implicit acknowledgement mode, records cannot be acknowledged: the consumer accepts a poll
+  * once `process` returned, see [[KafkaShareConsumer.autoConsume]].
   *
   * Experimental: this API targets Kafka's share groups and may change in minor releases.
   */

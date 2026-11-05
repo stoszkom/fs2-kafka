@@ -4,11 +4,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-package fs2.kafka.sync
+package fs2.kafka.internal
 
 import fs2.kafka.KafkaByteConsumerRecord
 import fs2.kafka.instances.fs2KafkaTopicPartitionOrdering
-import fs2.kafka.internal.actor.TopicPartitionOffset
+import fs2.kafka.internal.ShareConsumerState.TopicPartitionOffset
+import org.apache.kafka.common.TopicPartition
 import scala.collection.immutable.SortedSet
 import scala.concurrent.duration.Duration
 import scala.concurrent.duration.FiniteDuration
@@ -21,7 +22,7 @@ import scala.concurrent.duration.FiniteDuration
   * @param heldSince
   *   when `process` got it, or the user's latest renewal; the max processing time counts from it
   */
-final private[sync] case class Delivery(
+final private[kafka] case class Delivery(
   record: KafkaByteConsumerRecord,
   deliveryCount: Short,
   heldSince: FiniteDuration
@@ -31,7 +32,7 @@ final private[sync] case class Delivery(
   * When the timers next renew the unacknowledged records, send the pending acknowledgements, and
   * release the first record past the max processing time, each if it applies.
   */
-final private[sync] case class Deadlines(
+final private[kafka] case class Deadlines(
   renewal: Option[FiniteDuration],
   send: Option[FiniteDuration],
   overdue: Option[FiniteDuration]
@@ -60,7 +61,7 @@ final private[sync] case class Deadlines(
   *   the unacknowledged records by `heldSince`, so that the max processing time finds the earliest
   *   without scanning
   */
-final private[sync] case class SyncState(
+final private[kafka] case class ShareConsumerState(
   held: Map[TopicPartitionOffset, Delivery],
   acked: Set[TopicPartitionOffset],
   unsentSince: Option[FiniteDuration],
@@ -74,7 +75,7 @@ final private[sync] case class SyncState(
 
   def record(offset: TopicPartitionOffset): KafkaByteConsumerRecord = held(offset).record
 
-  def withLock(reported: Option[FiniteDuration]): SyncState = copy(lock = reported.orElse(lock))
+  def withLock(reported: Option[FiniteDuration]): ShareConsumerState = copy(lock = reported.orElse(lock))
 
   def hasUnacked: Boolean = held.size > acked.size
 
@@ -99,7 +100,7 @@ final private[sync] case class SyncState(
     offsets.flatMap(p => held.get(p).map(d => d.heldSince -> p))
 
   // Java recorded these acknowledgements; they are sent later.
-  def withAcked(offsets: Iterable[TopicPartitionOffset], at: FiniteDuration): SyncState =
+  def withAcked(offsets: Iterable[TopicPartitionOffset], at: FiniteDuration): ShareConsumerState =
     if (offsets.isEmpty) this
     else
       copy(
@@ -109,15 +110,15 @@ final private[sync] case class SyncState(
       )
 
   // The pending acknowledgements were sent: their records are no longer held.
-  def withoutAcked: SyncState =
+  def withoutAcked: ShareConsumerState =
     copy(held = held -- acked, acked = Set.empty, unsentSince = None)
 
   // Java no longer holds these, so they cannot be acknowledged.
-  def withoutHeld(offsets: Iterable[TopicPartitionOffset]): SyncState =
+  def withoutHeld(offsets: Iterable[TopicPartitionOffset]): ShareConsumerState =
     copy(held = held -- offsets, acked = acked -- offsets, timed = timed -- timedEntries(offsets))
 
   // The poll's processing ended: its records can no longer be acknowledged or renewed.
-  def closed: SyncState = SyncState.empty.withLock(lock)
+  def closed: ShareConsumerState = ShareConsumerState.empty.withLock(lock)
 
   /**
     * A renewal sent the pending acknowledgements and renewed the unacknowledged records at `at`.
@@ -129,7 +130,7 @@ final private[sync] case class SyncState(
     byUser: Set[TopicPartitionOffset],
     at: FiniteDuration,
     reportedLock: Option[FiniteDuration]
-  ): SyncState = {
+  ): ShareConsumerState = {
     val sent = acked -- byUser
     val lost = held.keySet -- sent -- returned.keySet
     val kept = returned.map { case (p, r) =>
@@ -137,7 +138,7 @@ final private[sync] case class SyncState(
       p -> old.copy(record = r, heldSince = if (byUser(p)) at else old.heldSince)
     }
     val reset = byUser.intersect(returned.keySet)
-    SyncState(
+    ShareConsumerState(
       held = kept,
       acked = Set.empty,
       unsentSince = None,
@@ -149,20 +150,24 @@ final private[sync] case class SyncState(
 
 }
 
-private[sync] object SyncState {
+private[kafka] object ShareConsumerState {
+
+  // A record's offset in its topic partition. It identifies a record, not a delivery: a redelivery
+  // has the same one.
+  type TopicPartitionOffset = (TopicPartition, Long)
 
   // Nothing held, before the first poll.
-  val empty: SyncState =
-    SyncState(Map.empty, Set.empty, None, Duration.Zero, None, SortedSet.empty)
+  val empty: ShareConsumerState =
+    ShareConsumerState(Map.empty, Set.empty, None, Duration.Zero, None, SortedSet.empty)
 
   // A new poll, started at `polledAt`, which `process` got at `at`.
   def polled(
     deliveries: Vector[(TopicPartitionOffset, Delivery)],
     polledAt: FiniteDuration,
     reportedLock: Option[FiniteDuration],
-    previous: SyncState
-  ): SyncState =
-    SyncState(
+    previous: ShareConsumerState
+  ): ShareConsumerState =
+    ShareConsumerState(
       held = deliveries.toMap,
       acked = Set.empty,
       unsentSince = None,

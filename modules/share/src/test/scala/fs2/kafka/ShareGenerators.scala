@@ -8,8 +8,8 @@ package fs2.kafka
 
 import cats.ApplicativeThrow
 import fs2.Chunk
-import fs2.kafka.internal.actor.Acknowledgement
-import fs2.kafka.internal.actor.Acknowledger
+import fs2.kafka.internal.Acknowledgement
+import fs2.kafka.internal.Acknowledger
 import org.scalacheck.Arbitrary
 import org.scalacheck.Cogen
 import org.scalacheck.Gen

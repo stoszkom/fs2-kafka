@@ -180,7 +180,7 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
 
   /**
     * How long the final commit after `stopConsuming` waits for the broker to confirm the last
-    * acknowledgements. A commit timing out before it is sent fails the stream with a
+    * acknowledgements. A commit timing out before it is sent fails `consume` with a
     * [[ShareCommitTimeoutException]].<br><br>
     *
     * The default value is 15 seconds.
@@ -194,8 +194,8 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
 
   /**
     * How long we should allow the `poll` call to block for in the Java `KafkaShareConsumer`. The
-    * consumer polls again as soon as the previous poll is acknowledged and the stream has taken it,
-    * so this is also how long an idle consumer waits between polls.<br><br>
+    * consumer polls again as soon as `process` returned from the previous poll, so this is also how
+    * long an idle consumer waits between polls.<br><br>
     *
     * The default value is 50 milliseconds.
     */
@@ -250,16 +250,16 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
     * later acknowledgement fails with a [[RecordNotInFlightException]], which [[acknowledgeChunks]]
     * skips. It applies with explicit acknowledgement.<br><br>
     *
-    * The time counts from when the stream took the record's poll, or from its latest `Renew` by the
+    * The time counts from when `process` got the record's poll, or from its latest `Renew` by the
     * user. Set it well above the time to process a whole poll: `max.poll.records` times the time
     * per record, divided by the parallelism, and more with merged consumers or `batch_optimized`
     * polls. Ignoring the failure is usually enough, as the record is processed again:
     *
     * {{{
-    * records.evalMap { record =>
+    * consumer.consume(_.parTraverseN(8) { record =>
     *   process(record.record) *>
     *     record.accept.recover { case _: RecordNotInFlightException => () }
-    * }
+    * }.void)
     * }}}
     *
     * The default value is `None`.
@@ -306,7 +306,7 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
     * A signal which pauses the consumer while it is `true`, or `None` to never pause. While paused,
     * the consumer polls for no new records, so records are not acquired and their delivery count
     * does not grow while, for example, a service the processing needs is down. Records already
-    * taken by the stream are processed and acknowledged as usual: their acknowledgements are sent
+    * being processed are acknowledged as usual: their acknowledgements are sent
     * at once, and auto-renewal keeps renewing them; a new record a renewal poll still returns is
     * released at once. If the last poll before the pause returned nothing, Java still fetches in
     * the background until it acquires records, once: those are delivered after the pause with a

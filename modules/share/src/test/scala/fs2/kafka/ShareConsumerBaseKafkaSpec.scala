@@ -7,7 +7,9 @@
 package fs2.kafka
 
 import cats.effect.IO
+import cats.effect.Ref
 import cats.effect.unsafe.implicits.global
+import cats.syntax.all.*
 import fs2.kafka.internal.converters.collection.*
 import java.util.UUID
 import java.util.concurrent.TimeUnit
@@ -70,15 +72,6 @@ abstract class ShareConsumerBaseKafkaSpec extends BaseKafkaSpec {
 
   protected def run[A](io: IO[A]): A = io.timeout(2.minutes).unsafeRunSync()
 
-  // Accepts every record up to and including `marker`, returning values and delivery counts.
-  // Runs `use` with a consumer subscribed to the topic.
-  protected def subscribed[A](settings: ShareConsumerSettings[IO, String, String], topic: String)(
-    use: KafkaShareConsumer[IO, String, String] => IO[A]
-  ): IO[A] =
-    KafkaShareConsumer
-      .resource(settings)
-      .use(consumer => consumer.subscribeTo(topic) *> use(consumer))
-
   // Checks that the topic has no records left to deliver: a new record is the next one read.
   protected def assertSettled(
     topic: String,
@@ -88,20 +81,28 @@ abstract class ShareConsumerBaseKafkaSpec extends BaseKafkaSpec {
     readUntil(topic, settings, "after") shouldBe Vector("after" -> 1)
   }
 
+  // Accepts every record up to and including `marker`, and the rest of its poll, returning values
+  // and delivery counts.
   protected def readUntil(
     topic: String,
     settings: ShareConsumerSettings[IO, String, String],
     marker: String
   ): Vector[(String, Int)] =
     run(
-      KafkaShareConsumer
-        .stream(settings)
-        .subscribeTo(topic)
-        .records
-        .evalMap(r => r.accept.as(r.record.value -> r.offset.deliveryCount.toInt))
-        .takeThrough(_._1 != marker)
-        .compile
-        .toVector
+      Ref
+        .of[IO, Vector[(String, Int)]](Vector.empty)
+        .flatMap { seen =>
+          KafkaShareConsumer
+            .resource(settings)
+            .use { consumer =>
+              consumer.subscribeTo(topic) *>
+                consumer.consume(_.traverse_ { r =>
+                  r.accept *> seen
+                    .updateAndGet(_ :+ (r.record.value -> r.offset.deliveryCount.toInt))
+                    .flatMap(s => consumer.stopConsuming.whenA(s.exists(_._1 == marker)))
+                })
+            } *> seen.get
+        }
     )
 
 }
