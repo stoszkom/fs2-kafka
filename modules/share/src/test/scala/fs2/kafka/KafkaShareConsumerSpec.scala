@@ -901,6 +901,29 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       }
     }
 
+    // Leaving the group released the records: a renewal due after an unsubscribe has nothing to
+    // renew, and must not poll, as Java's poll refuses an unsubscribed consumer.
+    it("should let process finish after an unsubscribe while a renewal comes due") {
+      withTopic { topic =>
+        createTopic(topic)
+        publish(topic, "0")
+        val settings = shareConsumerSettings.withAutoRenewal(true)
+        val accepted = run(
+          Ref
+            .of[IO, Option[Either[Throwable, Unit]]](None)
+            .flatMap { result =>
+              consumed(settings, topic) { consumer => records =>
+                records.traverse_ { r =>
+                  consumer.unsubscribe *> IO.sleep(lock - settings.renewalMargin + 2.seconds) *>
+                    r.accept.attempt.flatMap(a => result.set(Some(a)))
+                } *> consumer.stopConsuming
+              } *> result.get
+            }
+        )
+        accepted.flatMap(_.left.toOption).get shouldBe a[RecordNotInFlightException]
+      }
+    }
+
     it("should count the max processing time from the user's latest renewal") {
       withTopic { topic =>
         createTopic(topic)

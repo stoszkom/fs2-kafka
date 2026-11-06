@@ -419,7 +419,8 @@ object KafkaShareConsumer {
       * the mutex, so an acknowledgement never sees a record being renewed. A renewal still pending
       * after the wait makes that poll fetch: new records it returns are released, and the renewed
       * records count as lost; should Java complete the renewal later, the poll returning them
-      * releases them at once. The wait is the renewal margin, at most half the lock.
+      * releases them at once. The wait is the renewal margin, at most half the lock. Unsubscribed,
+      * nothing is renewed: leaving the group released the records, so they are released here too.
       */
     private def renew(byUser: Set[TopicPartitionOffset]): F[Unit] =
       (state.get, F.monotonic).tupled
@@ -428,32 +429,40 @@ object KafkaShareConsumer {
           val timeout = config.renewalWait(s.lock)
           withConsumer
             .blocking { consumer =>
-              val failed = renewing.filter { p =>
+              // Unsubscribed: leaving the group released the records, and Java's poll would throw.
+              if (consumer.subscription().isEmpty) None
+              else {
+                val failed = renewing.filter { p =>
+                  Either
+                    .catchOnly[IllegalStateException](
+                      consumer.acknowledge(s.record(p), AcknowledgeType.Renew.asJava)
+                    )
+                    .isLeft
+                }
                 Either
-                  .catchOnly[IllegalStateException](
-                    consumer.acknowledge(s.record(p), AcknowledgeType.Renew.asJava)
+                  .catchOnly[TimeoutException](consumer.commitSync(timeout.toJava))
+                  .void
+                  .getOrElse(())
+                Some(
+                  (
+                    failed,
+                    consumer.poll(_root_.java.time.Duration.ZERO).iterator().asScala.toVector,
+                    acquisitionLock(consumer)
                   )
-                  .isLeft
+                )
               }
-              Either
-                .catchOnly[TimeoutException](consumer.commitSync(timeout.toJava))
-                .void
-                .getOrElse(())
-              (
-                failed,
-                consumer.poll(_root_.java.time.Duration.ZERO).iterator().asScala.toVector,
-                acquisitionLock(consumer)
-              )
             }
-            .flatMap { case (failed, polled, lock) =>
-              val asked = renewing.toSet -- failed
-              val (returned, stray) = polled.partition { r =>
-                val p = offsetOf(r)
-                asked(p) && s.holds(p, deliveryCountOf(r))
-              }
-              state.update(
-                _.withRenewed(returned.map(r => offsetOf(r) -> r).toMap, byUser, at, lock)
-              ) *> releaseAtOnce(stray)
+            .flatMap {
+              case None => release(renewing) *> send
+              case Some((failed, polled, lock)) =>
+                val asked = renewing.toSet -- failed
+                val (returned, stray) = polled.partition { r =>
+                  val p = offsetOf(r)
+                  asked(p) && s.holds(p, deliveryCountOf(r))
+                }
+                state.update(
+                  _.withRenewed(returned.map(r => offsetOf(r) -> r).toMap, byUser, at, lock)
+                ) *> releaseAtOnce(stray)
             }
         }
 
