@@ -219,16 +219,21 @@ object KafkaShareConsumer {
             }
         )
 
+    // Uncancelable from taking the flag until its reset is in place, or a cancel in between would
+    // leave the consumer "already consuming" for good.
     private def consumingOnce(run: F[Unit]): F[Unit] =
-      consuming
-        .getAndSet(true)
-        .ifM(
-          F.raiseError(new IllegalStateException("the consumer is already consuming")),
-          withConsumer
-            .blocking(_.subscription().isEmpty)
-            .ifM(F.raiseError(NotSubscribedException()), run)
-            .guarantee(consuming.set(false))
-        )
+      F.uncancelable { cancelable =>
+        consuming
+          .getAndSet(true)
+          .ifM(
+            F.raiseError(new IllegalStateException("the consumer is already consuming")),
+            cancelable(
+              withConsumer
+                .blocking(_.subscription().isEmpty)
+                .ifM(F.raiseError(NotSubscribedException()), run)
+            ).guarantee(consuming.set(false))
+          )
+      }
 
     // Polls until stopped, waiting while paused, and gives each poll to `run` with when it started
     // and the lock the broker reported. A poll can't be canceled until `run` has taken its records:
@@ -338,19 +343,17 @@ object KafkaShareConsumer {
     override def acknowledge(acks: Chunk[Acknowledgement]): F[Unit] =
       mutex.lock
         .surround(
-          state.get
-            .flatMap { s =>
-              val last = acks.toVector.map(a => a.offset -> a).toMap.values.toVector
-              val (held, notHeld) = last.partition(a => s.holds(a.offset, a.deliveryCount))
-              val (renewals, now) = held.partition(_.acknowledgeType == AcknowledgeType.Renew)
-              recordInJava(s, now.map(a => a.offset -> a.acknowledgeType)).flatMap { gone =>
-                renew(renewals.map(_.offset).toSet).whenA(renewals.nonEmpty) *>
-                  paused.ifM(send, F.unit) *>
-                  (notHeld.map(_.offset) ++ gone).headOption
-                    .traverse_(p => F.raiseError[Unit](RecordNotInFlightException(p._1, p._2)))
-              }
+          state.get.flatMap { s =>
+            val last = acks.toVector.map(a => a.offset -> a).toMap.values.toVector
+            val (held, notHeld) = last.partition(a => s.holds(a.offset, a.deliveryCount))
+            val (renewals, now) = held.partition(_.acknowledgeType == AcknowledgeType.Renew)
+            recordInJava(s, now.map(a => a.offset -> a.acknowledgeType)).flatMap { gone =>
+              renew(renewals.map(_.offset).toSet).whenA(renewals.nonEmpty) *>
+                paused.ifM(send, F.unit) *>
+                (notHeld.map(_.offset) ++ gone).headOption
+                  .traverse_(p => F.raiseError[Unit](RecordNotInFlightException(p._1, p._2)))
             }
-            .uncancelable
+          }.uncancelable
         )
 
     // Gives the acknowledgements to Java, returning those Java no longer holds, which are dropped.
