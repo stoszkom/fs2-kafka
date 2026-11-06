@@ -368,10 +368,14 @@ object KafkaShareConsumer {
             val (held, notHeld) = last.partition(a => s.holds(a.offset, a.deliveryCount))
             val (renewals, now) = held.partition(_.acknowledgeType == AcknowledgeType.Renew)
             recordInJava(s, now.map(a => a.offset -> a.acknowledgeType)).flatMap { gone =>
-              renew(renewals.map(_.offset).toSet).whenA(renewals.nonEmpty) *>
+              val renewed =
+                if (renewals.isEmpty) F.pure(Set.empty[TopicPartitionOffset])
+                else renew(renewals.map(_.offset).toSet)
+              renewed.flatMap { notRenewed =>
                 paused.ifM(send, F.unit) *>
-                (notHeld.map(_.offset) ++ gone).headOption
-                  .traverse_(p => F.raiseError[Unit](RecordNotInFlightException(p._1, p._2)))
+                  (notHeld.map(_.offset) ++ gone ++ notRenewed).headOption
+                    .traverse_(p => F.raiseError[Unit](RecordNotInFlightException(p._1, p._2)))
+              }
             }
           }.uncancelable
         )
@@ -421,8 +425,9 @@ object KafkaShareConsumer {
       * records count as lost; should Java complete the renewal later, the poll returning them
       * releases them at once. The wait is the renewal margin, at most half the lock. Unsubscribed,
       * nothing is renewed: leaving the group released the records, so they are released here too.
+      * Returns the records the user renewed which are no longer held.
       */
-    private def renew(byUser: Set[TopicPartitionOffset]): F[Unit] =
+    private def renew(byUser: Set[TopicPartitionOffset]): F[Set[TopicPartitionOffset]] =
       (state.get, F.monotonic).tupled
         .flatMap { case (s, at) =>
           val renewing = (s.unacked.toSet ++ byUser).toVector
@@ -453,16 +458,16 @@ object KafkaShareConsumer {
               }
             }
             .flatMap {
-              case None => release(renewing) *> send
+              case None => release(renewing) *> send.as(byUser)
               case Some((failed, polled, lock)) =>
                 val asked = renewing.toSet -- failed
                 val (returned, stray) = polled.partition { r =>
                   val p = offsetOf(r)
                   asked(p) && s.holds(p, deliveryCountOf(r))
                 }
-                state.update(
-                  _.withRenewed(returned.map(r => offsetOf(r) -> r).toMap, byUser, at, lock)
-                ) *> releaseAtOnce(stray)
+                val kept = returned.map(r => offsetOf(r) -> r).toMap
+                state.update(_.withRenewed(kept, byUser, at, lock)) *>
+                  releaseAtOnce(stray).as(byUser -- kept.keySet)
             }
         }
 

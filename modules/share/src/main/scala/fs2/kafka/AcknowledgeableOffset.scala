@@ -43,10 +43,8 @@ sealed abstract class AcknowledgeableOffset[F[_]] { self =>
     * the next poll, or sooner: after the [[ShareConsumerSettings.maxAcknowledgementDelay]], at once
     * while paused, and when the consumer stops or closes. Until it's sent, a later acknowledgement
     * replaces it. Once sent, or for a delivery the consumer no longer holds, an acknowledgement
-    * fails with a [[RecordNotInFlightException]]. An acknowledgement for a record being renewed
-    * completes once a poll returns the record and Java recorded the acknowledgement, or fails if
-    * the record loses its lock first. In implicit acknowledgement mode, it fails with an
-    * [[ImplicitAcknowledgementException]].
+    * fails with a [[RecordNotInFlightException]]. So does a renewal the broker does not confirm
+    * within the renewal wait: the record counts as lost, and is delivered again.
     */
   final def acknowledge(acknowledgeType: AcknowledgeType): F[Unit] =
     acknowledger.acknowledge(Chunk.singleton(ack(acknowledgeType)))
