@@ -43,6 +43,13 @@ final private[kafka] case class Deadlines(
 }
 
 /**
+  * A record whose renewal outlasted its wait, so it counts as lost. Java may still complete the
+  * renewal and return the record from a later poll, with this delivery count: it is released then
+  * rather than handed out again.
+  */
+final private[kafka] case class LostRenewal(deliveryCount: Short, at: FiniteDuration)
+
+/**
   * The records of the poll being processed. Only one poll is processed at a time, and a renewal
   * renews every unacknowledged record at once, so they all share one lock start.
   *
@@ -60,6 +67,9 @@ final private[kafka] case class Deadlines(
   * @param timed
   *   the unacknowledged records by `heldSince`, so that the max processing time finds the earliest
   *   without scanning
+  * @param lostRenewals
+  *   the records lost to a renewal which outlasted its wait, until a poll returns them or they are
+  *   forgotten
   */
 final private[kafka] case class ShareConsumerState(
   held: Map[TopicPartitionOffset, Delivery],
@@ -67,7 +77,8 @@ final private[kafka] case class ShareConsumerState(
   unsentSince: Option[FiniteDuration],
   lockedSince: FiniteDuration,
   lock: Option[FiniteDuration],
-  timed: SortedSet[(FiniteDuration, TopicPartitionOffset)]
+  timed: SortedSet[(FiniteDuration, TopicPartitionOffset)],
+  lostRenewals: Map[TopicPartitionOffset, LostRenewal]
 ) {
 
   def holds(offset: TopicPartitionOffset, deliveryCount: Short): Boolean =
@@ -118,12 +129,14 @@ final private[kafka] case class ShareConsumerState(
     copy(held = held -- offsets, acked = acked -- offsets, timed = timed -- timedEntries(offsets))
 
   // The poll's processing ended: its records can no longer be acknowledged or renewed.
-  def closed: ShareConsumerState = ShareConsumerState.empty.withLock(lock)
+  def closed: ShareConsumerState =
+    ShareConsumerState.empty.copy(lock = lock, lostRenewals = lostRenewals)
 
   /**
     * A renewal sent the pending acknowledgements and renewed the unacknowledged records at `at`.
-    * Those a poll returned are held again; the rest lost their lock. Records the user renewed
-    * replaced their earlier acknowledgement, and their time held restarts.
+    * Those a poll returned are held again; the rest count as lost, and are released should a later
+    * poll return them. Records the user renewed replaced their earlier acknowledgement, and their
+    * time held restarts.
     */
   def withRenewed(
     returned: Map[TopicPartitionOffset, KafkaByteConsumerRecord],
@@ -144,7 +157,8 @@ final private[kafka] case class ShareConsumerState(
       unsentSince = None,
       lockedSince = at,
       lock = reportedLock.orElse(lock),
-      timed = timed -- timedEntries(lost ++ byUser) ++ reset.map(at -> _)
+      timed = timed -- timedEntries(lost ++ byUser) ++ reset.map(at -> _),
+      lostRenewals = lostRenewals ++ lost.iterator.map(p => p -> LostRenewal(held(p).deliveryCount, at))
     )
   }
 
@@ -158,24 +172,39 @@ private[kafka] object ShareConsumerState {
 
   // Nothing held, before the first poll.
   val empty: ShareConsumerState =
-    ShareConsumerState(Map.empty, Set.empty, None, Duration.Zero, None, SortedSet.empty)
+    ShareConsumerState(Map.empty, Set.empty, None, Duration.Zero, None, SortedSet.empty, Map.empty)
 
-  // A new poll, started at `polledAt`, which `process` got at `at`.
+  /**
+    * A new poll, started at `polledAt`, which `process` got at `at`. The records of lost renewals
+    * it returned are not held but given back, to be released. Lost renewals older than the lock
+    * and the API timeout can't return any more, and are forgotten.
+    */
   def polled(
     deliveries: Vector[(TopicPartitionOffset, Delivery)],
     polledAt: FiniteDuration,
     reportedLock: Option[FiniteDuration],
+    apiTimeout: FiniteDuration,
     previous: ShareConsumerState
-  ): ShareConsumerState =
-    ShareConsumerState(
-      held = deliveries.toMap,
+  ): (ShareConsumerState, Vector[KafkaByteConsumerRecord]) = {
+    val (returned, fresh) =
+      if (previous.lostRenewals.isEmpty) (Vector.empty, deliveries)
+      else
+        deliveries.partition { case (p, d) =>
+          previous.lostRenewals.get(p).exists(_.deliveryCount == d.deliveryCount)
+        }
+    val forgotten = polledAt - previous.lock.getOrElse(Duration.Zero) - apiTimeout
+    val state = ShareConsumerState(
+      held = fresh.toMap,
       acked = Set.empty,
       unsentSince = None,
       lockedSince = polledAt,
       lock = reportedLock.orElse(previous.lock),
-      timed = SortedSet.empty[(FiniteDuration, TopicPartitionOffset)] ++ deliveries.map { case (p, d) =>
+      timed = SortedSet.empty[(FiniteDuration, TopicPartitionOffset)] ++ fresh.map { case (p, d) =>
         d.heldSince -> p
-      }
+      },
+      lostRenewals = (previous.lostRenewals -- returned.map(_._1)).filter { case (_, l) => l.at > forgotten }
     )
+    (state, returned.map(_._2.record))
+  }
 
 }

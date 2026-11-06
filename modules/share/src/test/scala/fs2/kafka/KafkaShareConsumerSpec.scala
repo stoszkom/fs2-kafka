@@ -230,6 +230,39 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       }
     }
 
+    // Java completes a renewal which outlasted its wait later, and its next poll returns the record
+    // with the same delivery count: it is released at once rather than handed out again, as its
+    // later acknowledgements have failed already.
+    it("should release a record returned by a renewal which outlasted its wait") {
+      withTopic { topic =>
+        createTopic(topic)
+        publish(topic, "0")
+        // The wait ends before the broker can answer, so the renewal is lost.
+        val settings = shareConsumerSettings.withRenewalMargin(1.nanosecond)
+        val (seen, lateAccept) = run(
+          (
+            Ref.of[IO, Vector[(String, Int)]](Vector.empty),
+            Ref.of[IO, Option[Either[Throwable, Unit]]](None)
+          ).flatMapN { (seen, lateAccept) =>
+            consumed(settings, topic) { consumer => records =>
+              records.traverse_ { r =>
+                seen
+                  .updateAndGet(_ :+ (r.record.value -> r.offset.deliveryCount.toInt))
+                  .flatMap { s =>
+                    if (s.size == 1)
+                      r.renew *> r.accept.attempt.flatMap(a => lateAccept.set(Some(a)))
+                    else r.accept *> consumer.stopConsuming
+                  }
+              }
+            } *> (seen.get, lateAccept.get).tupled
+          }
+        )
+        seen shouldBe Vector("0" -> 1, "0" -> 2)
+        lateAccept.flatMap(_.left.toOption).get shouldBe a[RecordNotInFlightException]
+        assertSettled(topic, settings)
+      }
+    }
+
     // Records of a finished poll stay in the state while the next polls return nothing: a renewal
     // of one must fail rather than reach Java, whose poll would acquire records outside the loop.
     it("should fail a renewal made after process returned") {

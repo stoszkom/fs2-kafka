@@ -302,16 +302,27 @@ object KafkaShareConsumer {
         .flatMap { now =>
           val deliveries = records.map(r => offsetOf(r) -> Delivery(r, deliveryCountOf(r), now))
           // Also when decoding fails or canceled: the poll is held from the state update on.
-          (state.update(ShareConsumerState.polled(deliveries, start, lock, _)) *>
-            cancelable(
-              Chunk
-                .from(records)
-                .traverse(decode)
-                .flatMap { chunk =>
-                  // The timers only end by failing, which cancels `process` and fails `consume`.
-                  F.race(F.both(timers, sendsWhenPaused) *> F.never[Unit], process(chunk)).void
+          state
+            .modify(ShareConsumerState.polled(deliveries, start, lock, config.apiTimeout, _))
+            .flatMap { returned =>
+              val fresh =
+                if (returned.isEmpty) records
+                else {
+                  val offsets = returned.map(offsetOf).toSet
+                  records.filterNot(r => offsets(offsetOf(r)))
                 }
-            )).guaranteeCase(outcome => mutex.lock.surround(releaseUnacked(ended = !outcome.isSuccess)))
+              releaseAtOnce(returned) *>
+                cancelable(
+                  Chunk
+                    .from(fresh)
+                    .traverse(decode)
+                    .flatMap { chunk =>
+                      // The timers only end by failing, which cancels `process` and fails `consume`.
+                      F.race(F.both(timers, sendsWhenPaused) *> F.never[Unit], process(chunk)).void
+                    }
+                ).whenA(fresh.nonEmpty)
+            }
+            .guaranteeCase(outcome => mutex.lock.surround(releaseUnacked(ended = !outcome.isSuccess)))
         }
 
     private def decode(record: KafkaByteConsumerRecord): F[AcknowledgeableConsumerRecord[F, K, V]] =
@@ -324,6 +335,15 @@ object KafkaShareConsumer {
             AcknowledgeableOffset(partition, offset, deliveryCountOf(record), this)
           )
         }
+
+    // Records a poll returned which `process` must not get: released and sent at once.
+    private def releaseAtOnce(records: Vector[KafkaByteConsumerRecord]): F[Unit] =
+      withConsumer
+        .blocking { consumer =>
+          records.foreach(consumer.acknowledge(_, AcknowledgeType.Release.asJava))
+          consumer.commitAsync()
+        }
+        .whenA(records.nonEmpty)
 
     // The records `process` left are released, sent with the next poll, or at once while paused or
     // when `consume` ended, as no poll follows. The poll is then closed, so that a late
@@ -398,7 +418,8 @@ object KafkaShareConsumer {
       * takes them back with a poll, which fetches nothing as no renewal is pending. Atomic under
       * the mutex, so an acknowledgement never sees a record being renewed. A renewal still pending
       * after the wait makes that poll fetch: new records it returns are released, and the renewed
-      * records count as lost. The wait is the renewal margin, at most half the lock.
+      * records count as lost; should Java complete the renewal later, the poll returning them
+      * releases them at once. The wait is the renewal margin, at most half the lock.
       */
     private def renew(byUser: Set[TopicPartitionOffset]): F[Unit] =
       (state.get, F.monotonic).tupled
@@ -432,13 +453,7 @@ object KafkaShareConsumer {
               }
               state.update(
                 _.withRenewed(returned.map(r => offsetOf(r) -> r).toMap, byUser, at, lock)
-              ) *>
-                withConsumer
-                  .blocking { consumer =>
-                    stray.foreach(consumer.acknowledge(_, AcknowledgeType.Release.asJava))
-                    consumer.commitAsync()
-                  }
-                  .whenA(stray.nonEmpty)
+              ) *> releaseAtOnce(stray)
             }
         }
 
