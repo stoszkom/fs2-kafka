@@ -332,7 +332,9 @@ object KafkaShareConsumer {
 
     // --- Acknowledgements ---
 
-    // The last acknowledgement of a delivery wins, as in Java.
+    // The last acknowledgement of a delivery wins, as in Java. Uncancelable once the mutex is held:
+    // a cancel after Java took an acknowledgement, but before the state did, would let a release
+    // replace it, and after a renewal it would leave the records the renewal returned unknown here.
     override def acknowledge(acks: Chunk[Acknowledgement]): F[Unit] =
       mutex.lock
         .surround(
@@ -348,6 +350,7 @@ object KafkaShareConsumer {
                     .traverse_(p => F.raiseError[Unit](RecordNotInFlightException(p._1, p._2)))
               }
             }
+            .uncancelable
         )
 
     // Gives the acknowledgements to Java, returning those Java no longer holds, which are dropped.
