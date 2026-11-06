@@ -14,9 +14,6 @@ import scala.concurrent.duration.*
 /**
   * What a share consumer reads from its settings and the Java consumer's properties, resolved once.
   *
-  * @param settings
-  *   the settings, with automatic renewal off in implicit acknowledgement mode, where Java does not
-  *   allow renewal
   * @param implicitMode
   *   whether Java accepts a poll's records on the next poll (`share.acknowledgement.mode`)
   */
@@ -61,7 +58,7 @@ private[kafka] object ShareConsumerConfig {
         )
 
       ShareConsumerConfig(
-        settings = if (implicitMode) settings.withAutoRenewal(false) else settings,
+        settings = settings,
         maxPollInterval = property(ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG, 300000L)(_.toLong).millis,
         apiTimeout = property(ConsumerConfig.DEFAULT_API_TIMEOUT_MS_CONFIG, 60000L)(_.toLong).millis,
         implicitMode = implicitMode

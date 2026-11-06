@@ -264,8 +264,8 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       }
     }
 
-    // Records of a finished poll stay in the state while the next polls return nothing: a renewal
-    // of one must fail rather than reach Java, whose poll would acquire records outside the loop.
+    // Once process returned, its poll is closed: a renewal of one of its records must fail rather
+    // than reach Java, whose poll would acquire records outside the loop.
     it("should fail a renewal made after process returned") {
       withTopic { topic =>
         createTopic(topic)

@@ -19,8 +19,7 @@ final private[kafka] case class Acknowledgement(
 )
 
 // Gives acknowledgements to the Java consumer of the records they are for. `acknowledgeChunks` groups
-// offsets by acknowledger: a consumer's actor by reference, a mapped one by its acknowledger and
-// function.
+// offsets by acknowledger: a consumer by reference, a mapped one by its acknowledger and function.
 private[kafka] trait Acknowledger[F[_]] {
 
   def acknowledge(acks: Chunk[Acknowledgement]): F[Unit]

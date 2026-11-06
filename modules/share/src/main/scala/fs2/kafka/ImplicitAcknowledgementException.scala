@@ -9,13 +9,13 @@ package fs2.kafka
 import org.apache.kafka.common.KafkaException
 
 /**
-  * [[ImplicitAcknowledgementException]] indicates an acknowledgement on a share consumer in
-  * implicit acknowledgement mode, where the records of a poll are accepted by the next poll or
-  * commit instead, as with Java's share consumer.
+  * [[ImplicitAcknowledgementException]] indicates `consume` on a share consumer in implicit
+  * acknowledgement mode, where records cannot be acknowledged: [[KafkaShareConsumer.autoConsume]]
+  * accepts a poll once `process` returned instead.
   */
 sealed abstract class ImplicitAcknowledgementException
   extends KafkaException(
-    "records cannot be acknowledged with share.acknowledgement.mode=implicit; they are accepted by the next poll"
+    "records cannot be acknowledged with share.acknowledgement.mode=implicit: use autoConsume"
   )
 
 private[kafka] object ImplicitAcknowledgementException {

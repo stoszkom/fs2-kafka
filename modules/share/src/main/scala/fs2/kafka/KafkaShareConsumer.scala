@@ -44,7 +44,9 @@ import scala.concurrent.duration.*
   * A share consumer which runs Java's loop: it polls, runs `process` on the poll's records, and
   * polls again once `process` returned. No poll runs while `process` runs, so acknowledgements go
   * straight into the Java consumer, under a mutex shared with the renewals and delayed sends which
-  * run meanwhile.
+  * run meanwhile.<br><br>
+  *
+  * Experimental: this API targets Kafka's share groups and may change in minor releases.
   */
 sealed abstract class KafkaShareConsumer[F[_], K, V] extends KafkaShareSubscription[F] with KafkaMetrics[F] {
 

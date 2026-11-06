@@ -36,9 +36,8 @@ import cats.~>
 sealed abstract class AcknowledgeableConsumerRecord[F[_], +K, +V] { self =>
 
   /**
-    * The Kafka record for the [[AcknowledgeableConsumerRecord]]. In implicit acknowledgement mode,
-    * simply use this to get the [[ConsumerRecord]] and discard the [[offset]]. In explicit
-    * acknowledgement mode, every record needs to be acknowledged through its [[offset]].
+    * The Kafka record for the [[AcknowledgeableConsumerRecord]]. Every record needs to be
+    * acknowledged through its [[offset]].
     */
   def record: ConsumerRecord[K, V]
 

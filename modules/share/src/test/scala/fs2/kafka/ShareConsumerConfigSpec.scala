@@ -25,11 +25,9 @@ final class ShareConsumerConfigSpec extends BaseSpec {
       assert(c.maxPollInterval == 5.minutes && c.apiTimeout == 1.minute)
     }
 
-    it("should read the mode as Java does, and turn renewal off in implicit mode") {
-      val c = config(
-        settings.withAutoRenewal(true).withProperty("share.acknowledgement.mode", " implicit\n")
-      )
-      assert(c.implicitMode && !c.settings.autoRenewal)
+    it("should read the mode as Java does") {
+      val c = config(settings.withProperty("share.acknowledgement.mode", " implicit\n"))
+      assert(c.implicitMode)
     }
 
     it("should read the poll and API timeouts") {

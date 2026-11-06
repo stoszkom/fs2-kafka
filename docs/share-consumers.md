@@ -182,7 +182,7 @@ With `withAutoRenewal(true)`, records without an acknowledgement are renewed `wi
 
 - **Without auto-renewal, keep processing within the lock** and `max.poll.interval.ms`, as in Java. A record whose lock expired is delivered again, possibly to another consumer, but `process` still holds it, and this consumer does not poll until `process` returns.
 
-- **A record whose processing hangs** holds back its consumer, renewed until the consumer is stopped or closed, unless you set `withMaxProcessingTime`. A record held without an acknowledgement for longer is released and delivered again; the release is sent at once. The time counts from when `process` got the poll, or from your latest `Renew` of the record, so set it well above the time to process a whole poll. Its processing is not cancelled, and its later acknowledgement fails with a `RecordNotInFlightException`.
+- **A record whose processing hangs** holds back its consumer, renewed for as long as `process` runs, since stopping waits for it, unless you set `withMaxProcessingTime`. A record held without an acknowledgement for longer is released and delivered again; the release is sent at once. The time counts from when `process` got the poll, or from your latest `Renew` of the record, so set it well above the time to process a whole poll. Its processing is not cancelled, and its later acknowledgement fails with a `RecordNotInFlightException`.
 
 - **A late acknowledgement fails** with a `RecordNotInFlightException` once the consumer has let go of the record. One for a record whose lock has expired is rejected by the broker when it is sent, see [acknowledging](#acknowledging). Either way, the record is processed again after its redelivery.
 
@@ -240,7 +240,7 @@ Pausing stops new records. For a record whose processing fails while the service
 With implicit acknowledgement, records cannot be acknowledged, and `consume` fails with an `ImplicitAcknowledgementException`. Instead, `autoConsume` gives `process` plain `ConsumerRecord`s, and accepts the poll once `process` returned, as the next poll of a Java loop would. This is at-least-once, like the Java loop: if `process` fails, the poll is not accepted, and closing the consumer releases its records, so they are delivered again. As any later poll would accept them, the consumer then refuses to consume again; close it and create a new one.
 
 ```scala mdoc:silent
-val implicitly: IO[Unit] =
+val implicitMode: IO[Unit] =
   KafkaShareConsumer
     .resource(settings.withAcknowledgementMode(ShareAcknowledgementMode.Implicit))
     .use { consumer =>

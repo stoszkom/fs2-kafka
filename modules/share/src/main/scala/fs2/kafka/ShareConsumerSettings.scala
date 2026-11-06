@@ -219,9 +219,9 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
     * Creates a new [[ShareConsumerSettings]] with the specified [[autoRenewal]].<br><br>
     *
     * Without it, a record neither acknowledged nor renewed in time is delivered again, possibly to
-    * another consumer; the other records are renewed only while an acknowledgement waits for a
-    * record you renewed. Enable it when processing may outlast the lock. A hung record is then
-    * renewed until the consumer is closed or stopped, or the [[maxProcessingTime]] passes.
+    * another consumer; a renewal you make renews every unacknowledged record of the poll with it.
+    * Enable it when processing may outlast the lock. A hung record is then renewed until `consume`
+    * is canceled or the [[maxProcessingTime]] passes, as stopping waits for `process`.
     */
   def withAutoRenewal(enabled: Boolean): ShareConsumerSettings[F, K, V]
 

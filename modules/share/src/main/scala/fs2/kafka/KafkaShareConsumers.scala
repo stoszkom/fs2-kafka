@@ -21,7 +21,9 @@ import scala.collection.immutable.SortedSet
 
 /**
   * Share consumers of the same share group, each with its own Java consumer and its own loop, so
-  * that polls are processed in parallel across consumers, one at a time within each.
+  * that polls are processed in parallel across consumers, one at a time within each.<br><br>
+  *
+  * Experimental: this API targets Kafka's share groups and may change in minor releases.
   */
 sealed abstract class KafkaShareConsumers[F[_], K, V] extends KafkaShareSubscription[F] {
 
