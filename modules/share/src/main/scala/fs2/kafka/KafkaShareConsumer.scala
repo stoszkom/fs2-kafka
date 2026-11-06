@@ -449,15 +449,18 @@ object KafkaShareConsumer {
 
     private def nextDeadline(s: ShareConsumerState): Option[FiniteDuration] = deadlines(s).next
 
+    // Does one due thing at a time and looks again, since what is done moves only its own deadline:
+    // a renewal due together with an overdue release would otherwise wait for the next state change,
+    // as an unchanged deadline doesn't re-arm the timer.
     private def due: F[Unit] =
       (state.get, F.monotonic).tupled
         .flatMap { case (s, now) =>
           val d = deadlines(s)
           // Overdue records are released and sent at once, so that a late acknowledgement can't replace it.
           if (d.overdue.exists(_ <= now))
-            settings.maxProcessingTime.traverse_(max => release(s.overdue(max, now))) *> send
-          else if (d.renewal.exists(_ <= now)) renew(Set.empty)
-          else if (d.send.exists(_ <= now)) send
+            settings.maxProcessingTime.traverse_(max => release(s.overdue(max, now))) *> send *> due
+          else if (d.renewal.exists(_ <= now)) renew(Set.empty) *> due
+          else if (d.send.exists(_ <= now)) send *> due
           else F.unit
         }
 
