@@ -10,6 +10,7 @@ import cats.MonadThrow
 import cats.Reducible
 import cats.effect.Async
 import cats.effect.Deferred
+import cats.effect.Poll
 import cats.effect.Ref
 import cats.effect.Resource
 import cats.effect.std.Mutex
@@ -177,7 +178,10 @@ object KafkaShareConsumer {
       process: Chunk[AcknowledgeableConsumerRecord[F, K, V]] => F[Unit]
     ): F[Unit] =
       if (config.implicitMode) F.raiseError(ImplicitAcknowledgementException())
-      else exclusively(loop((records, start, lock) => processed(records, start, lock, process)))
+      else
+        exclusively(
+          loop((cancelable, records, start, lock) => processed(cancelable, records, start, lock, process))
+        )
 
     override def autoConsume(process: Chunk[ConsumerRecord[K, V]] => F[Unit]): F[Unit] =
       if (!config.implicitMode)
@@ -186,12 +190,14 @@ object KafkaShareConsumer {
         )
       else
         exclusively(
-          loop { case (records, _, _) =>
+          loop { case (cancelable, records, _, _) =>
             // Accepting at once, rather than with the next poll, also covers a pause after it.
-            Chunk
-              .from(records)
-              .traverse(ConsumerRecord.fromJava(_, keyDeserializer, valueDeserializer))
-              .flatMap(process)
+            cancelable(
+              Chunk
+                .from(records)
+                .traverse(ConsumerRecord.fromJava(_, keyDeserializer, valueDeserializer))
+                .flatMap(process)
+            )
               // Also when canceled, e.g. as another of several consumers failed.
               .guaranteeCase(outcome => poisoned.set(true).unlessA(outcome.isSuccess)) *>
               withConsumer.blocking(_.commitAsync())
@@ -225,9 +231,16 @@ object KafkaShareConsumer {
         )
 
     // Polls until stopped, waiting while paused, and gives each poll to `run` with when it started
-    // and the lock the broker reported.
+    // and the lock the broker reported. A poll can't be canceled until `run` has taken its records:
+    // Java holds them from the poll on, and a cancel in between would leave them unknown here. `run`
+    // lets the processing be canceled again with the `Poll` it gets.
     private def loop(
-      run: (Vector[KafkaByteConsumerRecord], FiniteDuration, Option[FiniteDuration]) => F[Unit]
+      run: (
+        Poll[F],
+        Vector[KafkaByteConsumerRecord],
+        FiniteDuration,
+        Option[FiniteDuration]
+      ) => F[Unit]
     ): F[Unit] = {
       // A stop already requested wins: racing it against a wait which is already complete could pick
       // the wait and poll again.
@@ -240,14 +253,15 @@ object KafkaShareConsumer {
           .flatMap {
             case Left(_) => finalCommit
             case Right(_) =>
-              F.monotonic
-                .flatMap { start =>
+              F.uncancelable { cancelable =>
+                F.monotonic.flatMap { start =>
                   poll.flatMap {
-                    case None => F.sleep(subscriptionCheckInterval) *> next
+                    case None => F.pure(false)
                     case Some((records, lock)) =>
-                      run(records, start, lock).whenA(records.nonEmpty) *> next
+                      run(cancelable, records, start, lock).whenA(records.nonEmpty).as(true)
                   }
                 }
+              }.flatMap(polled => F.sleep(subscriptionCheckInterval).unlessA(polled) *> next)
           }
       next
     }
@@ -273,6 +287,7 @@ object KafkaShareConsumer {
     // --- One poll in explicit mode ---
 
     private def processed(
+      cancelable: Poll[F],
       records: Vector[KafkaByteConsumerRecord],
       start: FiniteDuration,
       lock: Option[FiniteDuration],
@@ -281,15 +296,17 @@ object KafkaShareConsumer {
       F.monotonic
         .flatMap { now =>
           val deliveries = records.map(r => offsetOf(r) -> Delivery(r, deliveryCountOf(r), now))
-          // Also when decoding fails: the poll is held from the state update on.
+          // Also when decoding fails or canceled: the poll is held from the state update on.
           (state.update(ShareConsumerState.polled(deliveries, start, lock, _)) *>
-            Chunk
-              .from(records)
-              .traverse(decode)
-              .flatMap { chunk =>
-                // The timers only end by failing, which cancels `process` and fails `consume`.
-                F.race(F.both(timers, sendsWhenPaused) *> F.never[Unit], process(chunk)).void
-              }).guaranteeCase(outcome => mutex.lock.surround(releaseUnacked(ended = !outcome.isSuccess)))
+            cancelable(
+              Chunk
+                .from(records)
+                .traverse(decode)
+                .flatMap { chunk =>
+                  // The timers only end by failing, which cancels `process` and fails `consume`.
+                  F.race(F.both(timers, sendsWhenPaused) *> F.never[Unit], process(chunk)).void
+                }
+            )).guaranteeCase(outcome => mutex.lock.surround(releaseUnacked(ended = !outcome.isSuccess)))
         }
 
     private def decode(record: KafkaByteConsumerRecord): F[AcknowledgeableConsumerRecord[F, K, V]] =
