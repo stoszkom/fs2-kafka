@@ -740,32 +740,34 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
   }
 
   describe("acknowledgeChunks") {
-    it("should acknowledge offsets mapped with different functions through each") {
+    it("should acknowledge a run of offsets mapped with different functions through the first") {
       withTopic { topic =>
         createTopic(topic)
         publish(topic, "0", "1")
+        // Each record is mapped with its own function; a chunk's records are still one run.
         val calls = run(
-          (Ref.of[IO, Set[String]](Set.empty), Ref.of[IO, Int](0)).flatMapN { (called, count) =>
+          (
+            Ref.of[IO, Vector[String]](Vector.empty),
+            Ref.of[IO, Vector[String]](Vector.empty),
+            Ref.of[IO, Int](0)
+          ).flatMapN { (called, expected, count) =>
             def tagged(tag: String): IO ~> IO = new (IO ~> IO) {
-              def apply[A](io: IO[A]): IO[A] = called.update(_ + tag) *> io
+              def apply[A](io: IO[A]): IO[A] = called.update(_ :+ tag) *> io
             }
-            val (first, second) = (tagged("first"), tagged("second"))
             consumed(shareConsumerSettings, topic) { consumer => records =>
+              val tags = records.map(r => if (r.record.value == "0") "first" else "second")
               Stream
-                .chunk(records)
-                .map { r =>
-                  val f = if (r.record.value == "0") first else second
-                  r.offset.mapK(f) -> accepting
-                }
+                .chunk(records.zip(tags))
+                .map { case (r, tag) => r.offset.mapK(tagged(tag)) -> accepting }
                 .through(acknowledgeChunks[IO])
                 .compile
-                .drain *> count
+                .drain *> expected.update(_ :+ tags(0)) *> count
                 .updateAndGet(_ + records.size)
                 .flatMap(n => consumer.stopConsuming.whenA(n >= 2))
-            } *> called.get
+            } *> (called.get, expected.get).tupled
           }
         )
-        calls shouldBe Set("first", "second")
+        calls._1 shouldBe calls._2
       }
     }
 

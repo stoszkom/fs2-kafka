@@ -31,7 +31,7 @@ import cats.~>
   * In implicit acknowledgement mode, records cannot be acknowledged: the consumer accepts a poll
   * once `process` returned, see [[KafkaShareConsumer.autoConsume]].
   *
-  * Experimental: this API targets Kafka's share groups and may change in minor releases.
+  * Experimental: this API targets Kafka's share groups.
   */
 sealed abstract class AcknowledgeableConsumerRecord[F[_], +K, +V] { self =>
 

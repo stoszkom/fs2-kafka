@@ -46,7 +46,7 @@ import scala.concurrent.duration.*
   * straight into the Java consumer, under a mutex shared with the renewals and delayed sends which
   * run meanwhile.<br><br>
   *
-  * Experimental: this API targets Kafka's share groups and may change in minor releases.
+  * Experimental: this API targets Kafka's share groups.
   */
 sealed abstract class KafkaShareConsumer[F[_], K, V] extends KafkaShareSubscription[F] with KafkaMetrics[F] {
 

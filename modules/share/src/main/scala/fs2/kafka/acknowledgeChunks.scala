@@ -26,8 +26,9 @@ object acknowledgeChunks {
   def apply[F[_]](implicit
     F: MonadThrow[F]
   ): Pipe[F, (AcknowledgeableOffset[F], AcknowledgeType), Unit] =
-    // Usually a chunk goes to one consumer. Runs of offsets mapped with different `mapK` functions are
-    // acknowledged through each, one after another in the chunk's order, as the last acknowledgement wins.
+    // Usually a chunk goes to one consumer. Runs of offsets of different consumers are acknowledged
+    // one after another in the chunk's order, as the last acknowledgement wins. A run goes through
+    // its first offset's acknowledger, which is equal to the others' and may be a mapped one.
     _.chunks.evalMap(chunk => runs(chunk.toVector).traverse_(acknowledge(_)))
 
   private def runs[F[_]](

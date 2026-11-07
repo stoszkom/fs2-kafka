@@ -32,7 +32,7 @@ import scala.concurrent.duration.*
   *
   * Use `ShareConsumerSettings#apply` to create a new instance.<br><br>
   *
-  * Experimental: this API targets Kafka's new share groups and may change in minor releases.
+  * Experimental: this API targets Kafka's new share groups.
   */
 sealed abstract class ShareConsumerSettings[F[_], K, V] {
 

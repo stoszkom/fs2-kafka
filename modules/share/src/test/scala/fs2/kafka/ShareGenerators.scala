@@ -6,7 +6,7 @@
 
 package fs2.kafka
 
-import cats.ApplicativeThrow
+import cats.Applicative
 import fs2.Chunk
 import fs2.kafka.internal.Acknowledgement
 import fs2.kafka.internal.Acknowledger
@@ -17,12 +17,12 @@ import org.scalacheck.rng.Seed
 
 trait ShareGenerators extends BaseGenerators {
 
-  def genAcknowledger[F[_]: ApplicativeThrow]: Gen[Acknowledger[F]] =
+  def genAcknowledger[F[_]: Applicative]: Gen[Acknowledger[F]] =
     Gen.const(new Acknowledger[F] {
-      override def acknowledge(acks: Chunk[Acknowledgement]): F[Unit] = ApplicativeThrow[F].unit
+      override def acknowledge(acks: Chunk[Acknowledgement]): F[Unit] = Applicative[F].unit
     })
 
-  def genAcknowledgeableOffset[F[_]: ApplicativeThrow]: Gen[AcknowledgeableOffset[F]] =
+  def genAcknowledgeableOffset[F[_]: Applicative]: Gen[AcknowledgeableOffset[F]] =
     for {
       topicPartition <- genTopicPartition
       offset <- Gen.posNum[Long]
@@ -30,7 +30,7 @@ trait ShareGenerators extends BaseGenerators {
       acknowledger <- genAcknowledger[F]
     } yield AcknowledgeableOffset[F](topicPartition, offset, deliveryCount, acknowledger)
 
-  implicit def arbAcknowledgeableOffset[F[_]: ApplicativeThrow]: Arbitrary[AcknowledgeableOffset[F]] =
+  implicit def arbAcknowledgeableOffset[F[_]: Applicative]: Arbitrary[AcknowledgeableOffset[F]] =
     Arbitrary(genAcknowledgeableOffset[F])
 
   implicit def cogenAcknowledgeableOffset[F[_]]: Cogen[AcknowledgeableOffset[F]] =
@@ -43,7 +43,7 @@ trait ShareGenerators extends BaseGenerators {
     }
 
   def genAcknowledgeableConsumerRecord[
-    F[_]: ApplicativeThrow,
+    F[_]: Applicative,
     K: Arbitrary,
     V: Arbitrary
   ]: Gen[AcknowledgeableConsumerRecord[F, K, V]] =
@@ -53,7 +53,7 @@ trait ShareGenerators extends BaseGenerators {
     } yield AcknowledgeableConsumerRecord[F, K, V](record, offset)
 
   implicit def arbAcknowledgeableConsumerRecord[
-    F[_]: ApplicativeThrow,
+    F[_]: Applicative,
     K: Arbitrary,
     V: Arbitrary
   ]: Arbitrary[AcknowledgeableConsumerRecord[F, K, V]] =

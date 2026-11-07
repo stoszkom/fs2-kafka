@@ -2,7 +2,7 @@
 
 Share consumers read from a Kafka share group ([KIP-932](https://cwiki.apache.org/confluence/display/KAFKA/KIP-932%3A+Queues+for+Kafka)), using the [Java share consumer][java-share-consumer]. Instead of committing one offset per partition, we acknowledge each delivered record, and several consumers can process records from the same partition.
 
-> **Experimental.** The API may change in minor releases.
+> **Experimental.** The module targets Kafka's share groups, introduced by KIP-932.
 
 Share consumers are in a separate module, which depends on the core module.
 
