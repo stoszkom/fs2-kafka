@@ -14,7 +14,9 @@ import cats.syntax.all.*
 import cats.~>
 import fs2.Chunk
 import fs2.Stream
+import fs2.concurrent.Signal
 import fs2.concurrent.SignallingRef
+import org.apache.kafka.common.KafkaException
 import org.apache.kafka.common.config.ConfigException
 import scala.collection.immutable.SortedSet
 import scala.concurrent.duration.*
@@ -636,11 +638,12 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         createTopic(topic)
         publish(topic, "0", "1")
         val settings = shareConsumerSettings.withMaxPollRecords(2)
+        // The second record is released past its lock, which the broker rejects when stopping.
         run(
           firstPoll(settings.withMaxAcknowledgementDelay(100.millis), topic) { records =>
             records.head.get.accept *> IO.sleep(lock + 1.second) *>
               records.drop(1).traverse_(_.release.attempt)
-          }
+          }.attempt
         )
         publish(topic, "after")
         readUntil(topic, settings, "after").map(_._1) shouldBe Vector("1", "after")
@@ -768,6 +771,36 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
           }
         )
         calls._1 shouldBe calls._2
+      }
+    }
+
+    it("should keep the held delivery's acknowledgement over a later one of an earlier delivery") {
+      withTopic { topic =>
+        createTopic(topic)
+        publish(topic, "0")
+        val settings = shareConsumerSettings
+        run(
+          Ref
+            .of[IO, Vector[AcknowledgeableOffset[IO]]](Vector.empty)
+            .flatMap { offsets =>
+              consumed(settings, topic) { consumer =>
+                _.traverse_ { r =>
+                  offsets
+                    .updateAndGet(_ :+ r.offset)
+                    .flatMap { seen =>
+                      if (seen.size == 1) r.release
+                      else
+                        Stream
+                          .chunk(Chunk(r.offset -> accepting, seen.head -> accepting))
+                          .through(acknowledgeChunks[IO])
+                          .compile
+                          .drain *> consumer.stopConsuming
+                    }
+                }
+              }
+            }
+        )
+        assertSettled(topic, settings)
       }
     }
 
@@ -927,6 +960,66 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       }
     }
 
+    // Java's unsubscribe doesn't send what is pending, so the record would be delivered again.
+    // The consumer idles unsubscribed past the lock while the record is read again, so no final
+    // commit helps.
+    it("should send the pending acknowledgements before unsubscribing") {
+      withTopic { topic =>
+        createTopic(topic)
+        publish(topic, "0")
+        val settings = shareConsumerSettings
+        run(
+          Deferred[IO, Unit].flatMap { returned =>
+            KafkaShareConsumer
+              .resource(settings)
+              .use { consumer =>
+                consumer.subscribeTo(topic) *>
+                  consumer
+                    .consume(
+                      _.traverse_(_.accept) *> consumer.unsubscribe *> returned.complete(()).void
+                    )
+                    .background
+                    .use(done =>
+                      returned.get *> IO.sleep(lock + 2.seconds) *> IO.blocking(
+                        assertSettled(topic, settings)
+                      ) *> consumer.stopConsuming *> done.flatMap(_.embedNever)
+                    )
+              }
+          }
+        )
+      }
+    }
+
+    // The renewal is due again before it returns, which must not keep acknowledgements out.
+    it("should let acknowledgements in while each renewal outlasts the renewal interval") {
+      withTopic { topic =>
+        createTopic(topic)
+        publish(topic, "0")
+        val settings = shareConsumerSettings.withAutoRenewal(true).withRenewalMargin(lock - 1.nanosecond)
+        run(
+          consumed(settings, topic)(consumer =>
+            _.traverse_(r => IO.sleep(2.seconds) *> r.accept.timeout(20.seconds)) *> consumer.stopConsuming
+          )
+        )
+        assertSettled(topic, settings)
+      }
+    }
+
+    it("should renew a record automatically while it is decoded past its lock") {
+      withTopic { topic =>
+        createTopic(topic)
+        publish(topic, "0")
+        val base = shareConsumerSettings
+        val values =
+          Deserializer.lift[IO, String](bytes => IO.sleep(lock + 1.second).as(new String(bytes)))
+        val settings = ShareConsumerSettings(Deserializer[IO, String], values)
+          .withProperties(base.properties)
+          .withAutoRenewal(true)
+        acceptAll(settings, topic, 1)(_ => IO.unit) shouldBe Vector("0" -> 1)
+        assertSettled(topic, base)
+      }
+    }
+
     it("should count the max processing time from the user's latest renewal") {
       withTopic { topic =>
         createTopic(topic)
@@ -963,12 +1056,17 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         createTopic(topic)
         publish(topic, "0", "1")
         val settings = shareConsumerSettings.withMaxPollRecords(2)
-        val late = run(
-          firstPoll(settings.withAutoRenewal(false), topic)(records =>
-            IO.sleep(lock + 1.second) *> records.traverse(_.accept.attempt)
-          )
+        val (stopped, late) = run(
+          Ref
+            .of[IO, Chunk[Either[Throwable, Unit]]](Chunk.empty)
+            .flatMap { late =>
+              firstPoll(settings.withAutoRenewal(false), topic)(records =>
+                IO.sleep(lock + 1.second) *> records.traverse(_.accept.attempt).flatMap(late.set)
+              ).attempt.flatMap(stopped => late.get.tupleLeft(stopped))
+            }
         )
         late.toList.distinct shouldBe List(Right(()))
+        stopped.left.toOption.get shouldBe a[KafkaException]
         all(readUntil(topic, settings, "1").map(_._2)) should be >= 2
       }
     }
@@ -1033,6 +1131,47 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       }
     }
 
+    it("should send the acknowledgements of a poll when a pause starts right after it") {
+      withTopic { topic =>
+        createTopic(topic)
+        publish(topic, "0")
+        val settings = shareConsumerSettings.withoutMaxAcknowledgementDelay
+        val seen = run(
+          (
+            SignallingRef[IO, Boolean](false),
+            Ref.of[IO, Boolean](false),
+            Ref.of[IO, Vector[Int]](Vector.empty)
+          ).flatMapN { (paused, armed, seen) =>
+            // Pauses right after the consumer read the signal once process returned.
+            val signal = new Signal[IO, Boolean] {
+              override def discrete: Stream[IO, Boolean] = paused.discrete
+              override def continuous: Stream[IO, Boolean] = paused.continuous
+              override def get: IO[Boolean] =
+                paused.get <* armed.getAndSet(false).ifM(paused.set(true), IO.unit)
+            }
+            KafkaShareConsumer
+              .resource(settings.withPauseWhen(signal))
+              .use { consumer =>
+                consumer.subscribeTo(topic) *>
+                  consumer
+                    .consume(
+                      _.traverse_(r => seen.update(_ :+ r.offset.deliveryCount.toInt) *> r.accept) *>
+                        armed.set(true)
+                    )
+                    .background
+                    // Past the record's lock, also after joining the group.
+                    .use(done =>
+                      IO.sleep(lock + 8.seconds) *> paused.set(false) *> IO.sleep(3.seconds) *>
+                        consumer.stopConsuming *> done.flatMap(_.embedNever)
+                    )
+              } *> seen.get
+          }
+        )
+        seen shouldBe Vector(1)
+        assertSettled(topic, settings)
+      }
+    }
+
     it("should accept a poll while paused in implicit mode") {
       withTopic { topic =>
         createTopic(topic)
@@ -1058,6 +1197,20 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
   }
 
   describe("stopping") {
+    it("should raise the broker's rejection of the last acknowledgements") {
+      withTopic { topic =>
+        createTopic(topic)
+        publish(topic, "0")
+        val settings = shareConsumerSettings.withoutMaxAcknowledgementDelay
+        val result = run(
+          consumed(settings, topic)(consumer =>
+            _.traverse_(r => IO.sleep(lock + 1.second) *> r.accept) *> consumer.stopConsuming
+          ).attempt
+        )
+        result.left.toOption.get shouldBe a[KafkaException]
+      }
+    }
+
     it("should send the last acknowledgements before finishing after stopping") {
       withTopic { topic =>
         createTopic(topic)

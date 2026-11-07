@@ -6,7 +6,6 @@
 
 package fs2.kafka
 
-import cats.MonadThrow
 import cats.Reducible
 import cats.effect.Async
 import cats.effect.Deferred
@@ -61,7 +60,10 @@ sealed abstract class KafkaShareConsumer[F[_], K, V] extends KafkaShareSubscript
     * finishes. Acknowledgements are sent after the `maxAcknowledgementDelay`, at once while paused,
     * or with the next poll. Records `process` leaves unacknowledged are released once it returns;
     * if it fails, they are released and the error is raised. Acknowledging a record after `process`
-    * returned fails with a [[RecordNotInFlightException]].
+    * returned fails with a [[RecordNotInFlightException]].<br><br>
+    *
+    * The last acknowledgements are sent before it returns, and it fails if the broker rejects them.
+    * Those sent earlier, without waiting, can fail unnoticed; their records are delivered again.
     */
   def consume(process: Chunk[AcknowledgeableConsumerRecord[F, K, V]] => F[Unit]): F[Unit]
 
@@ -134,14 +136,6 @@ object KafkaShareConsumer {
   // How often an unsubscribed consumer checks for a subscription.
   private val subscriptionCheckInterval: FiniteDuration = 50.millis
 
-  // Java's `commitSync`, failing with a ShareCommitTimeoutException once the timeout passed.
-  private def commitSync[F[_]](withConsumer: WithShareConsumer[F], timeout: FiniteDuration)(implicit
-    F: MonadThrow[F]
-  ): F[Unit] =
-    withConsumer
-      .blocking(consumer => consumer.commitSync(timeout.toJava): Unit)
-      .adaptError { case error: TimeoutException => ShareCommitTimeoutException(timeout, error) }
-
   final private class Impl[F[_], K, V](
     config: ShareConsumerConfig[F, K, V],
     keyDeserializer: KeyDeserializer[F, K],
@@ -167,7 +161,20 @@ object KafkaShareConsumer {
     override def subscribe[G[_]: Reducible](topics: G[String]): F[Unit] =
       withConsumer.blocking(_.subscribe(topics.toList.asJava))
 
-    override def unsubscribe: F[Unit] = withConsumer.blocking(_.unsubscribe())
+    // Java's unsubscribe doesn't send what is pending, and a later commit may be long off. In implicit
+    // mode a commit would accept records still being processed. A timeout doesn't stop leaving.
+    override def unsubscribe: F[Unit] =
+      if (config.implicitMode) withConsumer.blocking(_.unsubscribe())
+      else
+        mutex.lock.surround(
+          (withConsumer.blocking { consumer =>
+            Either
+              .catchOnly[TimeoutException](consumer.commitSync(settings.commitTimeout.toJava))
+              .void
+              .getOrElse(())
+            consumer.unsubscribe()
+          } *> state.update(_.withoutAcked)).uncancelable
+        )
 
     override def subscription: F[SortedSet[String]] =
       withConsumer.blocking(_.subscription().toSortedSet)
@@ -273,7 +280,13 @@ object KafkaShareConsumer {
       next
     }
 
-    private def unpaused: F[Unit] = settings.pauseWhen.traverse_(_.waitUntil(!_))
+    // A pause starting after the poll was closed found nothing to send there, and no poll follows.
+    private def unpaused: F[Unit] =
+      settings.pauseWhen.traverse_ { signal =>
+        signal.get.flatMap(paused =>
+          (withConsumer.blocking(_.commitAsync()) *> signal.waitUntil(!_)).whenA(paused)
+        )
+      }
 
     private def paused: F[Boolean] = settings.pauseWhen.fold(F.pure(false))(_.get)
 
@@ -288,8 +301,19 @@ object KafkaShareConsumer {
           )
       }
 
+    // Java returns what the broker rejected instead of throwing it. Once unsubscribed there is nothing
+    // to report: the records were given up with the subscription.
     private def finalCommit: F[Unit] =
-      commitSync(withConsumer, settings.commitTimeout)
+      withConsumer
+        .blocking { consumer =>
+          val results = consumer.commitSync(settings.commitTimeout.toJava)
+          if (consumer.subscription().isEmpty) None
+          else results.values.asScala.flatMap(_.toScala).headOption
+        }
+        .adaptError { case error: TimeoutException =>
+          ShareCommitTimeoutException(settings.commitTimeout, error)
+        }
+        .flatMap(_.traverse_(F.raiseError[Unit](_)))
 
     // --- One poll in explicit mode ---
 
@@ -306,22 +330,15 @@ object KafkaShareConsumer {
           // Also when decoding fails or canceled: the poll is held from the state update on.
           state
             .modify(ShareConsumerState.polled(deliveries, start, lock, config.apiTimeout, _))
-            .flatMap { returned =>
-              val fresh =
-                if (returned.isEmpty) records
-                else {
-                  val offsets = returned.map(offsetOf).toSet
-                  records.filterNot(r => offsets(offsetOf(r)))
-                }
+            .flatMap { case (returned, fresh) =>
               releaseAtOnce(returned) *>
                 cancelable(
-                  Chunk
-                    .from(fresh)
-                    .traverse(decode)
-                    .flatMap { chunk =>
-                      // The timers only end by failing, which cancels `process` and fails `consume`.
-                      F.race(F.both(timers, sendsWhenPaused) *> F.never[Unit], process(chunk)).void
-                    }
+                  // The timers only end by failing, which cancels `process` and fails `consume`. They
+                  // also run while decoding, as the records' locks have started.
+                  F.race(
+                    F.both(timers, sendsWhenPaused) *> F.never[Unit],
+                    Chunk.from(fresh).traverse(decode).flatMap(process)
+                  ).void
                 ).whenA(fresh.nonEmpty)
             }
             .guaranteeCase(outcome => mutex.lock.surround(releaseUnacked(ended = !outcome.isSuccess)))
@@ -366,9 +383,9 @@ object KafkaShareConsumer {
       mutex.lock
         .surround(
           state.get.flatMap { s =>
-            val last = acks.toVector.map(a => a.offset -> a).toMap.values.toVector
-            val (held, notHeld) = last.partition(a => s.holds(a.offset, a.deliveryCount))
-            val (renewals, now) = held.partition(_.acknowledgeType == AcknowledgeType.Renew)
+            val (held, notHeld) = acks.toVector.partition(a => s.holds(a.offset, a.deliveryCount))
+            val last = held.map(a => a.offset -> a).toMap.values.toVector
+            val (renewals, now) = last.partition(_.acknowledgeType == AcknowledgeType.Renew)
             recordInJava(s, now.map(a => a.offset -> a.acknowledgeType)).flatMap { gone =>
               val renewed =
                 if (renewals.isEmpty) F.pure(Set.empty[TopicPartitionOffset])
@@ -484,10 +501,10 @@ object KafkaShareConsumer {
         .switchMap {
           case None => Stream.empty
           case Some(at) =>
-            // `due` changes the deadline, which switches to a new inner stream: uncancelable, so
-            // that the switch can't stop it between a release and its send.
+            // `due` changes the deadline, which switches to a new inner stream: each step is
+            // uncancelable, so that the switch can't stop it between a release and its send.
             Stream.eval(F.monotonic).flatMap(now => Stream.sleep_[F](at - now)) ++
-              Stream.exec(mutex.lock.surround(due).uncancelable)
+              Stream.exec(due)
         }
         .compile
         .drain
@@ -505,17 +522,22 @@ object KafkaShareConsumer {
 
     // Does one due thing at a time and looks again, since what is done moves only its own deadline:
     // a renewal due together with an overdue release would otherwise wait for the next state change,
-    // as an unchanged deadline doesn't re-arm the timer.
+    // as an unchanged deadline doesn't re-arm the timer. The mutex is let go between steps, so that
+    // acknowledgements get in even when a renewal is due again as soon as it returns.
     private def due: F[Unit] =
+      mutex.lock.surround(dueStep).uncancelable.iterateWhile(identity).void
+
+    // Whether something was due.
+    private def dueStep: F[Boolean] =
       (state.get, F.monotonic).tupled
         .flatMap { case (s, now) =>
           val d = deadlines(s)
           // Overdue records are released and sent at once, so that a late acknowledgement can't replace it.
           if (d.overdue.exists(_ <= now))
-            settings.maxProcessingTime.traverse_(max => release(s.overdue(max, now))) *> send *> due
-          else if (d.renewal.exists(_ <= now)) renew(Set.empty) *> due
-          else if (d.send.exists(_ <= now)) send *> due
-          else F.unit
+            settings.maxProcessingTime.traverse_(max => release(s.overdue(max, now))) *> send.as(true)
+          else if (d.renewal.exists(_ <= now)) renew(Set.empty).as(true)
+          else if (d.send.exists(_ <= now)) send.as(true)
+          else F.pure(false)
         }
 
     // While paused, no poll sends acknowledgements: those pending as the pause starts are sent then.

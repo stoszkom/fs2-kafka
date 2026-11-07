@@ -31,7 +31,7 @@ trait KafkaShareSubscription[F[_]] {
   def subscribe[G[_]: Reducible](topics: G[String]): F[Unit]
 
   /**
-    * Unsubscribes the consumer from all topics.
+    * Unsubscribes the consumer from all topics, after sending the pending acknowledgements.
     */
   def unsubscribe: F[Unit]
 

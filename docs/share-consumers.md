@@ -145,6 +145,8 @@ As in Java, `acknowledge` records the acknowledgement in the consumer, and sends
 
 As in Java, the last acknowledgement for a record wins until it is sent. Once sent, a later acknowledgement fails with a `RecordNotInFlightException`; so does an acknowledgement for a delivery the consumer no longer holds: `process` returned, its renewal failed, the consumer released it after the max processing time, or the offset belongs to an earlier delivery. `acknowledgeChunks` skips these, as the record is delivered again.
 
+Stopping waits for the last acknowledgements. If the broker rejects them, for example as a record's lock has passed, `consume` fails with its error, even if the rejected acknowledgement was a release. Those sent earlier, without waiting, can fail unnoticed; their records are delivered again.
+
 Acknowledging succeeds without asking the broker, so an acknowledgement for a record whose lock has expired is only rejected when it is sent. Results are not reported: the record is delivered again. Errors are per partition, so the broker's rejection applies to every acknowledgement of that partition in the same request.
 
 ## Deserialization Failures
@@ -182,7 +184,7 @@ With `withAutoRenewal(true)`, records without an acknowledgement are renewed `wi
 
 - **Without auto-renewal, keep processing within the lock** and `max.poll.interval.ms`, as in Java. A record whose lock expired is delivered again, possibly to another consumer, but `process` still holds it, and this consumer does not poll until `process` returns.
 
-- **A record whose processing hangs** holds back its consumer, renewed for as long as `process` runs, since stopping waits for it, unless you set `withMaxProcessingTime`. A record held without an acknowledgement for longer is released and delivered again; the release is sent at once. The time counts from when `process` got the poll, or from your latest `Renew` of the record, so set it well above the time to process a whole poll. Its processing is not cancelled, and its later acknowledgement fails with a `RecordNotInFlightException`.
+- **A record whose processing hangs** holds back its consumer, renewed for as long as `process` runs, since stopping waits for it, unless you set `withMaxProcessingTime`. A record held without an acknowledgement for longer is released and delivered again; the release is sent at once. The time counts from when the consumer took the poll, so it includes decoding, or from your latest `Renew` of the record, so set it well above the time to process a whole poll. Its processing is not cancelled, and its later acknowledgement fails with a `RecordNotInFlightException`.
 
 - **A late acknowledgement fails** with a `RecordNotInFlightException` once the consumer has let go of the record. One for a record whose lock has expired is rejected by the broker when it is sent, see [acknowledging](#acknowledging). Either way, the record is processed again after its redelivery.
 

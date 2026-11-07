@@ -19,7 +19,8 @@ import scala.concurrent.duration.FiniteDuration
   * @param record
   *   the Java record to acknowledge it by, from the poll which last returned it
   * @param heldSince
-  *   when `process` got it, or the user's latest renewal; the max processing time counts from it
+  *   when the consumer took its poll, or the user's latest renewal; the max processing time counts
+  *   from it
   */
 final private[kafka] case class Delivery(
   record: KafkaByteConsumerRecord,
@@ -85,8 +86,6 @@ final private[kafka] case class ShareConsumerState(
 
   def record(offset: TopicPartitionOffset): KafkaByteConsumerRecord = held(offset).record
 
-  def withLock(reported: Option[FiniteDuration]): ShareConsumerState = copy(lock = reported.orElse(lock))
-
   def hasUnacked: Boolean = held.size > acked.size
 
   // Scans the held records: only for a renewal or the end of a poll, not per acknowledgement.
@@ -124,8 +123,15 @@ final private[kafka] case class ShareConsumerState(
     copy(held = held -- acked, acked = Set.empty, unsentSince = None)
 
   // Java no longer holds these, so they cannot be acknowledged.
-  def withoutHeld(offsets: Iterable[TopicPartitionOffset]): ShareConsumerState =
-    copy(held = held -- offsets, acked = acked -- offsets, timed = timed -- timedEntries(offsets))
+  def withoutHeld(offsets: Iterable[TopicPartitionOffset]): ShareConsumerState = {
+    val pending = acked -- offsets
+    copy(
+      held = held -- offsets,
+      acked = pending,
+      unsentSince = if (pending.isEmpty) None else unsentSince,
+      timed = timed -- timedEntries(offsets)
+    )
+  }
 
   // The poll's processing ended: its records can no longer be acknowledged or renewed.
   def closed: ShareConsumerState =
@@ -170,9 +176,9 @@ private[kafka] object ShareConsumerState {
     ShareConsumerState(Map.empty, Set.empty, None, Duration.Zero, None, SortedSet.empty, Map.empty)
 
   /**
-    * A new poll, started at `polledAt`, which `process` got at `at`. The records of lost renewals
-    * it returned are not held but given back, to be released. Lost renewals older than the lock
-    * and the API timeout can't return any more, and are forgotten.
+    * A new poll, started at `polledAt`. The records of lost renewals it returned are not held but
+    * given back first, to be released; the other records follow, for `process`. Lost renewals older
+    * than the lock and the API timeout can't return any more, and are forgotten.
     */
   def polled(
     deliveries: Vector[(TopicPartitionOffset, Delivery)],
@@ -180,7 +186,7 @@ private[kafka] object ShareConsumerState {
     reportedLock: Option[FiniteDuration],
     apiTimeout: FiniteDuration,
     previous: ShareConsumerState
-  ): (ShareConsumerState, Vector[KafkaByteConsumerRecord]) = {
+  ): (ShareConsumerState, (Vector[KafkaByteConsumerRecord], Vector[KafkaByteConsumerRecord])) = {
     val (returned, fresh) =
       if (previous.lostRenewals.isEmpty) (Vector.empty, deliveries)
       else
@@ -199,7 +205,7 @@ private[kafka] object ShareConsumerState {
       },
       lostRenewals = (previous.lostRenewals -- returned.map(_._1)).filter { case (_, l) => l.at > forgotten }
     )
-    (state, returned.map(_._2.record))
+    (state, (returned.map(_._2.record), fresh.map(_._2.record)))
   }
 
 }

@@ -251,8 +251,8 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
     * later acknowledgement fails with a [[RecordNotInFlightException]], which [[acknowledgeChunks]]
     * skips. It applies with explicit acknowledgement.<br><br>
     *
-    * The time counts from when `process` got the record's poll, or from its latest `Renew` by the
-    * user. Set it well above the time to process a whole poll: `max.poll.records` times the time
+    * The time counts from when the consumer took the record's poll, so it includes decoding, or
+    * from its latest `Renew` by the user. Set it well above the time to process a whole poll: `max.poll.records` times the time
     * per record, divided by the parallelism, and more with merged consumers or `batch_optimized`
     * polls. Ignoring the failure is usually enough, as the record is processed again:
     *
