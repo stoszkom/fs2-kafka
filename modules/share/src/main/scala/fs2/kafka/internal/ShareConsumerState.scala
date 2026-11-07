@@ -8,8 +8,7 @@ package fs2.kafka.internal
 
 import fs2.kafka.KafkaByteConsumerRecord
 import fs2.kafka.instances.fs2KafkaTopicPartitionOrdering
-import fs2.kafka.internal.ShareConsumerState.TopicPartitionOffset
-import org.apache.kafka.common.TopicPartition
+import fs2.kafka.internal.Acknowledgement.TopicPartitionOffset
 import scala.collection.immutable.SortedSet
 import scala.concurrent.duration.Duration
 import scala.concurrent.duration.FiniteDuration
@@ -165,10 +164,6 @@ final private[kafka] case class ShareConsumerState(
 }
 
 private[kafka] object ShareConsumerState {
-
-  // A record's offset in its topic partition. It identifies a record, not a delivery: a redelivery
-  // has the same one.
-  type TopicPartitionOffset = (TopicPartition, Long)
 
   // Nothing held, before the first poll.
   val empty: ShareConsumerState =

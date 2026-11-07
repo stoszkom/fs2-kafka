@@ -9,7 +9,8 @@ package fs2.kafka.internal
 import cats.~>
 import fs2.Chunk
 import fs2.kafka.AcknowledgeType
-import fs2.kafka.internal.ShareConsumerState.TopicPartitionOffset
+import fs2.kafka.internal.Acknowledgement.TopicPartitionOffset
+import org.apache.kafka.common.TopicPartition
 
 // An acknowledgement for one delivery of a record.
 final private[kafka] case class Acknowledgement(
@@ -17,6 +18,14 @@ final private[kafka] case class Acknowledgement(
   deliveryCount: Short,
   acknowledgeType: AcknowledgeType
 )
+
+private[kafka] object Acknowledgement {
+
+  // A record's offset in its topic partition. It identifies a record, not a delivery: a redelivery
+  // has the same one.
+  type TopicPartitionOffset = (TopicPartition, Long)
+
+}
 
 // Gives acknowledgements to the Java consumer of the records they are for. `acknowledgeChunks` groups
 // offsets by acknowledger: a consumer by reference, a mapped one by its acknowledger and function.

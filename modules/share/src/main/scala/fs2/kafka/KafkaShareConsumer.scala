@@ -28,7 +28,7 @@ import fs2.kafka.internal.Deadlines
 import fs2.kafka.internal.Delivery
 import fs2.kafka.internal.ShareConsumerConfig
 import fs2.kafka.internal.ShareConsumerState
-import fs2.kafka.internal.ShareConsumerState.TopicPartitionOffset
+import fs2.kafka.internal.Acknowledgement.TopicPartitionOffset
 import fs2.kafka.internal.WithShareConsumer
 import fs2.kafka.internal.converters.collection.*
 import fs2.kafka.internal.converters.option.*
