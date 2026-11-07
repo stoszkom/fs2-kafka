@@ -51,6 +51,12 @@ final class ShareConsumerConfigSpec extends BaseSpec {
     it("should renew within half of max.poll.interval.ms") {
       val c = config(settings.withProperty("max.poll.interval.ms", "20000"))
       assert(c.renewalInterval(Some(30.seconds)) == 10.seconds)
+      assert(config(settings.withProperty("max.poll.interval.ms", "800")).renewalInterval(None) == 400.millis)
+    }
+
+    it("should leave a value Java rejects to Java") {
+      val c = config(settings.withProperty("max.poll.interval.ms", "5m"))
+      assert(c.maxPollInterval == 5.minutes)
     }
 
     it("should wait for a renewal up to the margin, and at most half the lock") {

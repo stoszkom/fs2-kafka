@@ -10,6 +10,7 @@ import cats.effect.Sync
 import fs2.kafka.ShareConsumerSettings
 import org.apache.kafka.clients.consumer.ConsumerConfig
 import scala.concurrent.duration.*
+import scala.util.Try
 
 /**
   * What a share consumer reads from its settings and the Java consumer's properties, resolved once.
@@ -32,11 +33,11 @@ final private[kafka] case class ShareConsumerConfig[F[_], K, V](
   // The renewal margin before the lock ends, or half the lock, early enough for
   // `max.poll.interval.ms`.
   def renewalInterval(lock: Option[FiniteDuration]): FiniteDuration =
-    lock.fold(ShareConsumerConfig.unknownLockRenewalInterval) { lock =>
-      val byMargin =
+    lock
+      .fold(ShareConsumerConfig.unknownLockRenewalInterval) { lock =>
         if (settings.renewalMargin < lock) lock - settings.renewalMargin else lock / 2
-      byMargin.min(maxPollInterval / 2)
-    }
+      }
+      .min(maxPollInterval / 2)
 
 }
 
@@ -49,8 +50,9 @@ private[kafka] object ShareConsumerConfig {
     settings: ShareConsumerSettings[F, K, V]
   )(implicit F: Sync[F]): F[ShareConsumerConfig[F, K, V]] =
     F.delay {
+      // A value Java rejects is left to it, so that its error names the property.
       def property[A](key: String, default: A)(parse: String => A): A =
-        settings.properties.get(key).fold(default)(v => parse(v.trim))
+        settings.properties.get(key).flatMap(v => Try(parse(v.trim)).toOption).getOrElse(default)
 
       val implicitMode =
         property(ConsumerConfig.SHARE_ACKNOWLEDGEMENT_MODE_CONFIG, true)(

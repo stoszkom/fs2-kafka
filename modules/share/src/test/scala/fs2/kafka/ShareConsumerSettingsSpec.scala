@@ -7,6 +7,7 @@
 package fs2.kafka
 
 import cats.effect.IO
+import cats.syntax.all.*
 import scala.concurrent.duration.*
 
 final class ShareConsumerSettingsSpec extends BaseSpec {
@@ -33,6 +34,33 @@ final class ShareConsumerSettingsSpec extends BaseSpec {
       settings.withMaxAcknowledgementDelay(Duration.Zero).maxAcknowledgementDelay shouldBe
         Some(Duration.Zero)
       settings.withoutMaxAcknowledgementDelay.maxAcknowledgementDelay shouldBe None
+    }
+
+    it("should default the timeouts as KafkaConsumer's settings do") {
+      settings.closeTimeout shouldBe 20.seconds
+      settings.pollTimeout shouldBe 50.millis
+      settings.commitTimeout shouldBe 15.seconds
+      settings.withCloseTimeout(1.second).closeTimeout shouldBe 1.second
+      settings.withPollTimeout(1.second).pollTimeout shouldBe 1.second
+      settings.withCommitTimeout(1.second).commitTimeout shouldBe 1.second
+    }
+
+    it("should set the Java properties") {
+      settings
+        .withBootstrapServers("localhost:9092")
+        .withGroupId("group")
+        .withMaxPollRecords(10)
+        .withMaxPollInterval(1.minute)
+        .properties shouldBe settings.properties ++ Map(
+        "bootstrap.servers" -> "localhost:9092",
+        "group.id" -> "group",
+        "max.poll.records" -> "10",
+        "max.poll.interval.ms" -> "60000"
+      )
+    }
+
+    it("should show as its toString") {
+      settings.show shouldBe settings.toString
     }
 
     it("should set the acknowledgement and acquire modes") {

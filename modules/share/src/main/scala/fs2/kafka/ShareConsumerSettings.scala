@@ -6,6 +6,7 @@
 
 package fs2.kafka
 
+import cats.Show
 import cats.effect.Resource
 import fs2.concurrent.Signal
 import org.apache.kafka.clients.consumer.ConsumerConfig
@@ -437,12 +438,12 @@ object ShareConsumerSettings {
     valueDeserializer: Resource[F, ValueDeserializer[F, V]]
   ): ShareConsumerSettings[F, K, V] =
     Impl(
-      keyDeserializer,
-      valueDeserializer,
-      Map.empty,
-      20.seconds,
-      50.millis,
-      15.seconds,
+      keyDeserializer = keyDeserializer,
+      valueDeserializer = valueDeserializer,
+      properties = Map.empty,
+      closeTimeout = 20.seconds,
+      pollTimeout = 50.millis,
+      commitTimeout = 15.seconds,
       autoRenewal = false,
       renewalMargin = 5.seconds,
       maxProcessingTime = None,
@@ -450,5 +451,8 @@ object ShareConsumerSettings {
       pauseWhen = None
     ).withAcknowledgementMode(ShareAcknowledgementMode.Explicit)
       .withAcquireMode(ShareAcquireMode.RecordLimit)
+
+  implicit def shareConsumerSettingsShow[F[_], K, V]: Show[ShareConsumerSettings[F, K, V]] =
+    Show.fromToString
 
 }
