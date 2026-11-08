@@ -79,9 +79,9 @@ In addition, there are several settings specific to the library.
 
 - `withMaxAcknowledgementDelay` sets how long a pending acknowledgement may wait before the consumer sends it, without waiting for the next poll. Default is 1 second; `withoutMaxAcknowledgementDelay` sends acknowledgements only with the next poll, as a Java loop does; a delay can be at most 365 days. See [acknowledging](#acknowledging).
 
-- `withPauseWhen` takes a `Signal[F, Boolean]`; while it is `true`, the consumer acquires no new records. Not paused by default. See [pausing](#pausing).
+- `withPauseWhen` takes a `Signal[F, Boolean]`; while it is `true`, the consumer polls for no new records. Not paused by default. See [pausing](#pausing).
 
-- `withCommitTimeout` sets how long the final commit after `stopConsuming` waits for the broker to confirm the last acknowledgements. Default is 15 seconds.
+- `withCommitTimeout` sets how long the final commit after `stopConsuming` waits for the broker to confirm the last acknowledgements; past it, `consume` fails with a `ShareCommitTimeoutException`. Default is 15 seconds.
 
 - `withCloseTimeout` controls the timeout when waiting for consumer shutdown. Default is 20 seconds.
 
@@ -131,7 +131,7 @@ def processOrRelease(record: AcknowledgeableConsumerRecord[IO, String, String]):
   }
 ```
 
-If `process` itself fails, the records it left without an acknowledgement are released, and `consume` fails with the same error. The same happens when `consume` is canceled.
+If `process` itself fails, the records it left without an acknowledgement are released, and `consume` fails with the same error. When `consume` is canceled, the records are released too.
 
 ## Acknowledging
 
@@ -139,15 +139,13 @@ As in Java, `acknowledge` records the acknowledgement in the consumer, and sends
 
 - `record.accept`, `release`, `reject` and `renew` acknowledge one record, as does `acknowledge(AcknowledgeType)`. They are on the record and on its `offset`.
 
-- `acknowledgeChunks` acknowledges the records of each chunk of a stream with one call per consumer, for example `Stream.chunk(records).map(_.offset -> (AcknowledgeType.Accept: AcknowledgeType)).through(acknowledgeChunks[IO])` to accept a whole poll at once.
+- `acknowledgeChunks` acknowledges the records of each chunk of a stream with one call per run of records of the same consumer, for example `Stream.chunk(records).map(_.offset -> AcknowledgeType.Accept).through(acknowledgeChunks[IO])` to accept a whole poll at once.
 
 - There is no commit to call. The consumer sends the pending acknowledgements itself: with the next poll, after the delay, at once while paused, when `consume` ends, and when the consumer is closed.
 
 As in Java, the last acknowledgement for a record wins until it is sent. Once sent, a later acknowledgement fails with a `RecordNotInFlightException`; so does an acknowledgement for a delivery the consumer no longer holds: `process` returned, its renewal failed, the consumer released it after the max processing time, or the offset belongs to an earlier delivery. `acknowledgeChunks` skips these, as the record is delivered again.
 
-Stopping waits for the last acknowledgements. If the broker rejects them, for example as a record's lock has passed, `consume` fails with its error, even if the rejected acknowledgement was a release. Those sent earlier, without waiting, can fail unnoticed; their records are delivered again.
-
-Acknowledging succeeds without asking the broker, so an acknowledgement for a record whose lock has expired is only rejected when it is sent. Results are not reported: the record is delivered again. Errors are per partition, so the broker's rejection applies to every acknowledgement of that partition in the same request.
+Acknowledging succeeds without asking the broker, so an acknowledgement for a record whose lock has expired is only rejected when it is sent, and the record is delivered again. Errors are per partition, so the broker's rejection applies to every acknowledgement of that partition in the same request. Stopping waits for the last acknowledgements: if the broker rejects them, `consume` fails with its error, even if the rejected acknowledgement was a release, unless the consumer is no longer subscribed. Acknowledgements sent earlier, without waiting, fail unnoticed.
 
 ## Deserialization Failures
 
@@ -178,13 +176,13 @@ A record which is not acknowledged within its acquisition lock, 30 seconds by de
 
 Java lets a renewed record be acknowledged again only once a poll has returned it, and that poll needs every other record of the batch acknowledged or renewed too. So a renewal here renews every record of the poll still without an acknowledgement, waits for the broker to confirm it, and takes the records back with a poll, which fetches nothing new. `process` keeps the records it has; they are not handed out again. The wait is the renewal margin, at most half of the lock; if the broker has not confirmed by then, the renewed records count as lost: the renewal you made and their later acknowledgements fail with a `RecordNotInFlightException`. Should the broker confirm such a renewal later, Java returns the records from a later poll; the consumer releases them at once rather than handing them out again, so they come back with a higher delivery count.
 
-With `withAutoRenewal(true)`, records without an acknowledgement are renewed `withRenewalMargin` (5 seconds by default) before their lock ends, or earlier when half of `max.poll.interval.ms` requires it. Enable it when processing may outlast the lock.
+With `withAutoRenewal(true)`, records without an acknowledgement are renewed `withRenewalMargin` (5 seconds by default) before their lock ends, or earlier when half of `max.poll.interval.ms` requires it. A margin of the whole lock or more renews at half the lock, and until the broker has reported the lock, records are renewed every 500 milliseconds. Enable it when processing may outlast the lock.
 
 - **A record's lock counts from the start of the poll which returned it.** Java can fetch records earlier and keep them buffered, for example from a second broker while you process the previous poll; a record buffered for longer than the margin can lose its lock before it is renewed, so raise the margin if polls take long to process.
 
 - **Without auto-renewal, keep processing within the lock** and `max.poll.interval.ms`, as in Java. A record whose lock expired is delivered again, possibly to another consumer, but `process` still holds it, and this consumer does not poll until `process` returns.
 
-- **A record whose processing hangs** holds back its consumer, renewed for as long as `process` runs, since stopping waits for it, unless you set `withMaxProcessingTime`. A record held without an acknowledgement for longer is released and delivered again; the release is sent at once. The time counts from when the consumer took the poll, so it includes decoding, or from your latest `Renew` of the record, so set it well above the time to process a whole poll. Its processing is not cancelled, and its later acknowledgement fails with a `RecordNotInFlightException`.
+- **With auto-renewal, a record whose processing hangs** holds back its consumer, renewed for as long as `process` runs, since stopping waits for it, unless you set `withMaxProcessingTime`. A record held without an acknowledgement for longer is released and delivered again; the release is sent at once. The time counts from when the consumer took the poll, so it includes decoding, or from your latest `Renew` of the record, so set it well above the time to process a whole poll. Its processing is not cancelled, and its later acknowledgement fails with a `RecordNotInFlightException`.
 
 - **A late acknowledgement fails** with a `RecordNotInFlightException` once the consumer has let go of the record. One for a record whose lock has expired is rejected by the broker when it is sent, see [acknowledging](#acknowledging). Either way, the record is processed again after its redelivery.
 
@@ -207,13 +205,19 @@ When something the processing needs is unavailable, polling on would acquire rec
 ```scala mdoc:silent
 import fs2.concurrent.SignallingRef
 
+// Retries until the service is back, while auto-renewal holds the record's lock.
+def processRetrying(record: AcknowledgeableConsumerRecord[IO, String, String]): IO[Unit] =
+  process(record.record).handleErrorWith(_ => IO.sleep(5.seconds) *> processRetrying(record))
+
 def pausable(paused: SignallingRef[IO, Boolean]): IO[Unit] =
-  KafkaShareConsumer.resource(settings.withPauseWhen(paused)).use { consumer =>
-    consumer.subscribeTo("jobs") *>
-      consumer.consume { records =>
-        records.parTraverseN(32)(processOrRelease).void
-      }
-  }
+  KafkaShareConsumer
+    .resource(settings.withAutoRenewal(true).withPauseWhen(paused))
+    .use { consumer =>
+      consumer.subscribeTo("jobs") *>
+        consumer.consume { records =>
+          records.parTraverseN(32)(record => processRetrying(record) *> record.accept).void
+        }
+    }
 ```
 
 Deciding when to pause is up to us: a circuit breaker, a health check, or failures counted in the processing, which sets the signal. While paused:
@@ -283,7 +287,7 @@ val parallelProgram: IO[Unit] =
 
 ## Stopping and Shutdown
 
-- `stopConsuming` makes `consume` return once the poll being processed is done and a final commit sent the last acknowledgements. If that commit fails, `consume` fails with its error. Stopping is final: consuming again fails; create a new consumer instead.
+- `stopConsuming` makes `consume` return once the poll being processed is done and a final commit sent the last acknowledgements. If the broker rejects them, `consume` fails with its error, and with a `ShareCommitTimeoutException` if it does not answer within the commit timeout. Stopping is final: consuming again fails; create a new consumer instead.
 
 - Releasing the resource closes the Java consumer, which sends the pending acknowledgements and releases the records it still holds without one; it never accepts them automatically.
 
