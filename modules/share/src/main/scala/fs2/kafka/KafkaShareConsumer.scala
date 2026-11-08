@@ -12,6 +12,7 @@ import cats.effect.Deferred
 import cats.effect.Poll
 import cats.effect.Ref
 import cats.effect.Resource
+import cats.effect.std.Dispatcher
 import cats.effect.std.Mutex
 import cats.effect.syntax.all.*
 import cats.syntax.all.*
@@ -23,6 +24,7 @@ import fs2.kafka.consumer.KafkaShareSubscription
 import fs2.kafka.consumer.MkShareConsumer
 import fs2.kafka.internal.Acknowledgement
 import fs2.kafka.internal.AcknowledgementResults
+import fs2.kafka.internal.AcknowledgementResults.Results
 import fs2.kafka.internal.Acknowledger
 import fs2.kafka.internal.Deadlines
 import fs2.kafka.internal.Delivery
@@ -95,11 +97,17 @@ object KafkaShareConsumer {
       keyDeserializer <- settings.keyDeserializer
       valueDeserializer <- settings.valueDeserializer
       config <- Resource.eval(ShareConsumerConfig.from(settings))
+      // Before the Java consumer, as closing it can still run the commit callback.
+      dispatcher <- Dispatcher.sequential[F]
       withConsumer <- WithShareConsumer(mk, settings)
-      results <- Resource.eval(F.delay(new AcknowledgementResults))
-      // Only explicit mode renews, and drains what the callback collects.
+      results <- Resource.eval(Ref.of[F, Results](Vector.empty))
+      // Only explicit mode renews, and reads what the callback reports.
       _ <- Resource.eval(
-        withConsumer.blocking(_.setAcknowledgementCommitCallback(results)).unlessA(config.implicitMode)
+        withConsumer
+          .blocking(
+            _.setAcknowledgementCommitCallback(AcknowledgementResults.callback(dispatcher, results))
+          )
+          .unlessA(config.implicitMode)
       )
       consumer <-
         Resource.eval(
@@ -141,7 +149,8 @@ object KafkaShareConsumer {
     keyDeserializer: KeyDeserializer[F, K],
     valueDeserializer: ValueDeserializer[F, V],
     withConsumer: WithShareConsumer[F],
-    results: AcknowledgementResults,
+    // What Java reported of the sent acknowledgements since they were last read.
+    results: Ref[F, Results],
     mutex: Mutex[F],
     state: SignallingRef[F, ShareConsumerState],
     stop: Deferred[F, Unit],
@@ -272,10 +281,7 @@ object KafkaShareConsumer {
             case Right(_) =>
               state.get
                 .map(_.hasRenewing)
-                .ifM(
-                  checkRenewals *> F.sleep(renewalCheckInterval) *> next,
-                  polling
-                )
+                .ifM(checkRenewals *> next, polling)
           }
       lazy val polling: F[Unit] =
         F.uncancelable { cancelable =>
@@ -290,7 +296,10 @@ object KafkaShareConsumer {
       next
     }
 
-    private def checkRenewals: F[Unit] = mutex.lock.surround(check).uncancelable.void
+    // Checks the renewals not yet back, waiting before the next check only if some still aren't.
+    private def checkRenewals: F[Unit] =
+      mutex.lock.surround(check).uncancelable *>
+        state.get.map(_.hasRenewing).ifM(F.sleep(renewalCheckInterval), F.unit)
 
     // Stopping gives the renewals still pending until the commit timeout to come back, so that the
     // acknowledgements made meanwhile are sent.
@@ -298,7 +307,7 @@ object KafkaShareConsumer {
       lazy val waiting: F[Unit] =
         state.get
           .map(_.hasRenewing)
-          .ifM(checkRenewals *> F.sleep(renewalCheckInterval) *> waiting, F.unit)
+          .ifM(checkRenewals *> waiting, F.unit)
       waiting.timeoutTo(settings.commitTimeout, F.unit)
     }
 
@@ -313,10 +322,9 @@ object KafkaShareConsumer {
     private def paused: F[Boolean] = settings.pauseWhen.fold(F.pure(false))(_.get)
 
     // Unsubscribed: nothing to poll; Java would throw.
-    // What the commit callback collected is of no use with nothing being renewed, so it is dropped.
+    // What the commit callback reported is of no use with nothing being renewed, so it is dropped.
     private def poll: F[Option[(Vector[KafkaByteConsumerRecord], Option[FiniteDuration])]] =
-      withConsumer.blocking { consumer =>
-        results.drain()
+      results.set(Vector.empty) *> withConsumer.blocking { consumer =>
         if (consumer.subscription().isEmpty) None
         else
           Some(
@@ -512,9 +520,10 @@ object KafkaShareConsumer {
         withConsumer
           .blocking { consumer =>
             consumer.commitAsync()
-            (results.drain(), consumer.subscription().isEmpty)
+            consumer.subscription().isEmpty
           }
-          .flatMap { case (reported, unsubscribed) =>
+          .product(results.getAndSet(Vector.empty))
+          .flatMap { case (unsubscribed, reported) =>
             state
               .modify { s =>
                 val forgetBefore = at - s.lock.getOrElse(Duration.Zero) - config.apiTimeout

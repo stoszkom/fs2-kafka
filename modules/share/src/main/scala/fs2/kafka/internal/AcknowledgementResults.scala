@@ -6,33 +6,33 @@
 
 package fs2.kafka.internal
 
+import cats.effect.Ref
+import cats.effect.std.Dispatcher
 import fs2.kafka.internal.Acknowledgement.TopicPartitionOffset
 import fs2.kafka.internal.converters.collection.*
 import org.apache.kafka.clients.consumer.AcknowledgementCommitCallback
 import org.apache.kafka.common.TopicIdPartition
 
-// Collects what Java reports of each sent acknowledgement, renewals included, from its commit
-// callback. Java runs the callback during a poll or commit, on the consumer's single thread, which
-// is also the only thread draining it.
-final private[kafka] class AcknowledgementResults extends AcknowledgementCommitCallback {
+private[kafka] object AcknowledgementResults {
 
-  private val results = Vector.newBuilder[(TopicPartitionOffset, Boolean)]
+  // Each offset Java reported as sent, with whether the broker took it.
+  type Results = Vector[(TopicPartitionOffset, Boolean)]
 
-  override def onComplete(
-    offsets: java.util.Map[TopicIdPartition, java.util.Set[java.lang.Long]],
-    exception: Exception
-  ): Unit =
-    offsets.asScala.foreach { case (partition, sent) =>
-      sent.asScala.foreach { offset =>
-        results += ((partition.topicPartition -> offset.longValue) -> (exception == null))
+  // Java's commit callback, adding what Java reports of the sent acknowledgements, renewals
+  // included, to `results`. Java runs it during a poll or commit, which only returns once it has.
+  def callback[F[_]](dispatcher: Dispatcher[F], results: Ref[F, Results]): AcknowledgementCommitCallback =
+    new AcknowledgementCommitCallback {
+      override def onComplete(
+        offsets: java.util.Map[TopicIdPartition, java.util.Set[java.lang.Long]],
+        exception: Exception
+      ): Unit = {
+        val reported = offsets.asScala.toVector.flatMap { case (partition, sent) =>
+          sent.asScala.toVector.map(offset =>
+            (partition.topicPartition -> offset.longValue) -> (exception == null)
+          )
+        }
+        dispatcher.unsafeRunSync(results.update(_ ++ reported))
       }
     }
-
-  // What was reported since the last drain: each offset with whether the broker took it.
-  def drain(): Vector[(TopicPartitionOffset, Boolean)] = {
-    val drained = results.result()
-    results.clear()
-    drained
-  }
 
 }
