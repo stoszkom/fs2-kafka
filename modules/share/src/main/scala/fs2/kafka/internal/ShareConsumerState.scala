@@ -42,7 +42,7 @@ final private[kafka] case class Delivery(
   * @param unacked
   *   how many records have no acknowledgement, a renewal by the user included
   * @param unsent
-  *   how many records have an acknowledgement to send
+  *   the records with an acknowledgement to send
   * @param renewals
   *   how many records the user renewed, which the next renewal takes
   * @param unsentSince
@@ -59,7 +59,7 @@ final private[kafka] case class ShareConsumerState(
   open: Boolean,
   records: Map[TopicPartitionOffset, Entry],
   unacked: Int,
-  unsent: Int,
+  unsent: Set[TopicPartitionOffset],
   renewals: Int,
   unsentSince: Option[FiniteDuration],
   timed: SortedSet[(FiniteDuration, TopicPartitionOffset)],
@@ -69,7 +69,7 @@ final private[kafka] case class ShareConsumerState(
 
   def isEmpty: Boolean = records.isEmpty
 
-  def hasRenewing: Boolean = records.size > unacked + unsent
+  def hasRenewing: Boolean = records.size > unacked + unsent.size
 
   def holds(offset: TopicPartitionOffset, deliveryCount: Short): Boolean =
     open && records.get(offset).exists(_.delivery.deliveryCount == deliveryCount)
@@ -94,15 +94,15 @@ final private[kafka] case class ShareConsumerState(
     at: FiniteDuration
   ): ShareConsumerState = {
     val previous = records.get(offset)
-    val unsentNow = unsent + previous.fold(0)(-_.unsent) + next.fold(0)(_.unsent)
+    val unsentNow = if (next.exists(_.unsent > 0)) unsent + offset else unsent - offset
     copy(
       records = next.fold(records - offset)(records.updated(offset, _)),
       unacked = unacked + previous.fold(0)(-_.unacked) + next.fold(0)(_.unacked),
       unsent = unsentNow,
       renewals = renewals + previous.fold(0)(-_.renewal) + next.fold(0)(_.renewal),
       unsentSince =
-        if (unsentNow == 0) None
-        else if (unsentNow > unsent) unsentSince.orElse(Some(at))
+        if (unsentNow.isEmpty) None
+        else if (unsentNow.size > unsent.size) unsentSince.orElse(Some(at))
         else unsentSince,
       timed = timed -- previous.flatMap(_.timed(offset)) ++ next.flatMap(_.timed(offset))
     )
@@ -143,7 +143,7 @@ final private[kafka] case class ShareConsumerState(
 
   // Takes the acknowledgements to send, to give to Java: their records are no longer held.
   def takeUnsent: (ShareConsumerState, Vector[(KafkaByteConsumerRecord, AcknowledgeType)]) = {
-    val sent = records.toVector.collect { case (p, e) if e.unsent > 0 => (p, e) }
+    val sent = unsent.toVector.flatMap(p => records.get(p).map(p -> _))
     (
       withStatuses(sent.map { case (p, _) => p -> None }, lockedSince),
       sent.collect { case (_, Entry(d, Acked(kind))) => d.record -> kind }
@@ -256,7 +256,7 @@ private[kafka] object ShareConsumerState {
 
   // Nothing held, before the first poll.
   val empty: ShareConsumerState =
-    ShareConsumerState(false, Map.empty, 0, 0, 0, None, SortedSet.empty, Duration.Zero, None)
+    ShareConsumerState(false, Map.empty, 0, Set.empty, 0, None, SortedSet.empty, Duration.Zero, None)
 
   // A new poll, started at `polledAt` and taken by the consumer at `at`. Nothing was held before it.
   def polled(
