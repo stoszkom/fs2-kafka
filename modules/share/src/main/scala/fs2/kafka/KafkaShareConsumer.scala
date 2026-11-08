@@ -190,8 +190,9 @@ object KafkaShareConsumer {
         )
       else
         exclusively(
+          // Java accepts the poll with the next poll or commit: the loop's, or the commit it sends
+          // when it finds itself paused, or the final one.
           loop { case (cancelable, records, _, _) =>
-            // Accepting at once, rather than with the next poll, also covers a pause after it.
             cancelable(
               Chunk
                 .from(records)
@@ -199,8 +200,7 @@ object KafkaShareConsumer {
                 .flatMap(process)
             )
               // Also when canceled, e.g. as another of several consumers failed.
-              .guaranteeCase(outcome => poisoned.set(true).unlessA(outcome.isSuccess)) *>
-              withConsumer.blocking(_.commitAsync())
+              .guaranteeCase(outcome => poisoned.set(true).unlessA(outcome.isSuccess))
           }
         )
 
