@@ -8,7 +8,6 @@ package fs2.kafka
 
 import cats.Reducible
 import cats.effect.Async
-import cats.effect.Deferred
 import cats.effect.Poll
 import cats.effect.Ref
 import cats.effect.Resource
@@ -112,7 +111,7 @@ object KafkaShareConsumer {
           Mutex[F],
           SignallingRef.of[F, ShareConsumerState](ShareConsumerState.empty),
           SignallingRef.of[F, Lifecycle](Idle),
-          Deferred[F, Throwable]
+          SignallingRef.of[F, Option[Throwable]](None)
         ).mapN(new Impl(config, keyDeserializer, valueDeserializer, withConsumer, results, _, _, _, _))
       )
       // Stopped before the Java consumer closes.
@@ -186,8 +185,8 @@ object KafkaShareConsumer {
     mutex: Mutex[F],
     state: SignallingRef[F, ShareConsumerState],
     lifecycle: SignallingRef[F, Lifecycle],
-    // The driver's failure, which fails `consume`.
-    failure: Deferred[F, Throwable]
+    // The driver's last failure, which fails the running `consume`.
+    failure: SignallingRef[F, Option[Throwable]]
   )(implicit F: Async[F])
     extends KafkaShareConsumer[F, K, V]
     with Acknowledger[F] {
@@ -260,7 +259,7 @@ object KafkaShareConsumer {
               .blocking(_.subscription().isEmpty)
               .ifM(
                 F.raiseError(NotSubscribedException()),
-                F.race(failure.get.flatMap(F.raiseError[Unit]), run).void
+                failure.set(None) *> F.race(driverFailed, run).void
               )
           ).guarantee(lifecycle.update {
             case Consuming => Idle
@@ -276,6 +275,13 @@ object KafkaShareConsumer {
       }
 
     private def stopped: F[Unit] = lifecycle.waitUntil(_ == Stopped)
+
+    private def driverFailed: F[Unit] =
+      failure.discrete
+        .collectFirst { case Some(error) => error }
+        .compile
+        .lastOrError
+        .flatMap(F.raiseError[Unit])
 
     private def paused: F[Boolean] = pauseSignal.get
 
@@ -331,7 +337,8 @@ object KafkaShareConsumer {
     // --- One poll ---
 
     // In explicit mode the state holds the poll from the moment the consumer takes it, also when
-    // decoding fails or `process` is canceled; once `process` returns, the poll is closed.
+    // decoding fails or `process` is canceled. Once `process` returns, the poll is closed; if it
+    // failed or was canceled, no poll follows, so what it left is sent at once.
     private def processed(
       process: Chunk[AcknowledgeableConsumerRecord[F, K, V]] => F[Unit]
     )(cancelable: Poll[F], polled: Polled): F[Unit] =
@@ -339,7 +346,11 @@ object KafkaShareConsumer {
         val deliveries = polled.records.map(r => offsetOf(r) -> Delivery(r, deliveryCountOf(r), now))
         state.update(ShareConsumerState.polled(deliveries, polled.start, polled.lock, _)) *>
           cancelable(Chunk.from(polled.records).traverse(decode).flatMap(process))
-            .guarantee(F.monotonic.flatMap(at => state.update(_.closed(at))))
+            .guaranteeCase(outcome =>
+              F.monotonic.flatMap(at => state.update(_.closed(at))) *> send(identity).unlessA(
+                outcome.isSuccess
+              )
+            )
       }
 
     private def decode(record: KafkaByteConsumerRecord): F[AcknowledgeableConsumerRecord[F, K, V]] =
@@ -379,7 +390,8 @@ object KafkaShareConsumer {
     /**
       * Runs as long as the consumer and does what is due: releases records past the max processing
       * time, renews, and sends. It wakes at the earliest deadline, recomputed whenever the state or
-      * the pause changes it. Its failure fails `consume`.
+      * the pause changes it; what it does runs apart from that, so that a new deadline can't stop it
+      * half-way. A failure fails the running `consume`, and the driver goes on.
       */
     def driver: F[Unit] =
       Signal
@@ -390,11 +402,11 @@ object KafkaShareConsumer {
         .switchMap {
           case None => Stream.empty
           case Some(at) =>
-            Stream.eval(F.monotonic).flatMap(now => Stream.sleep_[F](at - now)) ++ Stream.exec(due)
+            Stream.eval(F.monotonic).flatMap(now => Stream.sleep_[F](at - now)) ++ Stream.emit(())
         }
+        .evalMap(_ => due.handleErrorWith(error => failure.set(Some(error))))
         .compile
         .drain
-        .handleErrorWith(failure.complete(_).void)
 
     // What the driver does, each with its deadline, in the order they go when due together.
     private def actions(s: ShareConsumerState, paused: Boolean): List[(FiniteDuration, F[Unit])] =
@@ -406,7 +418,6 @@ object KafkaShareConsumer {
       ).flatten
 
     // Does one due thing at a time and looks again, as what is done moves only its own deadline.
-    // Each step is uncancelable, so that a new deadline can't stop it half-way.
     private def due: F[Unit] =
       (state.get, paused, F.monotonic)
         .flatMapN { (s, p, now) =>
@@ -414,7 +425,6 @@ object KafkaShareConsumer {
             .collectFirst { case (at, action) if at <= now => action.as(true) }
             .getOrElse(F.pure(false))
         }
-        .uncancelable
         .iterateWhile(identity)
         .void
 
@@ -454,20 +464,26 @@ object KafkaShareConsumer {
                 (sent.toSet, acquisitionLock(consumer))
               }.flatMap { case (sent, lock) =>
                 val forgetAt = at + lock.getOrElse(Duration.Zero) + config.apiTimeout
-                confirmed(sent, forgetAt, Set.empty).flatMap(takeBack(_, at))
+                confirmed(sent, forgetAt, Set.empty).flatMap(takeBack)
               }
+                // Java failed before it had every renewal: none is counted on.
+                .onError { case _ =>
+                  F.monotonic.flatMap(now => state.update(_.withRenewalEnded(Vector.empty, None, now)._1))
+                }
           )
       }
 
-    // Asks Java, with a commit, until the broker answered for every record sent for renewal, or it
-    // can't anymore, and returns those it confirmed. Unsubscribed, none can be taken back.
+    // Asks Java, with a commit, until the broker answered for every record sent for renewal, and
+    // returns those it confirmed. If it can't answer anymore, or the consumer unsubscribed, none can
+    // be taken back: Java's poll would fetch while a renewal is pending, or refuse.
     private def confirmed(
       waiting: Set[TopicPartitionOffset],
       forgetAt: FiniteDuration,
       done: Set[TopicPartitionOffset]
     ): F[Set[TopicPartitionOffset]] =
       F.monotonic.flatMap { now =>
-        if (waiting.isEmpty || now >= forgetAt) F.pure(done)
+        if (waiting.isEmpty) F.pure(done)
+        else if (now >= forgetAt) F.pure(Set.empty[TopicPartitionOffset])
         else
           F.sleep(renewalCheckInterval) *>
             mutex.lock
@@ -491,12 +507,12 @@ object KafkaShareConsumer {
     // A poll takes the confirmed records back, after Java got the held records' acknowledgements,
     // which its poll needs first; the others are lost. Records it returned which no one knows are
     // released.
-    private def takeBack(confirmed: Set[TopicPartitionOffset], at: FiniteDuration): F[Unit] =
+    private def takeBack(confirmed: Set[TopicPartitionOffset]): F[Unit] =
       javaStep(_.takeUnsent) { (consumer, acks) =>
         recordIn(consumer, acks)
         if (confirmed.isEmpty) (Vector.empty[KafkaByteConsumerRecord], None)
         else pollRecords(consumer, Duration.Zero)
-      }.flatMap { case (returned, lock) =>
+      }.product(F.monotonic).flatMap { case ((returned, lock), at) =>
         state.modify(_.withRenewalEnded(returned, lock, at)).flatMap { unknown =>
           withConsumer
             .blocking { consumer =>
