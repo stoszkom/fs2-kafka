@@ -271,7 +271,7 @@ To keep polling past slow records, we can use several consumers in the same shar
 
 ```scala mdoc:silent
 val parallelProgram: IO[Unit] =
-  KafkaShareConsumer.resource(settings, consumers = 4).use { consumers =>
+  KafkaShareConsumers.resource(settings, consumers = 4).use { consumers =>
     consumers.subscribeTo("jobs") *>
       consumers.consume { records =>
         records.parTraverseN(8)(processOrRelease).void
@@ -279,7 +279,7 @@ val parallelProgram: IO[Unit] =
   }
 ```
 
-`consume` runs on every consumer until `stopConsuming`. If one of them fails, the others are canceled, which releases the records they hold, and the error is raised. When `client.id` is set, consumer `i` uses `client.id-i`.
+`consume` runs on every consumer until `stopConsuming`. If one of them fails, the others are canceled, which releases the records they hold, and the error is raised. With several consumers and `client.id` set, consumer `i` uses `client.id-i`. `metrics` gives each consumer's metrics by its client id.
 
 ## Stopping and Shutdown
 

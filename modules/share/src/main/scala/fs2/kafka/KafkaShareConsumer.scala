@@ -109,15 +109,6 @@ object KafkaShareConsumer {
         )
     } yield consumer
 
-  /**
-    * Creates `consumers` [[KafkaShareConsumer]]s in the same share group, see
-    * [[KafkaShareConsumers.resource]].
-    */
-  def resource[F[_], K, V](settings: ShareConsumerSettings[F, K, V], consumers: Int)(implicit
-    F: Async[F],
-    mk: MkShareConsumer[F]
-  ): Resource[F, KafkaShareConsumers[F, K, V]] = KafkaShareConsumers.resource(settings, consumers)
-
   def stream[F[_], K, V](settings: ShareConsumerSettings[F, K, V])(implicit
     F: Async[F],
     mk: MkShareConsumer[F]
