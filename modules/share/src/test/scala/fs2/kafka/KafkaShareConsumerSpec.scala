@@ -232,36 +232,53 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       }
     }
 
-    // A renewal which outlasted its wait loses the record: it and a later acknowledgement fail. Java
-    // completes the renewal later, and its next poll returns the record with the same delivery
-    // count: it is released at once rather than handed out again.
-    it("should release a record returned by a renewal which outlasted its wait") {
+    // A renewal which outlasted its wait leaves the record renewing: an acknowledgement made
+    // meanwhile is kept, and given to Java once the renewal completed, as the consumer stops.
+    it("should keep a record whose renewal outlasted its wait, and its acknowledgement") {
       withTopic { topic =>
         createTopic(topic)
         publish(topic, "0")
-        // The wait ends before the broker can answer, so the renewal is lost.
+        // The wait ends before the broker can answer.
         val settings = shareConsumerSettings.withRenewalMargin(1.nanosecond)
-        val (seen, lost) = run(
+        val (seen, results) = run(
           (
             Ref.of[IO, Vector[(String, Int)]](Vector.empty),
             Ref.of[IO, List[Either[Throwable, Unit]]](Nil)
-          ).flatMapN { (seen, lost) =>
+          ).flatMapN { (seen, results) =>
             consumed(settings, topic) { consumer => records =>
               records.traverse_ { r =>
-                seen
-                  .updateAndGet(_ :+ (r.record.value -> r.offset.deliveryCount.toInt))
-                  .flatMap { s =>
-                    if (s.size == 1)
-                      List(r.renew, r.accept).traverse(_.attempt).flatMap(lost.set)
-                    else r.accept *> consumer.stopConsuming
-                  }
-              }
-            } *> (seen.get, lost.get).tupled
+                seen.update(_ :+ (r.record.value -> r.offset.deliveryCount.toInt)) *>
+                  List(r.renew, r.accept).traverse(_.attempt).flatMap(results.set)
+              } *> consumer.stopConsuming
+            } *> (seen.get, results.get).tupled
           }
         )
-        seen shouldBe Vector("0" -> 1, "0" -> 2)
-        lost.map(_.left.toOption.get) should have size 2
-        lost.foreach(_.left.toOption.get shouldBe a[RecordNotInFlightException])
+        seen shouldBe Vector("0" -> 1)
+        results shouldBe List(Right(()), Right(()))
+        assertSettled(topic, settings)
+      }
+    }
+
+    // The same, with the renewal completing before the next poll.
+    it("should apply the acknowledgement of a renewing record before polling again") {
+      withTopic { topic =>
+        createTopic(topic)
+        publish(topic, "0", "1")
+        val settings = shareConsumerSettings.withRenewalMargin(1.nanosecond).withMaxPollRecords(1)
+        val seen = run(
+          Ref
+            .of[IO, Vector[(String, Int)]](Vector.empty)
+            .flatMap { seen =>
+              consumed(settings, topic) { consumer => records =>
+                records.traverse_ { r =>
+                  seen.update(_ :+ (r.record.value -> r.offset.deliveryCount.toInt)) *>
+                    (if (r.record.value == "0") r.renew *> r.accept
+                     else r.accept *> consumer.stopConsuming)
+                }
+              } *> seen.get
+            }
+        )
+        seen shouldBe Vector("0" -> 1, "1" -> 1)
         assertSettled(topic, settings)
       }
     }
@@ -910,8 +927,8 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       }
     }
 
-    // Leaving the group released the records: a renewal due after an unsubscribe has nothing to
-    // renew, and must not poll, as Java's poll refuses an unsubscribed consumer.
+    // A renewal due after an unsubscribe renews nothing, and must not poll, as Java's poll refuses
+    // an unsubscribed consumer. The record stays held, so it can still be acknowledged.
     it("should let process finish after an unsubscribe while a renewal comes due") {
       withTopic { topic =>
         createTopic(topic)
@@ -929,7 +946,7 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
               } *> result.get
             }
         )
-        accepted.flatMap(_.left.toOption).get shouldBe a[RecordNotInFlightException]
+        accepted shouldBe Some(Right(()))
       }
     }
 

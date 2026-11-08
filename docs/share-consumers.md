@@ -174,7 +174,7 @@ def processOrReject(
 
 A record which is not acknowledged within its acquisition lock, 30 seconds by default, is delivered again, possibly to another consumer, and its later acknowledgement fails. As in Java, records are not renewed automatically. We can renew a record with `Renew`, any number of times before its final acknowledgement.
 
-Java lets a renewed record be acknowledged again only once a poll has returned it, and that poll needs every other record of the batch acknowledged or renewed too. So a renewal here renews every record of the poll still without an acknowledgement, waits for the broker to confirm it, and takes the records back with a poll, which fetches nothing new. `process` keeps the records it has; they are not handed out again. The wait is the renewal margin, at most half of the lock; if the broker has not confirmed by then, the renewed records count as lost: the renewal you made and their later acknowledgements fail with a `RecordNotInFlightException`. Should the broker confirm such a renewal later, Java returns the records from a later poll; the consumer releases them at once rather than handing them out again, so they come back with a higher delivery count.
+Java lets a renewed record be acknowledged again only once a poll has returned it, and that poll needs every other record of the batch acknowledged or renewed too. So a renewal here renews every record of the poll still without an acknowledgement, waits for the broker to confirm it, and takes the records back with a poll, which fetches nothing new. `process` keeps the records it has; they are not handed out again. The wait is the renewal margin, at most half of the lock. If the broker has not confirmed by then, the records stay renewing: the consumer keeps checking with Java, and takes them back once the renewal is confirmed. An acknowledgement made meanwhile succeeds, and is given to Java once the records are back; the consumer polls for no new records until then, and stopping waits for it up to the commit timeout. A renewal the broker rejects loses the records, which are delivered again: the renewal you made, or a later acknowledgement, fails with a `RecordNotInFlightException`.
 
 With `withAutoRenewal(true)`, records without an acknowledgement are renewed `withRenewalMargin` (5 seconds by default) before their lock ends, or earlier when half of `max.poll.interval.ms` requires it. A margin of the whole lock or more renews at half the lock, and until the broker has reported the lock, records are renewed every 500 milliseconds. Enable it when processing may outlast the lock.
 
@@ -222,7 +222,7 @@ def pausable(paused: SignallingRef[IO, Boolean]): IO[Unit] =
 
 Deciding when to pause is up to us: a circuit breaker, a health check, or failures counted in the processing, which sets the signal. While paused:
 
-- The poll being processed is acknowledged as usual. As no poll comes, acknowledgements are sent at once. Auto-renewal keeps renewing records still held; the polls which return renewed records fetch no new ones, and a new record one still returns, e.g. after a renewal timed out, is released at once.
+- The poll being processed is acknowledged as usual. As no poll comes, acknowledgements are sent at once. Auto-renewal keeps renewing records still held; the polls which return renewed records fetch no new ones.
 
 - With no records held, a pause longer than `max.poll.interval.ms` makes Java leave the share group; the first poll after it rejoins. Nothing is acquired meanwhile, so nothing is lost.
 

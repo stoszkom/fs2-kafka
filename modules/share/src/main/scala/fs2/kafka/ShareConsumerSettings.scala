@@ -233,8 +233,9 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
     * for longer than the margin can lose its lock before it is renewed. Renewal also happens within
     * half of `max.poll.interval.ms`. Renewal repeats every lock duration minus the margin, so a
     * margin close to the lock renews often; a margin of the whole lock or more renews at half of
-    * the lock. A renewal waits for the broker for up to the margin, and at most half the
-    * lock.<br><br>
+    * the lock. A renewal waits for the broker for up to the margin, and at most half the lock;
+    * a renewal confirmed later still keeps the records, and the acknowledgements made meanwhile
+    * are kept until then.<br><br>
     *
     * The default value is 5 seconds.
     */
@@ -308,8 +309,7 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
     * the consumer polls for no new records, so records are not acquired and their delivery count
     * does not grow while, for example, a service the processing needs is down. Records already
     * being processed are acknowledged as usual: their acknowledgements are sent
-    * at once, and auto-renewal keeps renewing them; a new record a renewal poll still returns is
-    * released at once. If the last poll before the pause returned nothing, Java still fetches in
+    * at once, and auto-renewal keeps renewing them. If the last poll before the pause returned nothing, Java still fetches in
     * the background until it acquires records, once: those are delivered after the pause with a
     * delivery count one higher. Without records held, a pause longer than `max.poll.interval.ms`
     * makes Java leave the share group, and the first poll after it rejoins.

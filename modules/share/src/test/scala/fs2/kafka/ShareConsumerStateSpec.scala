@@ -24,14 +24,15 @@ final class ShareConsumerStateSpec extends BaseSpec {
     )
 
   private val state = ShareConsumerState
-    .polled(
-      Vector(delivery(0L), delivery(1L)),
-      Duration.Zero,
-      None,
-      1.minute,
-      ShareConsumerState.empty
-    )
-    ._1
+    .polled(Vector(delivery(0L), delivery(1L)), Duration.Zero, None, ShareConsumerState.empty)
+
+  private val (first, second) = (partition -> 0L, partition -> 1L)
+
+  private val renewing =
+    state.withRenewing(Set(first, second), Set.empty, Set.empty, 1.second, None)
+
+  private def record(offset: Long) =
+    new JavaRecord("topic", 0, offset, Array.emptyByteArray, Array.emptyByteArray)
 
   describe("ShareConsumerState") {
     it("should have nothing to send once Java lost every pending acknowledgement") {
@@ -40,16 +41,40 @@ final class ShareConsumerStateSpec extends BaseSpec {
       acked.withoutHeld(Vector(partition -> 0L)).nextSend(1.second) shouldBe None
     }
 
-    it("should split a poll into the records of lost renewals and the fresh ones") {
-      val (kept, lost) = (delivery(0L), delivery(1L))
-      val renewed =
-        state.withRenewed(Map(kept._1 -> kept._2.record), Set.empty, 1.second, None)
-      val (next, (returned, fresh)) =
-        ShareConsumerState.polled(Vector(kept, lost), 2.seconds, None, 1.minute, renewed)
-      returned.map(_.offset) shouldBe Vector(1L)
-      fresh.map(_.offset) shouldBe Vector(0L)
-      next.holds(kept._1, 1) shouldBe true
-      next.holds(lost._1, 1) shouldBe false
+    it("should keep an acknowledgement made while renewing until the record is back") {
+      renewing.holds(first, 1) shouldBe true
+      renewing.canTakeBack shouldBe false
+      val confirmed = renewing
+        .withKept(Vector(first -> AcknowledgeType.Accept))
+        .withResults(Vector(first -> true, second -> true), 2.seconds, Duration.Zero)
+        ._1
+      confirmed.canTakeBack shouldBe true
+      val (back, (acks, unknown)) =
+        confirmed.withTakenBack(Vector(first -> record(0L), second -> record(1L)), None)
+      acks shouldBe Vector(first -> AcknowledgeType.Accept)
+      unknown shouldBe empty
+      back.hasRenewing shouldBe false
+      back.held.keySet shouldBe Set(first, second)
+    }
+
+    it("should lose a record whose renewal failed") {
+      val (next, failed) =
+        renewing.withResults(Vector(first -> false), 2.seconds, Duration.Zero)
+      failed shouldBe Set(first)
+      next.holds(first, 1) shouldBe false
+      next.holds(second, 1) shouldBe true
+    }
+
+    it("should forget a renewal Java can no longer report") {
+      renewing.withResults(Vector.empty, 2.seconds, 2.seconds)._2 shouldBe Set(first, second)
+    }
+
+    it("should release a record still being renewed when process returned, once back") {
+      val (_, (acks, _)) = renewing.closed
+        .withResults(Vector(first -> true, second -> true), 2.seconds, Duration.Zero)
+        ._1
+        .withTakenBack(Vector(first -> record(0L), second -> record(1L)), None)
+      acks.toMap shouldBe Map(first -> AcknowledgeType.Release, second -> AcknowledgeType.Release)
     }
 
     it("should keep the send deadline while an acknowledgement is pending") {
