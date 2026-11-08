@@ -232,14 +232,13 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       }
     }
 
-    // A renewal which outlasted its wait leaves the record renewing: an acknowledgement made
+    // A renewal leaves the record renewing until the broker confirmed it: an acknowledgement made
     // meanwhile is kept, and given to Java once the renewal completed, as the consumer stops.
-    it("should keep a record whose renewal outlasted its wait, and its acknowledgement") {
+    it("should keep a record being renewed, and its acknowledgement") {
       withTopic { topic =>
         createTopic(topic)
         publish(topic, "0")
-        // The wait ends before the broker can answer.
-        val settings = shareConsumerSettings.withRenewalMargin(1.nanosecond)
+        val settings = shareConsumerSettings
         val (seen, results) = run(
           (
             Ref.of[IO, Vector[(String, Int)]](Vector.empty),
