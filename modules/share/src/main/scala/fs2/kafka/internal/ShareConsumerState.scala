@@ -235,7 +235,7 @@ final private[kafka] case class ShareConsumerState(
     * from now, or it would be due again at once.
     */
   def skipRenewal(at: FiniteDuration): ShareConsumerState =
-    withStatus(records.collect { case (p, e) if e.renewal > 0 => p }, at)(e => Some(e.copy(status = Unacked)))
+    withStatus(records.filter(_._2.renewal > 0).keySet, at)(e => Some(e.copy(status = Unacked)))
       .copy(lockedSince = at)
 
   /**
