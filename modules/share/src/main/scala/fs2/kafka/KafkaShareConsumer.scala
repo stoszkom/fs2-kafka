@@ -48,7 +48,7 @@ import scala.concurrent.duration.*
   *
   * Consuming works like Java's poll loop: the consumer polls, runs `process` on the records of the
   * poll, and polls again once `process` has returned. Acknowledgements are recorded by the
-  * consumer, and a background driver sends them when they are due, renews acquisition locks, and
+  * consumer, and a background scheduler sends them when they are due, renews acquisition locks, and
   * acknowledges records past the max processing time with the failure acknowledgement. Anything
   * still pending is sent with the next poll.<br><br>
   *
@@ -110,7 +110,7 @@ object KafkaShareConsumer {
     *
     * The commit callback is only set in explicit acknowledgement mode, which is the only mode that
     * renews records. The `Dispatcher` running the callback is created before the Java consumer, as
-    * closing the Java consumer can still run the callback, and the driver is stopped before the
+    * closing the Java consumer can still run the callback, and the scheduler is stopped before the
     * Java consumer is closed.
     */
   def resource[F[_], K, V](
@@ -136,7 +136,7 @@ object KafkaShareConsumer {
           SignallingRef.of[F, Option[Throwable]](None)
         ).mapN(new Impl(config, keyDeserializer, valueDeserializer, withConsumer, results, _, _, _, _))
       )
-      _ <- consumer.driver.background
+      _ <- consumer.scheduler.background
     } yield consumer
 
   /**
@@ -194,7 +194,7 @@ object KafkaShareConsumer {
   private val subscriptionCheckInterval: FiniteDuration = 50.millis
 
   /**
-    * How long the driver waits before retrying an action which failed.
+    * How long the scheduler waits before retrying an action which failed.
     */
   private val retryInterval: FiniteDuration = 1.second
 
@@ -230,7 +230,7 @@ object KafkaShareConsumer {
     *   held while acknowledgements are moved from the state to the Java consumer, so that nothing
     *   else uses the Java consumer in between
     * @param failure
-    *   the last failure of the driver, which fails the running `consume`
+    *   the last failure of the scheduler, which fails the running `consume`
     */
   final private class Impl[F[_], K, V](
     config: ShareConsumerConfig[F, K, V],
@@ -305,7 +305,7 @@ object KafkaShareConsumer {
       else exclusively(loop(autoProcessed(process)))
 
     /**
-      * Runs `run` as the only consumption of the consumer, and fails if the driver fails.<br><br>
+      * Runs `run` as the only consumption of the consumer, and fails if the scheduler fails.<br><br>
       *
       * It is uncancelable from marking the consumer as consuming until the finalizer which unmarks
       * it is in place, as a cancelation in between would leave the consumer consuming for good.
@@ -323,7 +323,7 @@ object KafkaShareConsumer {
               .blocking(_.subscription().isEmpty)
               .ifM(
                 F.raiseError(NotSubscribedException()),
-                failure.set(None) *> F.race(driverFailed, run).void
+                failure.set(None) *> F.race(schedulerFailed, run).void
               )
           ).guarantee(
             send(identity).attempt.void *> lifecycle.update {
@@ -342,7 +342,7 @@ object KafkaShareConsumer {
 
     private def stopped: F[Unit] = lifecycle.waitUntil(_ == Stopped)
 
-    private def driverFailed: F[Unit] =
+    private def schedulerFailed: F[Unit] =
       failure.discrete
         .collectFirst { case Some(error) => error }
         .compile
@@ -475,9 +475,9 @@ object KafkaShareConsumer {
       *
       * It wakes up at the earliest deadline, which is recomputed whenever the state or the pause
       * signal changes. Due actions run outside of that, so that a new deadline can't interrupt
-      * them. A failure fails the running `consume`, and the driver keeps running.
+      * them. A failure fails the running `consume`, and the scheduler keeps running.
       */
-    def driver: F[Unit] =
+    def scheduler: F[Unit] =
       Signal
         .applicativeInstance[F]
         .map2(state, pauseSignal)((s, p) => actions(s, p).map(_._1).reduceOption(_ min _))
@@ -500,7 +500,7 @@ object KafkaShareConsumer {
       step.handleErrorWith(error => failure.set(Some(error)) *> F.sleep(retryInterval) *> retried(step))
 
     /**
-      * Returns the actions of the driver with their deadlines, in the order they run when due at
+      * Returns the actions of the scheduler with their deadlines, in the order they run when due at
       * the same time.
       */
     private def actions(s: ShareConsumerState, paused: Boolean): List[(FiniteDuration, F[Unit])] =
