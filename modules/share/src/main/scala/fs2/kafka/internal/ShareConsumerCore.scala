@@ -99,8 +99,7 @@ final private[kafka] class ShareConsumerCore[F[_]] private (
     * poll would throw. The callback's reports are dropped, as no renewal is pending.
     */
   def poll(timeout: FiniteDuration): F[Option[(Vector[KafkaByteConsumerRecord], Option[FiniteDuration])]] =
-    results.set(Vector.empty) *> step(_.takeUnsent) { (consumer, acks) =>
-      recordIn(consumer, acks)
+    results.set(Vector.empty) *> sendingUnsent { consumer =>
       if (consumer.subscription().isEmpty) None else Some(pollRecords(consumer, timeout))
     }
 
@@ -109,8 +108,7 @@ final private[kafka] class ShareConsumerCore[F[_]] private (
     * subscription.
     */
   def commitSync(timeout: FiniteDuration): F[Option[KafkaException]] =
-    step(_.takeUnsent) { (consumer, acks) =>
-      recordIn(consumer, acks)
+    sendingUnsent { consumer =>
       val committed = consumer.commitSync(timeout.toJava)
       if (consumer.subscription().isEmpty) None
       else committed.values.asScala.flatMap(_.toScala).headOption
@@ -201,6 +199,15 @@ final private[kafka] class ShareConsumerCore[F[_]] private (
         recordIn(consumer, acks)
         consumer.commitAsync()
       }
+    }
+
+  /**
+    * Gives Java the pending acknowledgements, and then runs `send`, which sends them.
+    */
+  private def sendingUnsent[A](send: KafkaByteShareConsumer => A): F[A] =
+    step(_.takeUnsent) { (consumer, acks) =>
+      recordIn(consumer, acks)
+      send(consumer)
     }
 
   /**
