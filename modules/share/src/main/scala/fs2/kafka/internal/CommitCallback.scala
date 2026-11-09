@@ -13,14 +13,17 @@ import fs2.kafka.internal.converters.collection.*
 import org.apache.kafka.clients.consumer.AcknowledgementCommitCallback
 import org.apache.kafka.common.TopicIdPartition
 
-private[kafka] object AcknowledgementResults {
+private[kafka] object CommitCallback {
 
   // Each offset Java reported as sent, with whether the broker took it.
-  type Results = Vector[(TopicPartitionOffset, Boolean)]
+  type CallbackResults = Vector[(TopicPartitionOffset, Boolean)]
 
   // Java's commit callback, adding what Java reports of the sent acknowledgements, renewals
   // included, to `results`. Java runs it during a poll or commit, which only returns once it has.
-  def callback[F[_]](dispatcher: Dispatcher[F], results: Ref[F, Results]): AcknowledgementCommitCallback =
+  def apply[F[_]](
+    dispatcher: Dispatcher[F],
+    results: Ref[F, CallbackResults]
+  ): AcknowledgementCommitCallback =
     new AcknowledgementCommitCallback {
       override def onComplete(
         offsets: java.util.Map[TopicIdPartition, java.util.Set[java.lang.Long]],

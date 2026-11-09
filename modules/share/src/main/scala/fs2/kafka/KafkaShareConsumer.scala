@@ -23,8 +23,8 @@ import fs2.kafka.consumer.KafkaMetrics
 import fs2.kafka.consumer.KafkaShareSubscription
 import fs2.kafka.consumer.MkShareConsumer
 import fs2.kafka.internal.Acknowledgement
-import fs2.kafka.internal.AcknowledgementResults
-import fs2.kafka.internal.AcknowledgementResults.Results
+import fs2.kafka.internal.CommitCallback
+import fs2.kafka.internal.CommitCallback.CallbackResults
 import fs2.kafka.internal.Acknowledger
 import fs2.kafka.internal.Delivery
 import fs2.kafka.internal.ShareConsumerConfig
@@ -120,10 +120,10 @@ object KafkaShareConsumer {
       config <- Resource.eval(ShareConsumerConfig.from(settings))
       dispatcher <- Dispatcher.sequential[F]
       withConsumer <- WithShareConsumer(mk, settings)
-      results <- Resource.eval(Ref.of[F, Results](Vector.empty))
+      results <- Resource.eval(Ref.of[F, CallbackResults](Vector.empty))
       _ <- Resource.eval(
         withConsumer
-          .blocking(_.setAcknowledgementCommitCallback(AcknowledgementResults.callback(dispatcher, results)))
+          .blocking(_.setAcknowledgementCommitCallback(CommitCallback(dispatcher, results)))
           .unlessA(config.implicitMode)
       )
       core <- Resource.eval(ShareConsumerCore.of(withConsumer, results))

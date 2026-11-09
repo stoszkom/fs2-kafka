@@ -18,7 +18,7 @@ import fs2.kafka.AcknowledgeType
 import fs2.kafka.KafkaByteConsumerRecord
 import fs2.kafka.KafkaByteShareConsumer
 import fs2.kafka.internal.Acknowledgement.TopicPartitionOffset
-import fs2.kafka.internal.AcknowledgementResults.Results
+import fs2.kafka.internal.CommitCallback.CallbackResults
 import fs2.kafka.internal.ShareConsumerCore.*
 import fs2.kafka.internal.ShareConsumerState.Acks
 import fs2.kafka.internal.converters.collection.*
@@ -49,7 +49,7 @@ final private[kafka] class ShareConsumerCore[F[_]] private (
   withConsumer: WithShareConsumer[F],
   mutex: Mutex[F],
   state: SignallingRef[F, ShareConsumerState],
-  results: Ref[F, Results]
+  results: Ref[F, CallbackResults]
 )(implicit F: Async[F]) {
 
   def metrics: F[Map[MetricName, Metric]] =
@@ -186,7 +186,7 @@ final private[kafka] class ShareConsumerCore[F[_]] private (
     * what the callback reported since the last check, or `None` if the consumer is unsubscribed. A
     * failed commit counts as subscribed, as Java still has what was sent.
     */
-  def checkRenewals: F[Option[Results]] =
+  def checkRenewals: F[Option[CallbackResults]] =
     mutex.lock
       .surround(withConsumer.blocking { consumer =>
         consumer.commitAsync()
@@ -265,7 +265,7 @@ private[kafka] object ShareConsumerCore {
 
   def of[F[_]](
     withConsumer: WithShareConsumer[F],
-    results: Ref[F, Results]
+    results: Ref[F, CallbackResults]
   )(implicit F: Async[F]): F[ShareConsumerCore[F]] =
     (Mutex[F], SignallingRef.of[F, ShareConsumerState](ShareConsumerState.empty))
       .mapN(new ShareConsumerCore(withConsumer, _, _, results))
