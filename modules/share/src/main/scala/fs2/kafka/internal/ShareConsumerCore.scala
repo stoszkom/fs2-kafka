@@ -117,14 +117,18 @@ final private[kafka] class ShareConsumerCore[F[_]] private (
     }
 
   /**
-    * Unsubscribes also if the commit fails. A commit which times out is not raised.
+    * Unsubscribes also if the commit fails, and then raises the commit's error first. A commit
+    * which times out is not raised.
     */
   def commitAndUnsubscribe(timeout: FiniteDuration): F[Unit] =
     step(_.takeUnsent) { (consumer, acks) =>
-      try {
+      val committed = Either.catchNonFatal {
         recordIn(consumer, acks)
         Either.catchOnly[TimeoutException](consumer.commitSync(timeout.toJava)).void.getOrElse(())
-      } finally consumer.unsubscribe()
+      }
+      val unsubscribed = Either.catchNonFatal(consumer.unsubscribe())
+      committed.left.foreach(error => unsubscribed.left.foreach(other => error.addSuppressed(other)))
+      (committed *> unsubscribed).fold(error => throw error, identity)
     }
 
   def send: F[Unit] =
