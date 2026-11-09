@@ -16,24 +16,20 @@ import scala.concurrent.duration.*
   * [[ShareConsumerSettings]] contain settings necessary to create a [[KafkaShareConsumer]]. At the
   * very least, this includes key and value deserializers.<br><br>
   *
-  * Unlike Java's share consumer, which defaults to `implicit` acknowledgement and `batch_optimized`
-  * acquisition, these settings default to `explicit` acknowledgement, where every polled record
-  * needs an acknowledgement before the next poll, and `record_limit` acquisition, where a poll
-  * returns at most `max.poll.records` records. Both modes can be changed with
-  * [[withAcknowledgementMode]] and [[withAcquireMode]], and behave as in Java's share consumer. As
-  * in Java, records are not renewed automatically unless enabled with [[withAutoRenewal]], except
-  * to let a renewed record be acknowledged.<br><br>
+  * Unlike Java's share consumer, these settings default to `explicit` acknowledgement and
+  * `record_limit` acquisition, which can be changed with [[withAcknowledgementMode]] and
+  * [[withAcquireMode]]. As in Java, records are only renewed automatically with
+  * [[withAutoRenewal]].<br><br>
   *
   * Several convenience functions are provided so that you don't have to work with `String` values
   * and `ConsumerConfig` for configuration. It's still possible to specify `ConsumerConfig` values
   * with functions like [[withProperty]].<br><br>
   *
   * [[ShareConsumerSettings]] instances are immutable and all modification functions return a new
-  * [[ShareConsumerSettings]] instance.<br><br>
+  * [[ShareConsumerSettings]] instance. Use `ShareConsumerSettings#apply` to create a new instance.
   *
-  * Use `ShareConsumerSettings#apply` to create a new instance.<br><br>
-  *
-  * Experimental: this API targets Kafka's new share groups.
+  * @note
+  *   this API is experimental, as are Kafka's share groups.
   */
 sealed abstract class ShareConsumerSettings[F[_], K, V] {
 
@@ -180,9 +176,9 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
   def withCloseTimeout(timeout: FiniteDuration): ShareConsumerSettings[F, K, V]
 
   /**
-    * How long the final commit after `stopConsuming` waits for the broker to confirm the last
-    * acknowledgements. A commit timing out before it is sent fails `consume` with a
-    * [[ShareCommitTimeoutException]].<br><br>
+    * How long stopping waits for the broker to confirm the last acknowledgements, before failing
+    * `consume` with a [[ShareCommitTimeoutException]]. It also bounds the wait for a pending
+    * renewal before that commit, and the commit before `unsubscribe`.<br><br>
     *
     * The default value is 15 seconds.
     */
@@ -194,9 +190,8 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
   def withCommitTimeout(timeout: FiniteDuration): ShareConsumerSettings[F, K, V]
 
   /**
-    * How long we should allow the `poll` call to block for in the Java `KafkaShareConsumer`. The
-    * consumer polls again as soon as `process` returned from the previous poll, so this is also how
-    * long an idle consumer waits between polls.<br><br>
+    * How long we should allow the `poll` call to block for in the Java `KafkaShareConsumer`, which
+    * is also how long each poll of an idle consumer waits for records.<br><br>
     *
     * The default value is 50 milliseconds.
     */
@@ -208,9 +203,8 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
   def withPollTimeout(timeout: FiniteDuration): ShareConsumerSettings[F, K, V]
 
   /**
-    * Whether records without an acknowledgement are renewed automatically before their acquisition
-    * lock expires, [[renewalMargin]] before it ends. Renewal does not apply in implicit
-    * acknowledgement mode, where Java does not allow it.<br><br>
+    * Whether records without an acknowledgement are renewed automatically, [[renewalMargin]] before
+    * their acquisition lock ends. It applies with explicit acknowledgement.<br><br>
     *
     * The default value is `false`, as in Java's share consumer.
     */
@@ -219,22 +213,17 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
   /**
     * Creates a new [[ShareConsumerSettings]] with the specified [[autoRenewal]].<br><br>
     *
-    * Without it, a record neither acknowledged nor renewed in time is delivered again, possibly to
-    * another consumer; a renewal you make renews every unacknowledged record of the poll with it.
-    * Enable it when processing may outlast the lock. A hung record is then renewed until `consume`
-    * is canceled or the [[maxProcessingTime]] passes, as stopping waits for `process`.
+    * Enable it when processing may outlast the lock: without it, a record neither acknowledged nor
+    * renewed in time is delivered again. A hung record is then renewed until the
+    * [[maxProcessingTime]] passes.
     */
   def withAutoRenewal(enabled: Boolean): ShareConsumerSettings[F, K, V]
 
   /**
-    * How long before a record's lock ends [[autoRenewal]] renews it. A record's lock counts from
-    * the start of the poll which returned it, but Java may have fetched it earlier and kept it
-    * buffered, e.g. from a second broker while you processed the previous poll; a record buffered
-    * for longer than the margin can lose its lock before it is renewed. Renewal also happens within
-    * half of `max.poll.interval.ms`. Renewal repeats every lock duration minus the margin, so a
-    * margin close to the lock renews often; a margin of the whole lock or more renews at half of
-    * the lock. A renewal doesn't wait for the broker: the records are back once the broker
-    * confirmed it, and acknowledgements made meanwhile are kept until then.<br><br>
+    * How long before a record's lock ends [[autoRenewal]] renews it, and at least every half of
+    * `max.poll.interval.ms`. A margin of the whole lock or more renews at half the lock. The lock
+    * counts from the start of the poll, so with `batch_optimized` acquisition, a record Java
+    * buffered for longer than the margin can lose its lock first.<br><br>
     *
     * The default value is 5 seconds.
     */
@@ -247,15 +236,13 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
 
   /**
     * How long the consumer may hold a record without an acknowledgement, or `None` for no limit. A
-    * record held longer is acknowledged with the [[failureAcknowledgement]], by default released
-    * and delivered again; its processing is not cancelled, and its
-    * later acknowledgement fails with a [[RecordNotInFlightException]], which [[acknowledgeChunks]]
+    * record held longer gets the [[failureAcknowledgement]]; its processing goes on, and its later
+    * acknowledgement fails with a [[RecordNotInFlightException]], which [[acknowledgeChunks]]
     * skips. It applies with explicit acknowledgement.<br><br>
     *
-    * The time counts from when the consumer took the record's poll, so it includes decoding, or
-    * from its latest `Renew` by the user. Set it well above the time to process a whole poll: `max.poll.records` times the time
-    * per record, divided by the parallelism, and more with merged consumers or `batch_optimized`
-    * polls. Ignoring the failure is usually enough, as the record is processed again:
+    * The time counts from the poll, or from the user's latest `Renew` of the record, so set it well
+    * above the time to process a whole poll. Ignoring the failure is usually enough, as the record
+    * was released and is delivered again:
     *
     * {{{
     * consumer.consume(_.parTraverseN(8) { record =>
@@ -280,20 +267,17 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
   def withoutMaxProcessingTime: ShareConsumerSettings[F, K, V]
 
   /**
-    * How the consumer acknowledges the records it settles itself: records `process` leaves
-    * unacknowledged when it returns or fails, records which fail to decode, and
-    * records held longer than the [[maxProcessingTime]]. Either `Release`, so that they are
-    * delivered again, or `Reject`, so that they are not. It applies with explicit acknowledgement.
-    * Records of a canceled `process`, for example when another of several consumers fails, are
-    * always released, as they were only interrupted, and so are the records the consumer still
-    * holds when it is closed.<br><br>
+    * How the consumer acknowledges the records it settles itself: those `process` leaves
+    * unacknowledged when it returns or fails, those of a poll in which a record fails to decode,
+    * and those past the [[maxProcessingTime]]. `Release` delivers them again, `Reject` does not.
+    * Records of a canceled `process` are always released. It applies with explicit
+    * acknowledgement.<br><br>
     *
-    * A failure of `process`, or a record which fails to decode, settles every record of the poll
-    * still without an acknowledgement, not just the failing one. With `Reject`, records which were
-    * never processed are then not delivered again, so handle failures per record: use `attempt`
-    * deserializers, and reject the failing record without failing `process`.<br><br>
+    * A failing `process` or decoder settles every unacknowledged record of its poll, so with
+    * `Reject`, handle failures per record, for example with `attempt` deserializers, rather than
+    * failing `process`.<br><br>
     *
-    * The default value is `Release`, as in Java's share consumer.
+    * The default value is `Release`, so these records are delivered again.
     */
   def failureAcknowledgement: AcknowledgeType
 
@@ -304,13 +288,11 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
   def withFailureAcknowledgement(kind: AcknowledgeType): ShareConsumerSettings[F, K, V]
 
   /**
-    * How long a pending acknowledgement may wait before the consumer sends it, or `None` to send
-    * acknowledgements only with the next poll, as a Java loop does. The next poll waits for every
-    * record of the current one, so without a limit, acknowledgements for fast records wait for the
-    * slowest record, and can be lost with their lock, or with the consumer, if it takes too long.
-    * Once the oldest unsent acknowledgement is this old, the consumer sends every pending
-    * acknowledgement with Java's `commitAsync`, without waiting for the result. It applies with
-    * explicit acknowledgement.<br><br>
+    * How long a pending acknowledgement may wait before the consumer sends it, without waiting for
+    * the result, or `None` to send acknowledgements only with the next poll, while paused, and when
+    * consuming ends, as a Java loop does. Without a limit, acknowledgements wait for the slowest
+    * record of the poll, and can be lost with their lock. It applies with explicit
+    * acknowledgement.<br><br>
     *
     * The default value is 1 second.
     */
@@ -330,18 +312,14 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
 
   /**
     * A signal which pauses the consumer while it is `true`, or `None` to never pause. While paused,
-    * the consumer polls for no new records, so records are not acquired and their delivery count
-    * does not grow while, for example, a service the processing needs is down. Records already
-    * being processed are acknowledged as usual: their acknowledgements are sent
-    * at once, and auto-renewal keeps renewing them. If the last poll before the pause returned nothing, Java still fetches in
-    * the background until it acquires records, once: those are delivered after the pause with a
-    * delivery count one higher. Without records held, a pause longer than `max.poll.interval.ms`
-    * makes Java leave the share group, and the first poll after it rejoins.
+    * no new records are polled, so their delivery count does not grow while, for example, a service
+    * the processing needs is down. Records already held are acknowledged and renewed as
+    * usual.<br><br>
     *
-    * The circuit breaker deciding when to pause, such as one counting failures or checking a
-    * service's health, is yours: set the signal, for example a `SignallingRef`. While processing
-    * fails, keep a record unacknowledged and retry it, with auto-renewal, rather than releasing it,
-    * so that its delivery count does not grow.<br><br>
+    * If the last poll before the pause returned nothing, Java may still acquire records once; those
+    * are delivered after the pause with a higher delivery count. Without records held, a pause
+    * longer than `max.poll.interval.ms` makes Java leave the share group until the next
+    * poll.<br><br>
     *
     * The default value is `None`.
     */
@@ -362,7 +340,9 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
 
 object ShareConsumerSettings {
 
-  // The longest limit, far from the overflow of the deadlines computed from it.
+  /**
+    * The longest limit, far from overflowing the deadlines computed from it.
+    */
   private val maxLimit: FiniteDuration = 365.days
 
   final private case class Impl[F[_], K, V](

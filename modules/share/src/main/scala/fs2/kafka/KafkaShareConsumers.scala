@@ -21,10 +21,11 @@ import org.apache.kafka.common.MetricName
 import scala.collection.immutable.SortedSet
 
 /**
-  * Share consumers of the same share group, each with its own Java consumer and its own loop, so
-  * that polls are processed in parallel across consumers, one at a time within each.<br><br>
+  * Share consumers of the same share group, each with its own Java consumer and loop, so that polls
+  * are processed in parallel across consumers, one at a time within each.
   *
-  * Experimental: this API targets Kafka's share groups.
+  * @note
+  *   this API is experimental, as are Kafka's share groups.
   */
 sealed abstract class KafkaShareConsumers[F[_], K, V] extends KafkaShareSubscription[F] {
 
@@ -98,7 +99,9 @@ object KafkaShareConsumers {
     override def subscribe[G[_]: Reducible](topics: G[String]): F[Unit] =
       consumers.traverse_(_.subscribe(topics))
 
-    // Each consumer sends what is pending first, so they all leave at once, even if one fails.
+    /**
+      * Every consumer unsubscribes, even if one fails.
+      */
     override def unsubscribe: F[Unit] =
       consumers
         .parTraverse(_.unsubscribe.attempt)
@@ -116,7 +119,9 @@ object KafkaShareConsumers {
 
     override def stopConsuming: F[Unit] = consumers.traverse_(_.stopConsuming)
 
-    // Java tags each consumer's metrics with its client id, generated if not configured.
+    /**
+      * Java tags each consumer's metrics with its client id, generated if not configured.
+      */
     override def metrics: F[Map[String, Map[MetricName, Metric]]] =
       consumers.toVector.zipWithIndex
         .traverse { case (consumer, index) =>

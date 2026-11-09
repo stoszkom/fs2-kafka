@@ -12,7 +12,9 @@ import fs2.kafka.AcknowledgeType
 import fs2.kafka.internal.Acknowledgement.TopicPartitionOffset
 import org.apache.kafka.common.TopicPartition
 
-// An acknowledgement for one delivery of a record.
+/**
+  * An acknowledgement for one delivery of a record.
+  */
 final private[kafka] case class Acknowledgement(
   offset: TopicPartitionOffset,
   deliveryCount: Short,
@@ -21,22 +23,27 @@ final private[kafka] case class Acknowledgement(
 
 private[kafka] object Acknowledgement {
 
-  // A record's offset in its topic partition. It identifies a record, not a delivery: a redelivery
-  // has the same one.
+  /**
+    * A record's offset in its topic partition, the same for every delivery of the record.
+    */
   type TopicPartitionOffset = (TopicPartition, Long)
 
 }
 
-// Gives acknowledgements to the Java consumer of the records they are for. Acknowledgers with the
-// same source acknowledge through the same consumer, which is what equality is based on, so
-// `acknowledgeChunks` can group acknowledgements by acknowledger. The consumer records every
-// acknowledgement of a chunk for a delivery it holds before it raises a `RecordNotInFlightException`
-// for the first one it doesn't, which lets the pipe drop the exception for the whole chunk.
+/**
+  * Gives acknowledgements to the consumer holding their records.<br><br>
+  *
+  * Acknowledgers are equal when they share a `source`, so that `acknowledgeChunks` can acknowledge
+  * a run of records through one of them. The consumer records every acknowledgement of a chunk
+  * before raising a `RecordNotInFlightException` for the first one it doesn't hold.
+  */
 private[kafka] trait Acknowledger[F[_]] {
 
   def acknowledge(acks: Chunk[Acknowledgement]): F[Unit]
 
-  // The acknowledger this one was derived from through `mapK`, or this one itself.
+  /**
+    * The acknowledger this one was derived from with `mapK`, or this one.
+    */
   def source: AnyRef = this
 
   final override def equals(that: Any): Boolean =

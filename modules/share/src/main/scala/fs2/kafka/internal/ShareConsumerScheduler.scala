@@ -16,15 +16,14 @@ import fs2.kafka.internal.Acknowledgement.TopicPartitionOffset
 import scala.concurrent.duration.*
 
 /**
-  * Runs for as long as the share consumer, acknowledging records past the max processing time,
-  * renewing records, and sending acknowledgements when they are due.<br><br>
+  * Sends acknowledgements when due, renews records, and settles records past the max processing
+  * time, for as long as the consumer runs.<br><br>
   *
-  * It wakes up at the earliest deadline, which is recomputed whenever the held records or the pause
-  * signal changes. Due actions run outside of that, so that a new deadline can't interrupt them. A
-  * failure fails the running `consume`, and the scheduler keeps running.
+  * It sleeps until the earliest deadline, recomputed whenever the held records or the pause change.
+  * A failure fails the running `consume`, and the action is retried.
   *
   * @param failure
-  *   the last failure of the scheduler, which fails the running `consume`
+  *   the last failure, which fails the running `consume`
   */
 final private[kafka] class ShareConsumerScheduler[F[_], K, V] private (
   config: ShareConsumerConfig[F, K, V],
@@ -52,9 +51,6 @@ final private[kafka] class ShareConsumerScheduler[F[_], K, V] private (
       .compile
       .drain
 
-  /**
-    * Fails with the next failure of the scheduler.
-    */
   def failed: F[Unit] =
     failure.discrete
       .collectFirst { case Some(error) => error }
@@ -62,22 +58,17 @@ final private[kafka] class ShareConsumerScheduler[F[_], K, V] private (
       .lastOrError
       .flatMap(F.raiseError[Unit])
 
-  /**
-    * Forgets the last failure, when consuming starts.
-    */
   def reset: F[Unit] =
     failure.set(None)
 
   /**
-    * Runs `step`, retrying it after a failure, as the deadline which made it due might not
-    * change. Each failure fails the running `consume`.
+    * Retries `step` after a failure, as the deadline which made it due might not change.
     */
   private def retried(step: F[Unit]): F[Unit] =
     step.handleErrorWith(error => failure.set(Some(error)) *> F.sleep(retryInterval) *> retried(step))
 
   /**
-    * Returns the actions of the scheduler with their deadlines, in the order they run when due at
-    * the same time.
+    * The actions with their deadlines, in the order they run when due together.
     */
   private def actions(s: HeldRecords, paused: Boolean): List[(FiniteDuration, F[Unit])] =
     List(
@@ -90,7 +81,8 @@ final private[kafka] class ShareConsumerScheduler[F[_], K, V] private (
     Some(config.renewalInterval(s.lock)).filter(_ => settings.autoRenewal)
 
   /**
-    * Runs due actions one at a time until none is due, as an action only moves its own deadline.
+    * Runs the due actions one at a time, recomputing the deadlines after each, as an action can
+    * move the others' deadlines.
     */
   private def due: F[Unit] =
     (core.held.get, pause.get, F.monotonic)
@@ -103,28 +95,17 @@ final private[kafka] class ShareConsumerScheduler[F[_], K, V] private (
       .void
 
   /**
-    * Acknowledges records past the max processing time with the failure acknowledgement, and
-    * sends the acknowledgements immediately, so that a late acknowledgement fails.
+    * Sent at once, so that a late acknowledgement fails.
     */
   private def acknowledgeOverdue(max: FiniteDuration): F[Unit] =
     core.sendOverdue(max, settings.failureAcknowledgement)
 
   /**
-    * Renews every unacknowledged record, along with the pending acknowledgements.<br><br>
-    *
-    * Renewing works as follows.
-    *   1. The renewals are sent without waiting for the broker, as in Java's own renewal loop.
-    *      The renewal is skipped if it is no longer due once the mutex is held, as a poll since
-    *      then would otherwise have its new records renewed.
-    *   2. `confirmed` checks with the Java consumer until the broker has answered.
-    *   3. `core.takeBack` takes the renewed records back with a poll, which fetches nothing, as no
-    *      renewal is pending anymore.
-    *
-    * Meanwhile, there is nothing else to send, as every unacknowledged record is being renewed,
-    * and acknowledgements made in the meantime wait for their records. If the Java consumer fails
-    * on the way, the records are held again as they were, to be renewed or acknowledged later,
-    * rather than being left renewing forever. Nothing is renewed while unsubscribed, as Java's
-    * poll would refuse to take the records back.
+    * Renews every unacknowledged record as the renewal example in Java's `KafkaShareConsumer`
+    * documentation does: the renewals are sent without waiting, `confirmed` waits for the broker's
+    * answer, and `core.takeBack` polls the records back. If anything fails, the records are held
+    * again as they were. Nothing is renewed while unsubscribed, as Java's poll would refuse to
+    * return the records.
     */
   private def renew: F[Unit] =
     for {
@@ -145,16 +126,15 @@ final private[kafka] class ShareConsumerScheduler[F[_], K, V] private (
     renewal.onError { case _ => core.failRenewal }
   }
 
+  /**
+    * Checked again under the mutex, as a poll since the renewal came due holds new records.
+    */
   private def renewalDue(at: FiniteDuration)(s: HeldRecords): Boolean =
     s.nextRenewal(autoRenewalInterval(s)).exists(_ <= at)
 
   /**
-    * Checks with the Java consumer, using a commit, until the broker has answered for every
-    * record sent for renewal, and returns the records whose renewal was confirmed.<br><br>
-    *
-    * A failed check counts as no answer yet, as Java still has the renewals. If the broker can no
-    * longer answer, or the consumer has unsubscribed, no records are returned, as Java's poll
-    * would fetch while a renewal is pending, or throw.
+    * Commits until the broker answered for every record sent for renewal, and returns those it
+    * confirmed, or none if the broker can't answer anymore or the consumer unsubscribed.
     */
   private def confirmed(
     waiting: Set[TopicPartitionOffset],
@@ -189,14 +169,8 @@ private[kafka] object ShareConsumerScheduler {
       .of[F, Option[Throwable]](None)
       .map(new ShareConsumerScheduler(config, core, pause, _))
 
-  /**
-    * How long the scheduler waits before retrying an action which failed.
-    */
   private val retryInterval: FiniteDuration = 1.second
 
-  /**
-    * How often a renewal checks with the Java consumer whether the broker has answered.
-    */
   private val renewalCheckInterval: FiniteDuration = 10.millis
 
 }

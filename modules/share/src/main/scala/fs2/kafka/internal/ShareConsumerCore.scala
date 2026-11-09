@@ -32,18 +32,14 @@ import scala.collection.immutable.SortedSet
 import scala.concurrent.duration.*
 
 /**
-  * The Java share consumer, and the records it holds for the share consumer with their
-  * acknowledgements. It is the share consumer's only access to both.<br><br>
+  * The Java share consumer and the records it holds: the consumer's only access to both.<br><br>
   *
-  * Acknowledgements are taken from the state and given to Java in one step, holding the mutex
-  * and uncancelable, so that nothing is lost in between and nothing else uses the Java consumer
-  * meanwhile. The state otherwise only changes through the operations here, each running the
+  * Acknowledgements are taken from the state and given to Java in one `step`, under the mutex and
+  * uncancelable, so that nothing is lost in between. Operations which only change the state run the
   * `ShareConsumerState` method of the same name.
   *
-  * @param mutex
-  *   held while acknowledgements are moved from the state to the Java consumer
   * @param results
-  *   what the commit callback reported for sent acknowledgements since they were last read
+  *   what the commit callback reported since it was last read or cleared
   */
 final private[kafka] class ShareConsumerCore[F[_]] private (
   withConsumer: WithShareConsumer[F],
@@ -65,30 +61,20 @@ final private[kafka] class ShareConsumerCore[F[_]] private (
     withConsumer.blocking(!_.subscription().isEmpty)
 
   /**
-    * Unsubscribes without sending anything first, for implicit mode, where a commit would accept
-    * records still being processed.
+    * For implicit mode, where a commit would accept records still being processed.
     */
   def unsubscribe: F[Unit] =
     withConsumer.blocking(_.unsubscribe())
 
-  /**
-    * Sends what Java has pending with an asynchronous commit.
-    */
   def commit: F[Unit] =
     withConsumer.blocking(_.commitAsync())
 
-  /**
-    * The held records, read-only, for the scheduler's deadlines.
-    */
   def held: Signal[F, HeldRecords] = state.map(s => s: HeldRecords)
 
   def open: F[Boolean] = state.get.map(_.open)
 
   def renewing: F[Boolean] = state.get.map(_.renewing)
 
-  /**
-    * Waits until no record is being renewed.
-    */
   def awaitRenewals: F[Unit] = state.waitUntil(!_.renewing)
 
   def hold(
@@ -111,10 +97,8 @@ final private[kafka] class ShareConsumerCore[F[_]] private (
     F.monotonic.flatMap(at => state.update(_.failRenewal(at)))
 
   /**
-    * Polls for up to `timeout`, which sends the pending acknowledgements. Returns the records and
-    * the lock the broker reported, or `None` without polling if unsubscribed, as Java's poll would
-    * throw. What the commit callback has reported is of no use with no records held, so it is
-    * dropped.
+    * Polls, which sends the pending acknowledgements. Returns `None` if unsubscribed, as Java's
+    * poll would throw. The callback's reports are dropped, as no renewal is pending.
     */
   def poll(timeout: FiniteDuration): F[Option[(Vector[KafkaByteConsumerRecord], Option[FiniteDuration])]] =
     results.set(Vector.empty) *> step(_.takeUnsent) { (consumer, acks) =>
@@ -123,9 +107,8 @@ final private[kafka] class ShareConsumerCore[F[_]] private (
     }
 
   /**
-    * Sends the pending acknowledgements with a synchronous commit, waiting up to `timeout`.
-    * Returns the first acknowledgement the broker rejected, unless unsubscribed, as the records
-    * were released along with the subscription.
+    * Returns the first error the broker returned, unless unsubscribed, as the records went with the
+    * subscription.
     */
   def commitSync(timeout: FiniteDuration): F[Option[KafkaException]] =
     step(_.takeUnsent) { (consumer, acks) =>
@@ -136,8 +119,7 @@ final private[kafka] class ShareConsumerCore[F[_]] private (
     }
 
   /**
-    * Sends the pending acknowledgements with a synchronous commit, waiting up to `timeout`, and
-    * unsubscribes, also when the commit times out, as Java's `unsubscribe` doesn't send them.
+    * Unsubscribes also if the commit times out.
     */
   def commitAndUnsubscribe(timeout: FiniteDuration): F[Unit] =
     step(_.takeUnsent) { (consumer, acks) =>
@@ -146,23 +128,20 @@ final private[kafka] class ShareConsumerCore[F[_]] private (
       consumer.unsubscribe()
     }
 
-  /**
-    * Sends the pending acknowledgements with an asynchronous commit.
-    */
   def send: F[Unit] =
     sending(_.takeUnsent)
 
   /**
-    * Acknowledges the records held without an acknowledgement for `max` with `kind`, and sends
-    * the acknowledgements with an asynchronous commit.
+    * Acknowledges the records held for `max` without an acknowledgement with `kind`, and sends
+    * them.
     */
   def sendOverdue(max: FiniteDuration, kind: AcknowledgeType): F[Unit] =
     F.monotonic.flatMap(now => sending(_.takeOverdue(max, kind, now)))
 
   /**
-    * Gives Java the pending acknowledgements and a `Renew` for every unacknowledged record, if the
-    * renewal is still `due`, and commits without waiting. Returns the records Java took for
-    * renewal, and the lock the broker reported, or `None` if the renewal is no longer due.
+    * Sends the pending acknowledgements and a `Renew` for every unacknowledged record, if the
+    * renewal is still `due`, without waiting. Returns the records Java took, and the lock last
+    * reported.
     */
   def renew(at: FiniteDuration)(
     due: HeldRecords => Boolean
@@ -182,9 +161,8 @@ final private[kafka] class ShareConsumerCore[F[_]] private (
     }
 
   /**
-    * Lets the Java consumer run the commit callback with a commit, holding the mutex, and returns
-    * what the callback reported since the last check, or `None` if the consumer is unsubscribed. A
-    * failed commit counts as subscribed, as Java still has what was sent.
+    * Commits, so that Java runs the callback, and returns what it reported, or `None` if
+    * unsubscribed. A failed commit counts as no answer yet.
     */
   def checkRenewals: F[Option[CallbackResults]] =
     mutex.lock
@@ -196,10 +174,9 @@ final private[kafka] class ShareConsumerCore[F[_]] private (
       .flatMap(unsubscribed => results.getAndSet(Vector.empty).map(r => if (unsubscribed) None else Some(r)))
 
   /**
-    * Takes the confirmed records back with a poll, and holds them again. Records whose renewal was
-    * not confirmed are lost, and records the poll returned which are not held are released. If the
-    * poll has closed by the time the records are back, their acknowledgements are sent
-    * immediately, as `consume` may have ended.
+    * Polls the confirmed records back and holds them again; the others are lost. Returned records
+    * which are not held are released. If the poll is closed, the acknowledgements of the records
+    * taken back are sent at once, as `consume` may have ended.
     */
   def takeBack(confirmed: Set[TopicPartitionOffset]): F[Unit] =
     pollRenewed(confirmed).flatMap { case (returned, lock) =>
@@ -213,11 +190,9 @@ final private[kafka] class ShareConsumerCore[F[_]] private (
     }
 
   /**
-    * Polls the renewed records back, after giving the Java consumer the acknowledgements of the
-    * records it holds, which its poll requires. The poll fetches nothing, as no renewal is pending
-    * anymore. Nothing is polled if no renewal was confirmed, or if the consumer has unsubscribed
-    * since the check, as Java's poll would throw, and the records were released along with the
-    * subscription.
+    * Gives Java the pending acknowledgements, which its poll requires, and polls without fetching,
+    * as no renewal is pending anymore. Nothing is polled if no renewal was confirmed, or if
+    * unsubscribed.
     */
   private def pollRenewed(
     confirmed: Set[TopicPartitionOffset]
@@ -228,9 +203,6 @@ final private[kafka] class ShareConsumerCore[F[_]] private (
       else pollRecords(consumer, Duration.Zero)
     }
 
-  /**
-    * Releases records which are not held, and sends the releases with an asynchronous commit.
-    */
   private def release(records: Vector[KafkaByteConsumerRecord]): F[Unit] =
     step(s => (s, records)) { (consumer, records) =>
       recordIn(consumer, records.map(_ -> AcknowledgeType.Release))
@@ -238,7 +210,6 @@ final private[kafka] class ShareConsumerCore[F[_]] private (
     }
 
   /**
-    * Takes the acknowledgements to send with `take`, and sends them with an asynchronous commit.
     * Only commits if there is something to send, as in implicit mode a commit would accept the
     * poll.
     */
@@ -251,8 +222,7 @@ final private[kafka] class ShareConsumerCore[F[_]] private (
     }
 
   /**
-    * Takes something from the state with `take`, and gives it to the Java consumer with `give`.
-    * Runs holding the mutex and uncancelable, so that nothing is lost in between.
+    * Takes from the state and gives to Java, under the mutex and uncancelable.
     */
   private def step[A, B](take: ShareConsumerState => (ShareConsumerState, A))(
     give: (KafkaByteShareConsumer, A) => B
@@ -270,9 +240,6 @@ private[kafka] object ShareConsumerCore {
     (Mutex[F], SignallingRef.of[F, ShareConsumerState](ShareConsumerState.empty))
       .mapN(new ShareConsumerCore(withConsumer, _, _, results))
 
-  /**
-    * Returns the acquisition lock duration last reported by the broker.
-    */
   private def acquisitionLock(consumer: KafkaByteShareConsumer): Option[FiniteDuration] =
     consumer.acquisitionLockTimeoutMs().toScala.map(_.intValue.millis)
 
@@ -283,11 +250,8 @@ private[kafka] object ShareConsumerCore {
     consumer.poll(timeout.toJava).iterator().asScala.toVector -> acquisitionLock(consumer)
 
   /**
-    * Gives every acknowledgement to the Java consumer, and then throws the first error, ignoring
-    * the `IllegalStateException` Java throws for a record it no longer holds.<br><br>
-    *
-    * The acknowledgements have already been taken from the state, so a single failure must not
-    * lose the rest.
+    * Gives every acknowledgement to Java, then throws the first error other than the
+    * `IllegalStateException` for a record Java no longer holds: one failure must not lose the rest.
     */
   private def recordIn(consumer: KafkaByteShareConsumer, acks: Acks): Unit =
     acks
@@ -296,8 +260,7 @@ private[kafka] object ShareConsumerCore {
       .foreach(error => throw error)
 
   /**
-    * Renews the record with the Java consumer, and returns whether Java accepted the renewal. Java
-    * refuses to renew a record it no longer holds.
+    * Whether Java took the renewal: it refuses a record it no longer holds.
     */
   private def renewedIn(consumer: KafkaByteShareConsumer, record: KafkaByteConsumerRecord): Boolean =
     Either

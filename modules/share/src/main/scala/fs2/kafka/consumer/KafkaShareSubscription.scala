@@ -31,13 +31,11 @@ trait KafkaShareSubscription[F[_]] {
   def subscribe[G[_]: Reducible](topics: G[String]): F[Unit]
 
   /**
-    * Unsubscribes the consumer from all topics, after sending the pending acknowledgements.
+    * Unsubscribes the consumer from all topics. With explicit acknowledgement, the pending
+    * acknowledgements are sent first, waiting up to the commit timeout.
     */
   def unsubscribe: F[Unit]
 
-  /**
-    * Returns the topics the share consumer is subscribed to.
-    */
   def subscription: F[SortedSet[String]]
 
 }

@@ -40,15 +40,13 @@ import scala.collection.immutable.SortedSet
 import scala.concurrent.duration.*
 
 /**
-  * [[KafkaShareConsumer]] represents a consumer of Kafka records in a share group, with the
-  * ability to `subscribe` to topics and process records with [[consume]] or [[autoConsume]], and
-  * stop with [[stopConsuming]].<br><br>
+  * [[KafkaShareConsumer]] represents a consumer of Kafka records in a share group. Records are
+  * processed with [[consume]] or [[autoConsume]], one poll at a time, until
+  * [[stopConsuming]].<br><br>
   *
-  * Consuming works like Java's poll loop: the consumer polls, runs `process` on the records of the
-  * poll, and polls again once `process` has returned. Acknowledgements are recorded by the
-  * consumer, and a background scheduler sends them when they are due, renews acquisition locks, and
-  * acknowledges records past the max processing time with the failure acknowledgement. Anything
-  * still pending is sent with the next poll.<br><br>
+  * Acknowledgements are recorded by the consumer, and sent by a background scheduler when due, or
+  * with the next poll. The scheduler also renews acquisition locks, and acknowledges records held
+  * past the max processing time with the failure acknowledgement.
   *
   * @note
   *   this API is experimental, as are Kafka's share groups.
@@ -61,40 +59,32 @@ sealed abstract class KafkaShareConsumer[F[_], K, V] extends KafkaShareSubscript
   def settings: ShareConsumerSettings[F, K, V]
 
   /**
-    * Consumes records in explicit acknowledgement mode, running `process` on the records of each
-    * poll, one poll at a time, until [[stopConsuming]] is invoked.<br><br>
+    * Consumes records with explicit acknowledgement, running `process` on each poll until
+    * [[stopConsuming]]. `process` may acknowledge its records in parallel, as each one
+    * finishes.<br><br>
     *
-    * `process` may work on the records in parallel and acknowledge each record as it finishes.
-    * Acknowledgements are sent after `maxAcknowledgementDelay`, immediately while paused, or with
-    * the next poll. Records left unacknowledged when `process` returns are acknowledged with
-    * `failureAcknowledgement`, `Release` by default. If `process` fails, its records are
-    * acknowledged the same way and the error is raised. If it is canceled, they are released.
-    * Acknowledging a record after `process` has returned fails with a
-    * [[RecordNotInFlightException]].<br><br>
+    * Records left unacknowledged when `process` returns or fails get the `failureAcknowledgement`,
+    * and are released if it is canceled. Acknowledging a record after `process` returned fails with
+    * a [[RecordNotInFlightException]].<br><br>
     *
-    * The last acknowledgements are sent before this returns, and it fails if the broker rejects
-    * them. Acknowledgements sent earlier are not awaited, so they can fail unnoticed, in which case
-    * their records are delivered again.
+    * After [[stopConsuming]], the last acknowledgements are awaited, and fail `consume` if the
+    * broker rejects them. Others are not awaited: if they fail, their records are delivered again.
     */
   def consume(process: Chunk[AcknowledgeableConsumerRecord[F, K, V]] => F[Unit]): F[Unit]
 
   /**
-    * Consumes records in implicit acknowledgement mode, running `process` on the records of each
-    * poll until [[stopConsuming]] is invoked. Once `process` returns, the records of the poll are
-    * accepted.<br><br>
+    * Consumes records with implicit acknowledgement, running `process` on each poll until
+    * [[stopConsuming]]. The records of a poll are accepted once `process` returns.<br><br>
     *
-    * If `process` fails, the records are not accepted: closing the consumer releases them, so they
-    * are delivered again, as in Java's poll loop. Since Java would accept them with its next poll,
-    * the consumer then refuses to consume again, and you have to close it and create a new one.
+    * If `process` fails or is canceled, its records are released when the consumer is closed, and
+    * the consumer refuses to consume again, as Java would accept them with its next poll.
     */
   def autoConsume(process: Chunk[ConsumerRecord[K, V]] => F[Unit]): F[Unit]
 
   /**
-    * Stops consuming records. [[consume]] or [[autoConsume]] returns once the current poll has been
-    * processed and the last acknowledgements have been sent.<br><br>
-    *
-    * Stopping is final: consuming again fails with an `IllegalStateException`, so create a new
-    * consumer instead.
+    * Makes [[consume]] or [[autoConsume]] return once the current poll is processed and the last
+    * acknowledgements are sent. Stopping is final: consuming again fails with an
+    * `IllegalStateException`.
     */
   def stopConsuming: F[Unit]
 
@@ -106,10 +96,8 @@ object KafkaShareConsumer {
     * Creates a new [[KafkaShareConsumer]] in the `Resource` context, using the specified
     * [[ShareConsumerSettings]].<br><br>
     *
-    * The commit callback is only set in explicit acknowledgement mode, which is the only mode that
-    * renews records. The `Dispatcher` running the callback is created before the Java consumer, as
-    * closing the Java consumer can still run the callback, and the scheduler is stopped before the
-    * Java consumer is closed.
+    * The `Dispatcher` is created before the Java consumer, as closing it can still run the commit
+    * callback.
     */
   def resource[F[_], K, V](
     settings: ShareConsumerSettings[F, K, V]
@@ -150,15 +138,8 @@ object KafkaShareConsumer {
   private def deliveryCountOf(record: KafkaByteConsumerRecord): Short =
     record.deliveryCount().toScala.fold(1: Short)(_.shortValue)
 
-  /**
-    * How often an unsubscribed consumer checks whether it has been subscribed.
-    */
   private val subscriptionCheckInterval: FiniteDuration = 50.millis
 
-  /**
-    * The records of a poll, when the poll started, and the acquisition lock duration reported by
-    * the broker.
-    */
   final private case class Polled(
     records: Vector[KafkaByteConsumerRecord],
     start: FiniteDuration,
@@ -166,8 +147,8 @@ object KafkaShareConsumer {
   )
 
   /**
-    * Whether the consumer is able to consume. Stopping is final. In implicit mode, the consumer is
-    * poisoned once `process` has failed, since any later poll or commit would accept its records.
+    * Stopping is final. In implicit mode, a failed or canceled `process` poisons the consumer, as
+    * any later poll or commit would accept its records.
     */
   sealed abstract private class Lifecycle
   private case object Idle extends Lifecycle
@@ -197,9 +178,8 @@ object KafkaShareConsumer {
       core.subscribe(topics.toList)
 
     /**
-      * Java's `unsubscribe` does not send pending acknowledgements, so in explicit mode they are
-      * committed first, and a commit timeout does not stop the consumer from unsubscribing. In
-      * implicit mode, nothing is committed, as a commit would accept records still being processed.
+      * In explicit mode, pending acknowledgements are committed first, as Java's `unsubscribe`
+      * doesn't send them. In implicit mode, a commit would accept records still being processed.
       */
     override def unsubscribe: F[Unit] =
       if (config.implicitMode) core.unsubscribe
@@ -209,9 +189,6 @@ object KafkaShareConsumer {
     override def subscription: F[SortedSet[String]] =
       core.subscription
 
-    /**
-      * A poisoned consumer stays poisoned, so that the reason it refuses to consume is kept.
-      */
     override def stopConsuming: F[Unit] =
       lifecycle.update {
         case Poisoned => Poisoned
@@ -228,10 +205,8 @@ object KafkaShareConsumer {
       else exclusively(loop(autoProcessed(process)))
 
     /**
-      * Runs `run` as the only consumption of the consumer, and fails if the scheduler fails.<br><br>
-      *
-      * It is uncancelable from `startConsuming` until `endConsuming` is in place as its finalizer,
-      * as a cancelation in between would leave the consumer consuming for good.
+      * Runs `run` as the only consumption, and fails if the scheduler fails. It is uncancelable
+      * until `endConsuming` is in place, so that a cancelation can't leave the consumer consuming.
       */
     private def exclusively(run: F[Unit]): F[Unit] =
       F.uncancelable { cancelable =>
@@ -240,9 +215,6 @@ object KafkaShareConsumer {
             .guarantee(endConsuming)
       }
 
-    /**
-      * Marks the consumer as consuming, or fails with the reason it can't consume.
-      */
     private def startConsuming: F[Unit] =
       lifecycle.modify {
         case Idle => Consuming -> F.unit
@@ -253,8 +225,7 @@ object KafkaShareConsumer {
       core.subscribed.ifM(F.unit, F.raiseError(NotSubscribedException()))
 
     /**
-      * Sends the pending acknowledgements, as no poll follows to send them, and marks the consumer
-      * as no longer consuming, unless it was stopped or poisoned meanwhile.
+      * Sends what is pending, as no poll follows.
       */
     private def endConsuming: F[Unit] =
       core.send.attempt.void *> lifecycle.update {
@@ -270,9 +241,7 @@ object KafkaShareConsumer {
       }
 
     /**
-      * Polls until stopped, and passes the records of each poll to `run`. Stopping finishes with
-      * `finish`. While paused, or while records are being renewed, the loop waits instead of
-      * polling.
+      * Polls until stopped, waiting instead while paused, or while records are being renewed.
       */
     private def loop(run: (Poll[F], Polled) => F[Unit]): F[Unit] =
       (lifecycle.get, pauseSignal.get, core.renewing).flatMapN { (current, paused, renewing) =>
@@ -287,16 +256,13 @@ object KafkaShareConsumer {
       }
 
     /**
-      * Waits until the pause ends, or the consumer is stopped. Nothing is polled meanwhile, so a
-      * commit sends the pending acknowledgements, which in implicit mode accepts the poll just
-      * processed.
+      * Nothing is polled while paused, so a commit sends what is pending.
       */
     private def waitForUnpause: F[Unit] =
       core.commit *> untilStopped(pauseSignal.waitUntil(!_))
 
     /**
-      * Waits until the records being renewed are back, or the consumer is stopped, as Java's poll
-      * would fetch more records while a renewal is pending.
+      * Java's poll would fetch more records while a renewal is pending.
       */
     private def waitForRenewals: F[Unit] =
       untilStopped(core.awaitRenewals)
@@ -305,11 +271,7 @@ object KafkaShareConsumer {
       F.race(lifecycle.waitUntil(_ == Stopped), wait).void
 
     /**
-      * Polls once and passes the records to `run`, or waits a little if unsubscribed. The poll
-      * can't be canceled until `run` has taken its records, as Java holds them from the poll
-      * onwards. `run` makes processing cancelable again with the `Poll` it is given.<br><br>
-      *
-      * The commit callback's reports are dropped before polling.
+      * Uncancelable until `run` has the records, as Java holds them from the poll on.
       */
     private def pollOnce(run: (Poll[F], Polled) => F[Unit]): F[Unit] =
       F.uncancelable { cancelable =>
@@ -323,9 +285,8 @@ object KafkaShareConsumer {
       }.flatMap(subscribed => F.sleep(subscriptionCheckInterval).unlessA(subscribed))
 
     /**
-      * Waits for the records being renewed, up to the commit timeout, and sends the pending
-      * acknowledgements with a synchronous commit. Raises the first acknowledgement the broker
-      * rejected.
+      * Waits for the renewals, up to the commit timeout, and commits synchronously, raising the
+      * first error the broker returned.
       */
     private def finish: F[Unit] =
       for {
@@ -337,10 +298,7 @@ object KafkaShareConsumer {
       } yield ()
 
     /**
-      * Processes a poll in explicit mode. The state holds the records from the moment they are
-      * taken, also when decoding fails or `process` is canceled. Once `process` returns, the poll
-      * is closed. If `process` failed or was canceled, `consume` ends, which sends the pending
-      * acknowledgements.
+      * The records are held from the poll on, also if decoding fails or `process` is canceled.
       */
     private def processed(
       process: Chunk[AcknowledgeableConsumerRecord[F, K, V]] => F[Unit]
@@ -350,9 +308,8 @@ object KafkaShareConsumer {
           .guaranteeCase(closePoll)
 
     /**
-      * Processes a poll in implicit mode, where Java accepts the records with the next poll or
-      * commit. A failure poisons the consumer, as does a cancelation, for example when another of
-      * several consumers fails.
+      * A failure or cancelation poisons the consumer, as Java would accept the records with its
+      * next poll.
       */
     private def autoProcessed(
       process: Chunk[ConsumerRecord[K, V]] => F[Unit]
@@ -367,8 +324,7 @@ object KafkaShareConsumer {
       }
 
     /**
-      * Closes the poll once `process` is done: the records it left are acknowledged with
-      * `failureAcknowledgement`, or released if it was canceled, as they were only interrupted.
+      * Records `process` left get the `failureAcknowledgement`, or `Release` if it was canceled.
       */
     private def closePoll(outcome: Outcome[F, Throwable, Unit]): F[Unit] = {
       val kind = if (outcome.isCanceled) AcknowledgeType.Release else settings.failureAcknowledgement
@@ -390,9 +346,7 @@ object KafkaShareConsumer {
       }
 
     /**
-      * Records the acknowledgements, renewals included, with a single state update, without
-      * touching the Java consumer or the mutex. The state mirrors what Java holds, so anything Java
-      * would refuse fails here with a [[RecordNotInFlightException]].
+      * Only records the acknowledgements: Java gets them when they are sent.
       */
     override def acknowledge(acks: Chunk[Acknowledgement]): F[Unit] =
       core

@@ -24,14 +24,14 @@ import cats.~>
 /**
   * [[AcknowledgeableConsumerRecord]] is a Kafka record along with an instance of
   * [[AcknowledgeableOffset]], which acknowledges the record in its consumer. In explicit
-  * acknowledgement mode, the default in this library, every record of a poll needs an
-  * acknowledgement before its consumer can poll new records; the next poll sends the
-  * acknowledgements. Many records can be acknowledged together with [[acknowledgeChunks]].
+  * acknowledgement mode, every record of a poll needs an acknowledgement. Many records can be
+  * acknowledged together with [[acknowledgeChunks]].<br><br>
   *
-  * In implicit acknowledgement mode, records cannot be acknowledged: the consumer accepts a poll
-  * once `process` returned, see [[KafkaShareConsumer.autoConsume]].
+  * In implicit acknowledgement mode, records cannot be acknowledged, see
+  * [[KafkaShareConsumer.autoConsume]].
   *
-  * Experimental: this API targets Kafka's share groups.
+  * @note
+  *   this API is experimental, as are Kafka's share groups.
   */
 sealed abstract class AcknowledgeableConsumerRecord[F[_], +K, +V] { self =>
 

@@ -13,10 +13,10 @@ import scala.concurrent.duration.*
 import scala.util.Try
 
 /**
-  * What a share consumer reads from its settings and the Java consumer's properties, resolved once.
+  * What a share consumer reads from its settings and the Java properties, resolved once.
   *
   * @param implicitMode
-  *   whether Java accepts a poll's records on the next poll (`share.acknowledgement.mode`)
+  *   whether Java accepts a poll's records with the next poll
   */
 final private[kafka] case class ShareConsumerConfig[F[_], K, V](
   settings: ShareConsumerSettings[F, K, V],
@@ -25,8 +25,9 @@ final private[kafka] case class ShareConsumerConfig[F[_], K, V](
   implicitMode: Boolean
 ) {
 
-  // The renewal margin before the lock ends, or half the lock, early enough for
-  // `max.poll.interval.ms`.
+  /**
+    * The lock minus the renewal margin, or half the lock, within half of `max.poll.interval.ms`.
+    */
   def renewalInterval(lock: Option[FiniteDuration]): FiniteDuration =
     lock
       .fold(ShareConsumerConfig.unknownLockRenewalInterval) { lock =>
@@ -38,7 +39,9 @@ final private[kafka] case class ShareConsumerConfig[F[_], K, V](
 
 private[kafka] object ShareConsumerConfig {
 
-  // Half of the shortest lock a broker allows, while the broker has not reported the lock.
+  /**
+    * Half of the shortest lock a broker allows, until the broker reports the lock.
+    */
   val unknownLockRenewalInterval: FiniteDuration = 500.millis
 
   def from[F[_], K, V](

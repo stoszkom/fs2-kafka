@@ -14,7 +14,7 @@ import fs2.Pipe
 /**
   * Acknowledges the records of each chunk with one call per run of records of the same consumer,
   * instead of one per record. An acknowledgement for a record the consumer no longer holds is
-  * skipped, as the record is delivered again.
+  * skipped, as the consumer has already acknowledged or let go of it.<br><br>
   *
   * It pays off when a chunk holds many records, such as a whole poll acknowledged at once with
   * `Stream.chunk(records).map(_.offset -> AcknowledgeType.Accept).through(acknowledgeChunks)`.
@@ -26,9 +26,7 @@ object acknowledgeChunks {
   def apply[F[_]](implicit
     F: MonadThrow[F]
   ): Pipe[F, (AcknowledgeableOffset[F], AcknowledgeType), Unit] =
-    // Usually a chunk goes to one consumer. Runs of offsets of different consumers are acknowledged
-    // one after another in the chunk's order, as the last acknowledgement wins. A run goes through
-    // its first offset's acknowledger, which is equal to the others' and may be a mapped one.
+    // Runs are acknowledged in order, as the last acknowledgement wins.
     _.chunks.evalMap(chunk => runs(chunk.toVector).traverse_(acknowledge(_)))
 
   private def runs[F[_]](

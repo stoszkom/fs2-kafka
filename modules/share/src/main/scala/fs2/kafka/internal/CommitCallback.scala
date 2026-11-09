@@ -15,11 +15,15 @@ import org.apache.kafka.common.TopicIdPartition
 
 private[kafka] object CommitCallback {
 
-  // Each offset Java reported as sent, with whether the broker took it.
+  /**
+    * Each offset Java reported as sent, with whether the broker accepted it.
+    */
   type CallbackResults = Vector[(TopicPartitionOffset, Boolean)]
 
-  // Java's commit callback, adding what Java reports of the sent acknowledgements, renewals
-  // included, to `results`. Java runs it during a poll or commit, which only returns once it has.
+  /**
+    * Java's commit callback, adding what it reports of the sent acknowledgements, renewals
+    * included, to `results`. Java runs it during a poll, commit or close.
+    */
   def apply[F[_]](
     dispatcher: Dispatcher[F],
     results: Ref[F, CallbackResults]
