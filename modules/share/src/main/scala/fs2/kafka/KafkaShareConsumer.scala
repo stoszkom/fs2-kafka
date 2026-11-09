@@ -23,9 +23,9 @@ import fs2.kafka.consumer.KafkaMetrics
 import fs2.kafka.consumer.KafkaShareSubscription
 import fs2.kafka.consumer.MkShareConsumer
 import fs2.kafka.internal.Acknowledgement
+import fs2.kafka.internal.Acknowledger
 import fs2.kafka.internal.CommitCallback
 import fs2.kafka.internal.CommitCallback.CallbackResults
-import fs2.kafka.internal.Acknowledger
 import fs2.kafka.internal.Delivery
 import fs2.kafka.internal.ShareConsumerConfig
 import fs2.kafka.internal.ShareConsumerCore

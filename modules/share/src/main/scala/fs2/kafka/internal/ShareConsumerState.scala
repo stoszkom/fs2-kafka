@@ -9,12 +9,13 @@ package fs2.kafka.internal
 import fs2.Chunk
 import fs2.kafka.AcknowledgeType
 import fs2.kafka.KafkaByteConsumerRecord
-import fs2.kafka.instances.fs2KafkaTopicPartitionOrdering
 import fs2.kafka.internal.Acknowledgement.TopicPartitionOffset
 import fs2.kafka.internal.ShareConsumerState.*
 import scala.collection.immutable.SortedSet
 import scala.concurrent.duration.Duration
 import scala.concurrent.duration.FiniteDuration
+
+import fs2.kafka.instances.fs2KafkaTopicPartitionOrdering
 
 /**
   * A delivery of a record Java holds for the consumer.

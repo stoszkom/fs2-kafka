@@ -8,7 +8,6 @@ package fs2.kafka
 
 import cats.effect.IO
 import cats.effect.Ref
-import cats.effect.unsafe.implicits.global
 import cats.syntax.all.*
 import fs2.kafka.internal.converters.collection.*
 import java.util.UUID
@@ -22,6 +21,8 @@ import org.apache.kafka.clients.admin.UpdateFeaturesOptions
 import org.apache.kafka.common.config.ConfigResource
 import org.scalatest.Assertion
 import scala.concurrent.duration.*
+
+import cats.effect.unsafe.implicits.global
 
 abstract class ShareConsumerBaseKafkaSpec extends BaseKafkaSpec {
 
