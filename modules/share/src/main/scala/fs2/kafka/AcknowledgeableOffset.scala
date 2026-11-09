@@ -39,13 +39,14 @@ sealed abstract class AcknowledgeableOffset[F[_]] { self =>
   private[kafka] def acknowledger: Acknowledger[F]
 
   /**
-    * Records the acknowledgement in the Java consumer, as Java's `acknowledge` does. It's sent with
-    * the next poll, or sooner: after the [[ShareConsumerSettings.maxAcknowledgementDelay]], at once
-    * while paused, and when the consumer stops or closes. Until it's sent, a later acknowledgement
-    * replaces it. Once sent, or for a delivery the consumer no longer holds, an acknowledgement
-    * fails with a [[RecordNotInFlightException]]. While a renewal is not yet confirmed, an
-    * acknowledgement is kept, and recorded in Java once the broker confirmed it; a renewal the
-    * broker rejects loses the record, which is delivered again.
+    * Records the acknowledgement in the consumer, as Java's `acknowledge` does, and the consumer
+    * gives it to Java when it sends it: with the next poll, or sooner, after the
+    * [[ShareConsumerSettings.maxAcknowledgementDelay]], at once while paused, and when `process`
+    * fails or the consumer stops. Until it's sent, a later acknowledgement replaces it. Once sent, or
+    * for a delivery the consumer no longer holds, an acknowledgement fails with a
+    * [[RecordNotInFlightException]]. A `Renew` doesn't wait for the broker either: while a renewal
+    * is under way, an acknowledgement waits for its record, and a renewal the broker rejects loses
+    * the record, which is delivered again.
     */
   final def acknowledge(acknowledgeType: AcknowledgeType): F[Unit] =
     acknowledger.acknowledge(Chunk.singleton(ack(acknowledgeType)))
