@@ -176,7 +176,7 @@ final private[kafka] class ShareConsumerCore[F[_]] private (
   /**
     * Polls the confirmed records back and holds them again; the others are lost. Returned records
     * which are not held are released. If the poll is closed, the acknowledgements of the records
-    * taken back are sent at once, as `consume` may have ended.
+    * taken back are left to the next poll or the final commit, which waits for the broker.
     */
   def takeBack(confirmed: Set[TopicPartitionOffset]): F[Unit] =
     pollRenewed(confirmed).flatMap { case (returned, lock) =>
@@ -184,8 +184,6 @@ final private[kafka] class ShareConsumerCore[F[_]] private (
         at <- F.monotonic
         unknown <- state.modify(_.endRenewal(returned, lock, at))
         _ <- release(unknown).whenA(unknown.nonEmpty)
-        open <- state.get.map(_.open)
-        _ <- send.unlessA(open)
       } yield ()
     }
 

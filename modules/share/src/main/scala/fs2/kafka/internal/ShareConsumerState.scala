@@ -105,10 +105,11 @@ final private[kafka] case class ShareConsumerState(
     else interval.filter(_ => unacked > 0).map(lockedSince + _)
 
   /**
-    * Due at once while paused, as no poll follows. Once the poll is closed, the next poll sends it.
+    * Due at once while paused, as no poll follows. Otherwise the next poll or the final commit
+    * usually sends first, and the delay covers a closed poll which none of them follows.
     */
   def nextSend(delay: Option[FiniteDuration], paused: Boolean): Option[FiniteDuration] =
-    unsentSince.flatMap(since => if (paused) Some(since) else if (open) delay.map(since + _) else None)
+    unsentSince.flatMap(since => if (paused) Some(since) else delay.map(since + _))
 
   def nextOverdue(max: FiniteDuration): Option[FiniteDuration] =
     timed.headOption.map { case (since, _) => since + max }
