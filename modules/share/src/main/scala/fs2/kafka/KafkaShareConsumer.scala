@@ -242,17 +242,19 @@ object KafkaShareConsumer {
 
     /**
       * Polls until stopped, waiting instead while paused, or while records are being renewed.
+      * Stopping is checked first, so that it doesn't depend on the pause signal.
       */
     private def loop(run: (Poll[F], Polled) => F[Unit]): F[Unit] =
-      (lifecycle.get, pauseSignal.get, core.renewing).flatMapN { (current, paused, renewing) =>
-        if (current == Stopped) finish
-        else {
-          val step =
-            if (paused) waitForUnpause
-            else if (renewing) waitForRenewals
-            else pollOnce(run)
-          step >> loop(run)
-        }
+      lifecycle.get.flatMap {
+        case Stopped => finish
+        case _ =>
+          (pauseSignal.get, core.renewing).flatMapN { (paused, renewing) =>
+            val step =
+              if (paused) waitForUnpause
+              else if (renewing) waitForRenewals
+              else pollOnce(run)
+            step >> loop(run)
+          }
       }
 
     /**
