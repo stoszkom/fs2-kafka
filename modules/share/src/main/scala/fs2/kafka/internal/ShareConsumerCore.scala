@@ -71,8 +71,6 @@ final private[kafka] class ShareConsumerCore[F[_]] private (
 
   def held: Signal[F, HeldRecords] = state.map(s => s: HeldRecords)
 
-  def open: F[Boolean] = state.get.map(_.open)
-
   def renewing: F[Boolean] = state.get.map(_.renewing)
 
   def awaitRenewals: F[Unit] = state.waitUntil(!_.renewing)
