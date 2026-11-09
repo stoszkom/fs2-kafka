@@ -236,9 +236,11 @@ final private[kafka] case class ShareConsumerState(
     * Unsubscribed, nothing is renewed: user renewals are dropped, and the next renewal is scheduled
     * from now, or it would be due again at once.
     */
-  def skipRenewal(at: FiniteDuration): ShareConsumerState =
-    withStatus(records.filter(_._2.renewal > 0).keySet, at)(e => Some(e.copy(status = Unacked)))
-      .copy(lockedSince = at)
+  def skipRenewal(at: FiniteDuration): ShareConsumerState = {
+    val renewed =
+      if (renewals > 0) records.filter(_._2.renewal > 0).keySet else Set.empty[TopicPartitionOffset]
+    withStatus(renewed, at)(e => Some(e.copy(status = Unacked))).copy(lockedSince = at)
+  }
 
   /**
     * Holds the records the broker confirmed again, with the acknowledgement made meanwhile; the
