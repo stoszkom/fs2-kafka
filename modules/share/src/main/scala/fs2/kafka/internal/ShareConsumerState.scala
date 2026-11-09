@@ -32,6 +32,24 @@ final private[kafka] case class Delivery(
 )
 
 /**
+  * What the scheduler reads of the held records to compute its deadlines.
+  */
+sealed private[kafka] trait HeldRecords {
+
+  /**
+    * The acquisition lock last reported by the broker.
+    */
+  def lock: Option[FiniteDuration]
+
+  def nextOverdue(max: FiniteDuration): Option[FiniteDuration]
+
+  def nextRenewal(interval: Option[FiniteDuration]): Option[FiniteDuration]
+
+  def nextSend(delay: Option[FiniteDuration], paused: Boolean): Option[FiniteDuration]
+
+}
+
+/**
   * The records Java holds for the consumer, each with its status. Acknowledgements are recorded
   * here, and the consumer gives them to Java when it sends them. Every change of status goes
   * through `updated`, which keeps the counts and the max processing time's index in step, so that
@@ -65,9 +83,20 @@ final private[kafka] case class ShareConsumerState(
   timed: SortedSet[(FiniteDuration, TopicPartitionOffset)],
   lockedSince: FiniteDuration,
   lock: Option[FiniteDuration]
-) {
+) extends HeldRecords {
 
-  def hasRenewing: Boolean = records.size > unacked + unsent.size
+  // A new poll, started at `start`, with the lock the broker reported, or the last one known.
+  // Nothing was held before it.
+  def hold(
+    deliveries: Vector[(TopicPartitionOffset, Delivery)],
+    start: FiniteDuration,
+    reportedLock: Option[FiniteDuration]
+  ): ShareConsumerState =
+    ShareConsumerState.empty
+      .copy(open = true, lockedSince = start, lock = reportedLock.orElse(lock))
+      .withStatuses(deliveries.map { case (p, d) => p -> Some(Entry(d, Unacked)) }, start)
+
+  def renewing: Boolean = records.size > unacked + unsent.size
 
   def holds(offset: TopicPartitionOffset, deliveryCount: Short): Boolean =
     open && records.get(offset).exists(_.delivery.deliveryCount == deliveryCount)
@@ -123,7 +152,7 @@ final private[kafka] case class ShareConsumerState(
     * renewed waits for it, a renewal too, which then comes after it. Returns the offsets whose
     * delivery isn't held, in order.
     */
-  def acknowledged(
+  def acknowledge(
     acks: Chunk[Acknowledgement],
     at: FiniteDuration
   ): (ShareConsumerState, Vector[TopicPartitionOffset]) = {
@@ -146,7 +175,7 @@ final private[kafka] case class ShareConsumerState(
   }
 
   // Takes the acknowledgements to send, to give to Java: their records are no longer held.
-  def takeUnsent: (ShareConsumerState, Vector[(KafkaByteConsumerRecord, AcknowledgeType)]) = {
+  def takeUnsent: (ShareConsumerState, Acks) = {
     val sent = unsent.toVector.flatMap(p => records.get(p).map(p -> _))
     (
       withStatuses(sent.map { case (p, _) => p -> None }, lockedSince),
@@ -154,20 +183,21 @@ final private[kafka] case class ShareConsumerState(
     )
   }
 
-  // The records without an acknowledgement for `max` are acknowledged with `kind`.
-  def withOverdueAcknowledged(
+  // The records without an acknowledgement for `max` are acknowledged with `kind`, and the
+  // acknowledgements to send are taken.
+  def takeOverdue(
     max: FiniteDuration,
     kind: AcknowledgeType,
     now: FiniteDuration
-  ): ShareConsumerState =
+  ): (ShareConsumerState, Acks) =
     withStatus(timed.iterator.takeWhile { case (since, _) => since + max <= now }.map(_._2).toVector, now)(
       e => Some(e.copy(status = Acked(kind)))
-    )
+    ).takeUnsent
 
   // `process` returned at `at`: its records can no longer be acknowledged, and those it left are
   // acknowledged with `kind`, a renewal by the user included. Records being renewed keep `kind` for
   // when they are back.
-  def closed(kind: AcknowledgeType, at: FiniteDuration): ShareConsumerState =
+  def close(kind: AcknowledgeType, at: FiniteDuration): ShareConsumerState =
     copy(open = false).withStatuses(
       records.collect {
         case (p, e @ Entry(_, Renewing(kept))) if kept.forall(_ == AcknowledgeType.Renew) =>
@@ -179,35 +209,34 @@ final private[kafka] case class ShareConsumerState(
 
   /**
     * A renewal at `at` of every unacknowledged record, those the user renewed included, whose time
-    * held restarts. Returns the records it renews: they are no longer held until a poll returns
-    * them, and acknowledgements made meanwhile wait for them.
+    * held restarts. Takes the acknowledgements to send, and the records it renews: they are no
+    * longer held until a poll returns them, and acknowledgements made meanwhile wait for them.
     */
-  def renewal(
-    at: FiniteDuration
-  ): (ShareConsumerState, Vector[(TopicPartitionOffset, KafkaByteConsumerRecord)]) = {
-    val asked = records.toVector.collect { case (p, e) if e.unacked > 0 => p -> e }
-    val renewed = asked.map { case (p, e) =>
-      val delivery = if (e.renewal > 0) e.delivery.copy(heldSince = at) else e.delivery
-      p -> Entry(delivery, Renewing(None))
+  def takeRenewal(at: FiniteDuration): (ShareConsumerState, Renewal) = {
+    val (taken, acks) = takeUnsent
+    val renewed = taken.records.toVector.collect {
+      case (p, e) if e.unacked > 0 =>
+        val delivery = if (e.renewal > 0) e.delivery.copy(heldSince = at) else e.delivery
+        p -> Entry(delivery, Renewing(None))
     }
     (
-      withStatuses(renewed.map { case (p, e) => p -> Some(e) }, at).copy(lockedSince = at),
-      renewed.map { case (p, e) => p -> e.delivery.record }
+      taken.withStatuses(renewed.map { case (p, e) => p -> Some(e) }, at).copy(lockedSince = at),
+      Renewal(acks, renewed.map { case (p, e) => p -> e.delivery.record })
     )
   }
 
   // Unsubscribed, a renewal renews nothing: the user's renewals are dropped, and the time is still
   // taken, or it would be due at once again.
-  def withRenewalSkipped(at: FiniteDuration): ShareConsumerState =
+  def skipRenewal(at: FiniteDuration): ShareConsumerState =
     withStatus(records.collect { case (p, e) if e.renewal > 0 => p }, at)(e => Some(e.copy(status = Unacked)))
       .copy(lockedSince = at)
 
   /**
     * A renewal ended at `at`: a poll returned the records whose renewal the broker confirmed, which
-    * are held again with the acknowledgement made meanwhile, or the one `closed` gave them; the
+    * are held again with the acknowledgement made meanwhile, or the one `close` gave them; the
     * others are lost. Returns the records the poll returned which this state doesn't know.
     */
-  def withRenewalEnded(
+  def endRenewal(
     returned: Vector[KafkaByteConsumerRecord],
     reportedLock: Option[FiniteDuration],
     at: FiniteDuration
@@ -223,8 +252,8 @@ final private[kafka] case class ShareConsumerState(
   }
 
   // A renewal failed half-way: the records being renewed are held again as they were.
-  def withRenewalFailed(at: FiniteDuration): ShareConsumerState =
-    withRenewalEnded(records.values.collect { case Entry(d, Renewing(_)) => d.record }.toVector, None, at)._1
+  def failRenewal(at: FiniteDuration): ShareConsumerState =
+    endRenewal(records.values.collect { case Entry(d, Renewing(_)) => d.record }.toVector, None, at)._1
 
 }
 
@@ -273,14 +302,11 @@ private[kafka] object ShareConsumerState {
   val empty: ShareConsumerState =
     ShareConsumerState(false, Map.empty, 0, Set.empty, 0, None, SortedSet.empty, Duration.Zero, None)
 
-  // A new poll, started at `polledAt`, with the lock last reported. Nothing was held before it.
-  def polled(
-    deliveries: Vector[(TopicPartitionOffset, Delivery)],
-    polledAt: FiniteDuration,
-    lock: Option[FiniteDuration]
-  ): ShareConsumerState =
-    empty
-      .copy(open = true, lockedSince = polledAt, lock = lock)
-      .withStatuses(deliveries.map { case (p, d) => p -> Some(Entry(d, Unacked)) }, polledAt)
+  type Acks = Vector[(KafkaByteConsumerRecord, AcknowledgeType)]
+
+  /**
+    * What a renewal gives Java: the acknowledgements to send, and the records to renew.
+    */
+  final case class Renewal(acks: Acks, records: Vector[(TopicPartitionOffset, KafkaByteConsumerRecord)])
 
 }
