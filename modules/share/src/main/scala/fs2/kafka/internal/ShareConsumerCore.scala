@@ -171,37 +171,20 @@ final private[kafka] class ShareConsumerCore[F[_]] private (
 
   /**
     * Polls the confirmed records back and holds them again; the others are lost. Returned records
-    * which are not held are released. If the poll is closed, the acknowledgements of the records
-    * taken back are left to the next poll or the final commit, which waits for the broker.
+    * which are not held are released in the same locked section, so that no poll finds them
+    * unacknowledged. If the poll is closed, the acknowledgements of the records taken back are left
+    * to the next poll or the final commit, which waits for the broker.
     */
   def takeBack(confirmed: Set[TopicPartitionOffset]): F[Unit] =
-    pollRenewed(confirmed).flatMap { case (returned, lock) =>
+    locked {
       for {
+        acks <- state.modify(_.takeUnsent)
+        polled <- withConsumer.blocking(pollRenewed(_, acks, confirmed))
         at <- F.monotonic
-        unknown <- state.modify(_.endRenewal(returned, lock, at))
-        _ <- release(unknown).whenA(unknown.nonEmpty)
+        unknown <- state.modify(_.endRenewal(polled._1, polled._2, at))
+        _ <- withConsumer.blocking(release(_, unknown)).whenA(unknown.nonEmpty)
       } yield ()
     }
-
-  /**
-    * Gives Java the pending acknowledgements, which its poll requires, and polls without fetching,
-    * as no renewal is pending anymore. Nothing is polled if no renewal was confirmed, or if
-    * unsubscribed.
-    */
-  private def pollRenewed(
-    confirmed: Set[TopicPartitionOffset]
-  ): F[(Vector[KafkaByteConsumerRecord], Option[FiniteDuration])] =
-    step(_.takeUnsent) { (consumer, acks) =>
-      recordIn(consumer, acks)
-      if (confirmed.isEmpty || consumer.subscription().isEmpty) (Vector.empty, None)
-      else pollRecords(consumer, Duration.Zero)
-    }
-
-  private def release(records: Vector[KafkaByteConsumerRecord]): F[Unit] =
-    locked(withConsumer.blocking { consumer =>
-      recordIn(consumer, records.map(_ -> AcknowledgeType.Release))
-      consumer.commitAsync()
-    })
 
   /**
     * Only commits if there is something to send, as in implicit mode a commit would accept the
@@ -249,6 +232,26 @@ private[kafka] object ShareConsumerCore {
     timeout: FiniteDuration
   ): (Vector[KafkaByteConsumerRecord], Option[FiniteDuration]) =
     consumer.poll(timeout.toJava).iterator().asScala.toVector -> acquisitionLock(consumer)
+
+  /**
+    * Gives Java the pending acknowledgements, which its poll requires, and polls without fetching,
+    * as no renewal is pending anymore. Nothing is polled if no renewal was confirmed, or if
+    * unsubscribed.
+    */
+  private def pollRenewed(
+    consumer: KafkaByteShareConsumer,
+    acks: Acks,
+    confirmed: Set[TopicPartitionOffset]
+  ): (Vector[KafkaByteConsumerRecord], Option[FiniteDuration]) = {
+    recordIn(consumer, acks)
+    if (confirmed.isEmpty || consumer.subscription().isEmpty) (Vector.empty, None)
+    else pollRecords(consumer, Duration.Zero)
+  }
+
+  private def release(consumer: KafkaByteShareConsumer, records: Vector[KafkaByteConsumerRecord]): Unit = {
+    recordIn(consumer, records.map(_ -> AcknowledgeType.Release))
+    consumer.commitAsync()
+  }
 
   /**
     * Gives every acknowledgement to Java, then throws the first error other than the
