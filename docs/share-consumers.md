@@ -127,7 +127,7 @@ As in Java, acknowledging only records the acknowledgement in the consumer. The 
 
 - `record.accept`, `release`, `reject` and `renew` acknowledge one record, as does `acknowledge(AcknowledgeType)`. They are on the record and on its `offset`.
 
-- `acknowledgeChunks` acknowledges the records of each chunk with one call per consumer, for example `Stream.chunk(records).map(_.offset -> AcknowledgeType.Accept).through(acknowledgeChunks[IO])` to accept a whole poll at once.
+- `acknowledgeChunks` acknowledges the records of each chunk with one call per run of records of the same consumer, for example `Stream.chunk(records).map(_.offset -> AcknowledgeType.Accept).through(acknowledgeChunks[IO])` to accept a whole poll at once.
 
 As in Java, the last acknowledgement for a record wins until it is sent. Once sent, a later acknowledgement fails with a `RecordNotInFlightException`, and so does one for a delivery the consumer no longer holds. `acknowledgeChunks` skips these.
 
