@@ -358,6 +358,25 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       }
     }
 
+    it("should fail consume when the pause signal fails") {
+      withTopic { topic =>
+        createTopic(topic)
+        val failing = new Signal[IO, Boolean] {
+          override def discrete: Stream[IO, Boolean] = Stream.raiseError[IO](new RuntimeException("boom"))
+          override def continuous: Stream[IO, Boolean] = Stream.constant(false)
+          override def get: IO[Boolean] = IO.pure(false)
+        }
+        val result = run(
+          KafkaShareConsumer
+            .resource(shareConsumerSettings.withPauseWhen(failing))
+            .use(consumer =>
+              consumer.subscribeTo(topic) *> consumer.consume(_ => IO.unit).attempt.timeout(20.seconds)
+            )
+        )
+        result.left.toOption.map(_.getMessage) shouldBe Some("boom")
+      }
+    }
+
     it("should not poll while paused") {
       withTopic { topic =>
         createTopic(topic)

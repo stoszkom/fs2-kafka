@@ -36,20 +36,25 @@ final private[kafka] class ShareConsumerScheduler[F[_], K, V] private (
 
   private val settings: ShareConsumerSettings[F, K, V] = config.settings
 
+  /**
+    * A failure of the deadlines themselves, such as a failing pause signal, is retried as well.
+    */
   def run: F[Unit] =
-    Signal
-      .applicativeInstance[F]
-      .map2(core.held, pause)((s, p) => actions(s, p).map(_._1).reduceOption(_ min _))
-      .discrete
-      .changes(cats.Eq.fromUniversalEquals[Option[FiniteDuration]])
-      .switchMap {
-        case None => Stream.empty
-        case Some(at) =>
-          Stream.eval(F.monotonic).flatMap(now => Stream.sleep_[F](at - now)) ++ Stream.emit(())
-      }
-      .evalMap(_ => retried(due))
-      .compile
-      .drain
+    retried(
+      Signal
+        .applicativeInstance[F]
+        .map2(core.held, pause)((s, p) => actions(s, p).map(_._1).reduceOption(_ min _))
+        .discrete
+        .changes(cats.Eq.fromUniversalEquals[Option[FiniteDuration]])
+        .switchMap {
+          case None => Stream.empty
+          case Some(at) =>
+            Stream.eval(F.monotonic).flatMap(now => Stream.sleep_[F](at - now)) ++ Stream.emit(())
+        }
+        .evalMap(_ => retried(due))
+        .compile
+        .drain
+    )
 
   def failed: F[Unit] =
     failure.discrete
@@ -62,7 +67,8 @@ final private[kafka] class ShareConsumerScheduler[F[_], K, V] private (
     failure.set(None)
 
   /**
-    * Retries `step` after a failure, as the deadline which made it due might not change.
+    * Fails the running `consume` and retries `step` after a failure, as the deadline which made it
+    * due might not change.
     */
   private def retried(step: F[Unit]): F[Unit] =
     step.handleErrorWith(error => failure.set(Some(error)) *> F.sleep(retryInterval) *> retried(step))
