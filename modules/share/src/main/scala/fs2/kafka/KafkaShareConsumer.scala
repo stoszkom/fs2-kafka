@@ -220,13 +220,15 @@ object KafkaShareConsumer {
       core.subscribed.ifM(F.unit, F.raiseError(NotSubscribedException()))
 
     /**
-      * Sends what is pending, as no poll follows.
+      * Sends what is pending, as no poll follows, once the records being renewed are back, up to
+      * the commit timeout, so that an acknowledgement made during a renewal is sent too.
       */
     private def endConsuming: F[Unit] =
-      core.send.attempt.void *> lifecycle.update {
-        case Consuming => Idle
-        case other => other
-      }
+      core.awaitRenewals.timeoutTo(settings.commitTimeout, F.unit) *>
+        core.send.attempt.void *> lifecycle.update {
+          case Consuming => Idle
+          case other => other
+        }
 
     private def refusal(lifecycle: Lifecycle): String =
       lifecycle match {

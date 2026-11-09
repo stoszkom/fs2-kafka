@@ -195,6 +195,28 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       }
     }
 
+    it("should send an acknowledgement made during a renewal when process fails") {
+      withTopic { topic =>
+        createTopic(topic)
+        publish(topic, "0")
+        val settings = shareConsumerSettings
+        val result = run(
+          KafkaShareConsumer
+            .resource(settings)
+            .use { consumer =>
+              consumer.subscribeTo(topic) *>
+                consumer.consume { records =>
+                  // Accepts while the renewal is under way, and fails before it ends.
+                  records.traverse_(r => r.renew *> IO.sleep(5.millis) *> r.accept) *>
+                    IO.raiseError[Unit](new RuntimeException("boom"))
+                }.attempt
+            }
+        )
+        result.left.toOption.map(_.getMessage) shouldBe Some("boom")
+        assertSettled(topic, settings)
+      }
+    }
+
     it("should fail to consume again once stopped") {
       withTopic { topic =>
         createTopic(topic)

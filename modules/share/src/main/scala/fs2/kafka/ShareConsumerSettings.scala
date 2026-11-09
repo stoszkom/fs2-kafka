@@ -242,7 +242,7 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
   /**
     * How long stopping waits for the broker to confirm the last acknowledgements, before failing
     * `consume` with a [[ShareCommitTimeoutException]]. It also bounds the wait for a pending
-    * renewal before that commit, and the commit before `unsubscribe`.<br><br>
+    * renewal when `consume` ends, and the commit before `unsubscribe`.<br><br>
     *
     * The default value is 15 seconds.
     */

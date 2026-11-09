@@ -174,7 +174,7 @@ final private[kafka] class ShareConsumerCore[F[_]] private (
     * Polls the confirmed records back and holds them again; the others are lost. Returned records
     * which are not held are released in the same locked section, so that no poll finds them
     * unacknowledged. If the poll is closed, the acknowledgements of the records taken back are left
-    * to the next poll or the final commit, which waits for the broker.
+    * to the next poll, the final commit or the end of `consume`, which wait for the renewal.
     */
   def takeBack(confirmed: Set[TopicPartitionOffset]): F[Unit] =
     locked {
