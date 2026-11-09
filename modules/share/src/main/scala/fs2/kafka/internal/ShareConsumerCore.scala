@@ -205,12 +205,12 @@ final private[kafka] class ShareConsumerCore[F[_]] private (
     }
 
   /**
-    * Gives Java the pending acknowledgements, and then runs `send`, which sends them.
+    * Gives Java the pending acknowledgements, and then runs `give`, which sends them.
     */
-  private def sendingUnsent[A](send: KafkaByteShareConsumer => A): F[A] =
+  private def sendingUnsent[A](give: KafkaByteShareConsumer => A): F[A] =
     step(_.takeUnsent) { (consumer, acks) =>
       recordIn(consumer, acks)
-      send(consumer)
+      give(consumer)
     }
 
   /**
