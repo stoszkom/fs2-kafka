@@ -154,17 +154,27 @@ final private[kafka] case class ShareConsumerState(
     )
   }
 
-  // The records without an acknowledgement for `max` are released.
-  def withOverdueReleased(max: FiniteDuration, now: FiniteDuration): ShareConsumerState =
+  // The records without an acknowledgement for `max` are acknowledged with `kind`.
+  def withOverdueAcknowledged(
+    max: FiniteDuration,
+    kind: AcknowledgeType,
+    now: FiniteDuration
+  ): ShareConsumerState =
     withStatus(timed.iterator.takeWhile { case (since, _) => since + max <= now }.map(_._2).toVector, now)(
-      e => Some(e.copy(status = Acked(AcknowledgeType.Release)))
+      e => Some(e.copy(status = Acked(kind)))
     )
 
   // `process` returned at `at`: its records can no longer be acknowledged, and those it left are
-  // released, a renewal by the user included. Records being renewed are released once back.
-  def closed(at: FiniteDuration): ShareConsumerState =
-    copy(open = false).withStatus(records.collect { case (p, e) if e.unacked > 0 => p }, at)(e =>
-      Some(e.copy(status = Acked(AcknowledgeType.Release)))
+  // acknowledged with `kind`, a renewal by the user included. Records being renewed keep `kind` for
+  // when they are back.
+  def closed(kind: AcknowledgeType, at: FiniteDuration): ShareConsumerState =
+    copy(open = false).withStatuses(
+      records.collect {
+        case (p, e @ Entry(_, Renewing(kept))) if kept.forall(_ == AcknowledgeType.Renew) =>
+          p -> Some(e.copy(status = Renewing(Some(kind))))
+        case (p, e) if e.unacked > 0 => p -> Some(e.copy(status = Acked(kind)))
+      },
+      at
     )
 
   /**
@@ -194,7 +204,7 @@ final private[kafka] case class ShareConsumerState(
 
   /**
     * A renewal ended at `at`: a poll returned the records whose renewal the broker confirmed, which
-    * are held again with the acknowledgement made meanwhile, or released if the poll closed; the
+    * are held again with the acknowledgement made meanwhile, or the one `closed` gave them; the
     * others are lost. Returns the records the poll returned which this state doesn't know.
     */
   def withRenewalEnded(
@@ -204,12 +214,7 @@ final private[kafka] case class ShareConsumerState(
   ): (ShareConsumerState, Vector[KafkaByteConsumerRecord]) = {
     val byOffset = returned.map(r => offsetOf(r) -> r).toMap
     val ended = records.toVector.collect { case (p, Entry(d, Renewing(kept))) =>
-      p -> byOffset.get(p).map { record =>
-        val status =
-          if (open) kept.fold[Status](Unacked)(Acked(_))
-          else Acked(kept.filter(_ != AcknowledgeType.Renew).getOrElse(AcknowledgeType.Release))
-        Entry(d.copy(record = record), status)
-      }
+      p -> byOffset.get(p).map(record => Entry(d.copy(record = record), kept.fold[Status](Unacked)(Acked(_))))
     }
     (
       withStatuses(ended, at).copy(lock = reportedLock.orElse(lock)),

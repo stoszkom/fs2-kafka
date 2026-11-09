@@ -247,7 +247,8 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
 
   /**
     * How long the consumer may hold a record without an acknowledgement, or `None` for no limit. A
-    * record held longer is released and delivered again; its processing is not cancelled, and its
+    * record held longer is acknowledged with the [[failureAcknowledgement]], by default released
+    * and delivered again; its processing is not cancelled, and its
     * later acknowledgement fails with a [[RecordNotInFlightException]], which [[acknowledgeChunks]]
     * skips. It applies with explicit acknowledgement.<br><br>
     *
@@ -277,6 +278,30 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
     * Creates a new [[ShareConsumerSettings]] without a [[maxProcessingTime]], the default.
     */
   def withoutMaxProcessingTime: ShareConsumerSettings[F, K, V]
+
+  /**
+    * How the consumer acknowledges the records it settles itself: records `process` leaves
+    * unacknowledged when it returns or fails, records which fail to decode, and
+    * records held longer than the [[maxProcessingTime]]. Either `Release`, so that they are
+    * delivered again, or `Reject`, so that they are not. It applies with explicit acknowledgement.
+    * Records of a canceled `process`, for example when another of several consumers fails, are
+    * always released, as they were only interrupted, and so are the records the consumer still
+    * holds when it is closed.<br><br>
+    *
+    * A failure of `process`, or a record which fails to decode, settles every record of the poll
+    * still without an acknowledgement, not just the failing one. With `Reject`, records which were
+    * never processed are then not delivered again, so handle failures per record: use `attempt`
+    * deserializers, and reject the failing record without failing `process`.<br><br>
+    *
+    * The default value is `Release`, as in Java's share consumer.
+    */
+  def failureAcknowledgement: AcknowledgeType
+
+  /**
+    * Creates a new [[ShareConsumerSettings]] with the specified [[failureAcknowledgement]], which
+    * must be `Release` or `Reject`.
+    */
+  def withFailureAcknowledgement(kind: AcknowledgeType): ShareConsumerSettings[F, K, V]
 
   /**
     * How long a pending acknowledgement may wait before the consumer sends it, or `None` to send
@@ -350,6 +375,7 @@ object ShareConsumerSettings {
     autoRenewal: Boolean,
     renewalMargin: FiniteDuration,
     maxProcessingTime: Option[FiniteDuration],
+    failureAcknowledgement: AcknowledgeType,
     maxAcknowledgementDelay: Option[FiniteDuration],
     pauseWhen: Option[Signal[F, Boolean]]
   ) extends ShareConsumerSettings[F, K, V] {
@@ -395,6 +421,14 @@ object ShareConsumerSettings {
     override def withoutMaxProcessingTime: ShareConsumerSettings[F, K, V] =
       copy(maxProcessingTime = None)
 
+    override def withFailureAcknowledgement(kind: AcknowledgeType): ShareConsumerSettings[F, K, V] = {
+      require(
+        kind == AcknowledgeType.Release || kind == AcknowledgeType.Reject,
+        "failure acknowledgement must be Release or Reject"
+      )
+      copy(failureAcknowledgement = kind)
+    }
+
     override def withMaxAcknowledgementDelay(
       delay: FiniteDuration
     ): ShareConsumerSettings[F, K, V] = {
@@ -416,7 +450,7 @@ object ShareConsumerSettings {
       copy(pauseWhen = None)
 
     override def toString: String =
-      s"ShareConsumerSettings(closeTimeout = $closeTimeout, pollTimeout = $pollTimeout, commitTimeout = $commitTimeout, autoRenewal = $autoRenewal, renewalMargin = $renewalMargin, maxProcessingTime = $maxProcessingTime, maxAcknowledgementDelay = $maxAcknowledgementDelay, pauseWhen = ${
+      s"ShareConsumerSettings(closeTimeout = $closeTimeout, pollTimeout = $pollTimeout, commitTimeout = $commitTimeout, autoRenewal = $autoRenewal, renewalMargin = $renewalMargin, maxProcessingTime = $maxProcessingTime, failureAcknowledgement = $failureAcknowledgement, maxAcknowledgementDelay = $maxAcknowledgementDelay, pauseWhen = ${
           if (pauseWhen.isDefined) "Some(<signal>)"
           else "None"
         })"
@@ -446,6 +480,7 @@ object ShareConsumerSettings {
       autoRenewal = false,
       renewalMargin = 5.seconds,
       maxProcessingTime = None,
+      failureAcknowledgement = AcknowledgeType.Release,
       maxAcknowledgementDelay = Some(1.second),
       pauseWhen = None
     ).withAcknowledgementMode(ShareAcknowledgementMode.Explicit)

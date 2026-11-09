@@ -75,7 +75,9 @@ In addition, there are several settings specific to the library.
 
 - `withRenewalMargin` sets how long before a record's lock ends auto-renewal renews it. Default is 5 seconds. See [renewal](#renewal).
 
-- `withMaxProcessingTime` sets how long a record may be held without an acknowledgement before it is released, so a hung record does not hold back its consumer. No limit by default, or with `withoutMaxProcessingTime`; a limit can be at most 365 days. See [renewal](#renewal).
+- `withMaxProcessingTime` sets how long a record may be held without an acknowledgement before it is released (or rejected, see `withFailureAcknowledgement`), so a hung record does not hold back its consumer. No limit by default, or with `withoutMaxProcessingTime`; a limit can be at most 365 days. See [renewal](#renewal).
+
+- `withFailureAcknowledgement` sets how the consumer acknowledges records it settles itself: records `process` leaves without an acknowledgement, records of a failed `process`, records which fail to deserialize, and records past the max processing time. `Release` (the default) delivers them again, `Reject` does not. Records of a canceled `process` are always released. A failing `process` or a record which fails to deserialize settles every record of the poll without an acknowledgement, so with `Reject`, handle failures per record, as in [deserialization failures](#deserialization-failures), and let `process` itself not fail. See [acknowledging](#acknowledging).
 
 - `withMaxAcknowledgementDelay` sets how long a pending acknowledgement may wait before the consumer sends it, without waiting for the next poll. Default is 1 second; `withoutMaxAcknowledgementDelay` sends acknowledgements only with the next poll, as a Java loop does; a delay can be at most 365 days. See [acknowledging](#acknowledging).
 
@@ -119,7 +121,7 @@ val program: IO[Unit] =
 
 `AcknowledgeType#asJava` returns Java's `AcknowledgeType`, and `AcknowledgeableOffset#deliveryCount` is how often the record has been delivered.
 
-Once `process` returns, records it left without an acknowledgement are released, so that the next poll can run, and they are delivered again with a higher delivery count. Acknowledging a record after `process` returned fails with a `RecordNotInFlightException`.
+Once `process` returns, records it left without an acknowledgement are released, so that the next poll can run, and they are delivered again with a higher delivery count. With `withFailureAcknowledgement(AcknowledgeType.Reject)`, they are rejected instead. Acknowledging a record after `process` returned fails with a `RecordNotInFlightException`.
 
 Delivery is at-least-once, so processing must tolerate redelivery. A failed record can be released for another attempt, or rejected if it can never succeed.
 
@@ -131,7 +133,7 @@ def processOrRelease(record: AcknowledgeableConsumerRecord[IO, String, String]):
   }
 ```
 
-If `process` itself fails, the records it left without an acknowledgement are released, and `consume` fails with the same error. When `consume` is canceled, the records are released too.
+If `process` itself fails, the records it left without an acknowledgement are released, or rejected with `withFailureAcknowledgement(AcknowledgeType.Reject)`, and `consume` fails with the same error. When `consume` is canceled, the records are always released, as they were only interrupted.
 
 ## Acknowledging
 

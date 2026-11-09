@@ -49,8 +49,8 @@ import scala.concurrent.duration.*
   * Consuming works like Java's poll loop: the consumer polls, runs `process` on the records of the
   * poll, and polls again once `process` has returned. Acknowledgements are recorded by the
   * consumer, and a background driver sends them when they are due, renews acquisition locks, and
-  * releases records past the max processing time. Anything still pending is sent with the next
-  * poll.<br><br>
+  * acknowledges records past the max processing time with the failure acknowledgement. Anything
+  * still pending is sent with the next poll.<br><br>
   *
   * @note
   *   this API is experimental, as are Kafka's share groups.
@@ -68,9 +68,11 @@ sealed abstract class KafkaShareConsumer[F[_], K, V] extends KafkaShareSubscript
     *
     * `process` may work on the records in parallel and acknowledge each record as it finishes.
     * Acknowledgements are sent after `maxAcknowledgementDelay`, immediately while paused, or with
-    * the next poll. Records left unacknowledged when `process` returns are released. If `process`
-    * fails, its records are released and the error is raised. Acknowledging a record after
-    * `process` has returned fails with a [[RecordNotInFlightException]].<br><br>
+    * the next poll. Records left unacknowledged when `process` returns are acknowledged with
+    * `failureAcknowledgement`, `Release` by default. If `process` fails, its records are
+    * acknowledged the same way and the error is raised. If it is canceled, they are released.
+    * Acknowledging a record after `process` has returned fails with a
+    * [[RecordNotInFlightException]].<br><br>
     *
     * The last acknowledgements are sent before this returns, and it fails if the broker rejects
     * them. Acknowledgements sent earlier are not awaited, so they can fail unnoticed, in which case
@@ -415,8 +417,9 @@ object KafkaShareConsumer {
     /**
       * Processes a poll in explicit mode. The state holds the records from the moment they are
       * taken, also when decoding fails or `process` is canceled. Once `process` returns, the poll
-      * is closed. If `process` failed or was canceled, `consume` ends, which sends the pending
-      * acknowledgements.
+      * is closed, and the records it left are acknowledged with `failureAcknowledgement`, or
+      * released if it was canceled, as the records were only interrupted. If `process` failed or
+      * was canceled, `consume` ends, which sends the pending acknowledgements.
       */
     private def processed(
       process: Chunk[AcknowledgeableConsumerRecord[F, K, V]] => F[Unit]
@@ -424,8 +427,10 @@ object KafkaShareConsumer {
       F.monotonic.flatMap { now =>
         val deliveries = polled.records.map(r => offsetOf(r) -> Delivery(r, deliveryCountOf(r), now))
         state.update(s => ShareConsumerState.polled(deliveries, polled.start, polled.lock.orElse(s.lock))) *>
-          cancelable(Chunk.from(polled.records).traverse(decode).flatMap(process))
-            .guarantee(F.monotonic.flatMap(at => state.update(_.closed(at))))
+          cancelable(Chunk.from(polled.records).traverse(decode).flatMap(process)).guaranteeCase { outcome =>
+            val kind = if (outcome.isCanceled) AcknowledgeType.Release else settings.failureAcknowledgement
+            F.monotonic.flatMap(at => state.update(_.closed(kind, at)))
+          }
       }
 
     private def decode(record: KafkaByteConsumerRecord): F[AcknowledgeableConsumerRecord[F, K, V]] =
@@ -465,8 +470,8 @@ object KafkaShareConsumer {
         .flatMap(_.headOption.traverse_(p => F.raiseError[Unit](RecordNotInFlightException(p._1, p._2))))
 
     /**
-      * Runs for as long as the consumer, releasing records past the max processing time, renewing
-      * records, and sending acknowledgements when they are due.<br><br>
+      * Runs for as long as the consumer, acknowledging records past the max processing time,
+      * renewing records, and sending acknowledgements when they are due.<br><br>
       *
       * It wakes up at the earliest deadline, which is recomputed whenever the state or the pause
       * signal changes. Due actions run outside of that, so that a new deadline can't interrupt
@@ -500,7 +505,7 @@ object KafkaShareConsumer {
       */
     private def actions(s: ShareConsumerState, paused: Boolean): List[(FiniteDuration, F[Unit])] =
       List(
-        settings.maxProcessingTime.flatMap(max => s.nextOverdue(max).tupleRight(releaseOverdue(max))),
+        settings.maxProcessingTime.flatMap(max => s.nextOverdue(max).tupleRight(acknowledgeOverdue(max))),
         s.nextRenewal(autoRenewalInterval(s)).tupleRight(renew),
         s.nextSend(settings.maxAcknowledgementDelay, paused).tupleRight(send(identity))
       ).flatten
@@ -535,11 +540,11 @@ object KafkaShareConsumer {
       }
 
     /**
-      * Releases records past the max processing time and sends the releases immediately, so that a
-      * late acknowledgement fails.
+      * Acknowledges records past the max processing time with the failure acknowledgement, and
+      * sends the acknowledgements immediately, so that a late acknowledgement fails.
       */
-    private def releaseOverdue(max: FiniteDuration): F[Unit] =
-      F.monotonic.flatMap(now => send(_.withOverdueReleased(max, now)))
+    private def acknowledgeOverdue(max: FiniteDuration): F[Unit] =
+      F.monotonic.flatMap(now => send(_.withOverdueAcknowledged(max, settings.failureAcknowledgement, now)))
 
     /**
       * Renews every unacknowledged record, along with the pending acknowledgements.<br><br>
@@ -554,7 +559,7 @@ object KafkaShareConsumer {
       *
       * Meanwhile, there is nothing else to send, as every unacknowledged record is being renewed,
       * and acknowledgements made in the meantime wait for their records. If the Java consumer fails
-      * on the way, the records are held again as they were, to be renewed or released later,
+      * on the way, the records are held again as they were, to be renewed or acknowledged later,
       * rather than being left renewing forever. Nothing is renewed while unsubscribed, as Java's
       * poll would refuse to take the records back.
       */

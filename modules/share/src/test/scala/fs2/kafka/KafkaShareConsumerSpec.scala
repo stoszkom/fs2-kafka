@@ -85,6 +85,30 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
       }
     }
 
+    it("should reject the records process leaves unacknowledged with a Reject failure acknowledgement") {
+      withTopic { topic =>
+        createTopic(topic)
+        publish(topic, "0")
+        val settings = shareConsumerSettings.withFailureAcknowledgement(AcknowledgeType.Reject)
+        run(consumed(settings, topic)(consumer => _ => consumer.stopConsuming))
+        assertSettled(topic, settings)
+      }
+    }
+
+    it("should reject a record past the max processing time with a Reject failure acknowledgement") {
+      withTopic { topic =>
+        createTopic(topic)
+        publish(topic, "0")
+        val settings = shareConsumerSettings
+          .withMaxProcessingTime(2.seconds)
+          .withFailureAcknowledgement(AcknowledgeType.Reject)
+        run(consumed(settings, topic) { consumer => records =>
+          IO.sleep(4.seconds) *> records.traverse_(_.accept.attempt) *> consumer.stopConsuming
+        })
+        assertSettled(topic, settings)
+      }
+    }
+
     it("should release the records and raise the error when process fails") {
       withTopic { topic =>
         createTopic(topic)
@@ -1218,6 +1242,22 @@ final class KafkaShareConsumerSpec extends ShareConsumerBaseKafkaSpec {
         createTopic(topic)
         publish(topic, "0")
         val settings = shareConsumerSettings
+        run(
+          Deferred[IO, Unit].flatMap { received =>
+            consumed(settings, topic)(_ => _ => received.complete(()) *> IO.never[Unit])
+              .race(received.get)
+              .void
+          }
+        )
+        readUntil(topic, settings, "0") shouldBe Vector("0" -> 2)
+      }
+    }
+
+    it("should release records still processing when consume is canceled, also with Reject") {
+      withTopic { topic =>
+        createTopic(topic)
+        publish(topic, "0")
+        val settings = shareConsumerSettings.withFailureAcknowledgement(AcknowledgeType.Reject)
         run(
           Deferred[IO, Unit].flatMap { received =>
             consumed(settings, topic)(_ => _ => received.complete(()) *> IO.never[Unit])

@@ -30,6 +30,10 @@ final class ShareConsumerSettingsSpec extends BaseSpec {
         .withMaxProcessingTime(1.minute)
         .withoutMaxProcessingTime
         .maxProcessingTime shouldBe None
+      settings.failureAcknowledgement shouldBe AcknowledgeType.Release
+      settings
+        .withFailureAcknowledgement(AcknowledgeType.Reject)
+        .failureAcknowledgement shouldBe AcknowledgeType.Reject
       settings.maxAcknowledgementDelay shouldBe Some(1.second)
       settings.withMaxAcknowledgementDelay(Duration.Zero).maxAcknowledgementDelay shouldBe
         Some(Duration.Zero)
@@ -86,6 +90,8 @@ final class ShareConsumerSettingsSpec extends BaseSpec {
       intercept[IllegalArgumentException](settings.withMaxAcknowledgementDelay((-1).second))
       intercept[IllegalArgumentException](settings.withMaxProcessingTime(366.days))
       intercept[IllegalArgumentException](settings.withMaxAcknowledgementDelay(366.days))
+      intercept[IllegalArgumentException](settings.withFailureAcknowledgement(AcknowledgeType.Accept))
+      intercept[IllegalArgumentException](settings.withFailureAcknowledgement(AcknowledgeType.Renew))
     }
   }
 
