@@ -163,12 +163,10 @@ final private[kafka] class ShareConsumerCore[F[_]] private (
     * unsubscribed. A failed commit counts as no answer yet.
     */
   def checkRenewals: F[Option[CallbackResults]] =
-    mutex.lock
-      .surround(withConsumer.blocking { consumer =>
-        consumer.commitAsync()
-        consumer.subscription().isEmpty
-      })
-      .handleError(_ => false)
+    locked(withConsumer.blocking { consumer =>
+      consumer.commitAsync()
+      consumer.subscription().isEmpty
+    }).handleError(_ => false)
       .flatMap(unsubscribed => results.getAndSet(Vector.empty).map(r => if (unsubscribed) None else Some(r)))
 
   /**
@@ -200,10 +198,10 @@ final private[kafka] class ShareConsumerCore[F[_]] private (
     }
 
   private def release(records: Vector[KafkaByteConsumerRecord]): F[Unit] =
-    step(s => (s, records)) { (consumer, records) =>
+    locked(withConsumer.blocking { consumer =>
       recordIn(consumer, records.map(_ -> AcknowledgeType.Release))
       consumer.commitAsync()
-    }
+    })
 
   /**
     * Only commits if there is something to send, as in implicit mode a commit would accept the
@@ -218,12 +216,19 @@ final private[kafka] class ShareConsumerCore[F[_]] private (
     }
 
   /**
-    * Takes from the state and gives to Java, under the mutex and uncancelable.
+    * Takes from the state and gives to Java, in one locked section.
     */
   private def step[A, B](take: ShareConsumerState => (ShareConsumerState, A))(
     give: (KafkaByteShareConsumer, A) => B
   ): F[B] =
-    mutex.lock.surround(state.modify(take).flatMap(a => withConsumer.blocking(give(_, a)))).uncancelable
+    locked(state.modify(take).flatMap(a => withConsumer.blocking(give(_, a))))
+
+  /**
+    * Runs `use` under the mutex and uncancelable, so that nothing else uses the Java consumer
+    * meanwhile.
+    */
+  private def locked[A](use: F[A]): F[A] =
+    mutex.lock.surround(use).uncancelable
 
 }
 
