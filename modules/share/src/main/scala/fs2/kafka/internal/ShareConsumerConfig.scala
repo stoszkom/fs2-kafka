@@ -25,6 +25,11 @@ final private[kafka] case class ShareConsumerConfig[F[_], K, V](
   implicitMode: Boolean
 ) {
 
+  // How long a renewal waits for the broker: past the margin, or half the lock, the lock has likely
+  // ended.
+  def renewalWait(lock: Option[FiniteDuration]): FiniteDuration =
+    lock.fold(settings.renewalMargin)(_ / 2).min(settings.renewalMargin)
+
   // The renewal margin before the lock ends, or half the lock, early enough for
   // `max.poll.interval.ms`.
   def renewalInterval(lock: Option[FiniteDuration]): FiniteDuration =

@@ -472,18 +472,17 @@ object KafkaShareConsumer {
         )
 
     /**
-      * Renews every unacknowledged record and those the user renewed, and sends the renewal without
-      * waiting for the broker, as Java's own renewal loop does: the records are renewing until the
-      * checks find the renewal confirmed and take them back. Atomic under the mutex, so an
-      * acknowledgement never sees a record being renewed half-way. Unsubscribed, nothing is
-      * renewed, as Java's poll would refuse to take the records back. Returns the records the user
-      * renewed which Java no longer held; a renewal the broker rejects fails a later
-      * acknowledgement instead.
+      * Renews every unacknowledged record and those the user renewed, and waits for the broker for
+      * up to the renewal margin, at most half the lock. The renewed records are then checked:
+      * once back, they are held again. Atomic under the mutex, so an acknowledgement never sees a
+      * record being renewed half-way. Unsubscribed, nothing is renewed, as Java's poll would refuse
+      * to take the records back. Returns the records the user renewed which are no longer held.
       */
     private def renew(byUser: Set[TopicPartitionOffset]): F[Set[TopicPartitionOffset]] =
       (state.get, F.monotonic).tupled
         .flatMap { case (s, at) =>
           val asked = s.unacked.toSet ++ byUser
+          val timeout = config.renewalWait(s.lock)
           withConsumer
             .blocking { consumer =>
               if (consumer.subscription().isEmpty) None
@@ -495,14 +494,18 @@ object KafkaShareConsumer {
                     )
                     .isLeft
                 }
-                consumer.commitAsync()
+                Either
+                  .catchOnly[TimeoutException](consumer.commitSync(timeout.toJava))
+                  .void
+                  .getOrElse(())
                 Some(gone -> acquisitionLock(consumer))
               }
             }
             .flatMap {
               case None => state.update(_.withRenewalSkipped(at)).as(byUser)
               case Some((gone, lock)) =>
-                state.update(_.withRenewing(asked, gone, byUser, at, lock)).as(byUser.intersect(gone))
+                state.update(_.withRenewing(asked, gone, byUser, at, lock)) *>
+                  check.map(failed => byUser.intersect(gone ++ failed))
             }
         }
 
