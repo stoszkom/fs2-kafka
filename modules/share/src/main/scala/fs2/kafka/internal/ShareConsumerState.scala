@@ -128,14 +128,20 @@ final private[kafka] case class ShareConsumerState(
     at: FiniteDuration
   ): (ShareConsumerState, Vector[TopicPartitionOffset]) = {
     val (inFlight, notHeld) = acks.toVector.partition(a => holds(a.offset, a.deliveryCount))
-    val next = inFlight.foldLeft(this) { (s, a) =>
-      s.withStatus(List(a.offset), at) { e =>
-        Some(e.copy(status = e.status match {
-          case Renewing(_) => Renewing(Some(a.acknowledgeType))
-          case _ => Acked(a.acknowledgeType)
-        }))
-      }
+    val last = inFlight.foldLeft(Map.empty[TopicPartitionOffset, AcknowledgeType]) { (m, a) =>
+      m.updated(a.offset, a.acknowledgeType)
     }
+    val next = withStatuses(
+      last.flatMap { case (p, kind) =>
+        records.get(p).map { e =>
+          p -> Some(e.copy(status = e.status match {
+            case Renewing(_) => Renewing(Some(kind))
+            case _ => Acked(kind)
+          }))
+        }
+      },
+      at
+    )
     (next, notHeld.map(_.offset))
   }
 

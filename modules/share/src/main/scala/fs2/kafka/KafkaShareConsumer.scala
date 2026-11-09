@@ -346,7 +346,7 @@ object KafkaShareConsumer {
 
     // In explicit mode the state holds the poll from the moment the consumer takes it, also when
     // decoding fails or `process` is canceled. Once `process` returns, the poll is closed; if it
-    // failed or was canceled, no poll follows, so what it left is sent at once.
+    // failed or was canceled, `consume` ends, which sends what it left.
     private def processed(
       process: Chunk[AcknowledgeableConsumerRecord[F, K, V]] => F[Unit]
     )(cancelable: Poll[F], polled: Polled): F[Unit] =
@@ -354,11 +354,7 @@ object KafkaShareConsumer {
         val deliveries = polled.records.map(r => offsetOf(r) -> Delivery(r, deliveryCountOf(r), now))
         state.update(s => ShareConsumerState.polled(deliveries, polled.start, polled.lock.orElse(s.lock))) *>
           cancelable(Chunk.from(polled.records).traverse(decode).flatMap(process))
-            .guaranteeCase(outcome =>
-              F.monotonic.flatMap(at => state.update(_.closed(at))) *> send(identity).unlessA(
-                outcome.isSuccess
-              )
-            )
+            .guarantee(F.monotonic.flatMap(at => state.update(_.closed(at))))
       }
 
     private def decode(record: KafkaByteConsumerRecord): F[AcknowledgeableConsumerRecord[F, K, V]] =
@@ -536,7 +532,9 @@ object KafkaShareConsumer {
     private def takeBack(confirmed: Set[TopicPartitionOffset]): F[Unit] =
       javaStep(_.takeUnsent) { (consumer, acks) =>
         recordIn(consumer, acks)
-        if (confirmed.isEmpty) (Vector.empty[KafkaByteConsumerRecord], None)
+        // Unsubscribed since the check, Java's poll would throw; the records went with it.
+        if (confirmed.isEmpty || consumer.subscription().isEmpty)
+          (Vector.empty[KafkaByteConsumerRecord], None)
         else pollRecords(consumer, Duration.Zero)
       }.product(F.monotonic).flatMap { case ((returned, lock), at) =>
         state.modify(_.withRenewalEnded(returned, lock, at)).flatMap { unknown =>
