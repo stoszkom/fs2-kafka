@@ -153,15 +153,13 @@ final private[kafka] class ShareConsumerScheduler[F[_], K, V] private (
       if (waiting.isEmpty) F.pure(done)
       else if (now >= forgetAt) F.pure(Set.empty[TopicPartitionOffset])
       else
-        for {
-          _ <- F.sleep(renewalCheckInterval)
-          check <- core.checkRenewals
-          result <- check.fold(F.pure(Set.empty[TopicPartitionOffset])) { reported =>
+        F.sleep(renewalCheckInterval) *> core.checkRenewals.flatMap {
+          case None => F.pure(Set.empty[TopicPartitionOffset])
+          case Some(reported) =>
             val answered = reported.filter { case (p, _) => waiting(p) }
             val accepted = answered.collect { case (p, true) => p }
             confirmed(waiting -- answered.map(_._1), forgetAt, done ++ accepted)
-          }
-        } yield result
+        }
     }
 
 }
