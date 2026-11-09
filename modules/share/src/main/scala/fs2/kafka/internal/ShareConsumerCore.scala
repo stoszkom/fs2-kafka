@@ -111,9 +111,9 @@ final private[kafka] class ShareConsumerCore[F[_]] private (
   def commitSync(timeout: FiniteDuration): F[Option[KafkaException]] =
     step(_.takeUnsent) { (consumer, acks) =>
       recordIn(consumer, acks)
-      val results = consumer.commitSync(timeout.toJava)
+      val committed = consumer.commitSync(timeout.toJava)
       if (consumer.subscription().isEmpty) None
-      else results.values.asScala.flatMap(_.toScala).headOption
+      else committed.values.asScala.flatMap(_.toScala).headOption
     }
 
   /**
