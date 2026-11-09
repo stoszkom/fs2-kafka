@@ -125,7 +125,10 @@ final private[kafka] class ShareConsumerCore[F[_]] private (
         Either.catchOnly[TimeoutException](consumer.commitSync(timeout.toJava)).void.getOrElse(())
       }
       val unsubscribed = Either.catchNonFatal(consumer.unsubscribe())
-      committed.left.foreach(error => unsubscribed.left.foreach(other => error.addSuppressed(other)))
+      (committed, unsubscribed) match {
+        case (Left(error), Left(other)) if other ne error => error.addSuppressed(other)
+        case _ => ()
+      }
       (committed *> unsubscribed).fold(error => throw error, identity)
     }
 
