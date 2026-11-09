@@ -115,9 +115,10 @@ object KafkaShareConsumer {
           .unlessA(config.implicitMode)
       )
       core <- Resource.eval(ShareConsumerCore.of(withConsumer, results))
-      scheduler <- Resource.eval(ShareConsumerScheduler.of(config, core, pauseOf(settings)))
+      pause = settings.pauseWhen.getOrElse(Signal.constant[F, Boolean](false))
+      scheduler <- Resource.eval(ShareConsumerScheduler.of(config, core, pause))
       lifecycle <- Resource.eval(SignallingRef.of[F, Lifecycle](Idle))
-      consumer = new Impl(config, keyDeserializer, valueDeserializer, core, scheduler, lifecycle)
+      consumer = new Impl(config, keyDeserializer, valueDeserializer, core, scheduler, lifecycle, pause)
       _ <- scheduler.run.background
     } yield consumer
 
@@ -129,11 +130,6 @@ object KafkaShareConsumer {
     F: Async[F],
     mk: MkShareConsumer[F]
   ): Stream[F, KafkaShareConsumer[F, K, V]] = Stream.resource(resource(settings))
-
-  private def pauseOf[F[_], K, V](settings: ShareConsumerSettings[F, K, V])(implicit
-    F: Async[F]
-  ): Signal[F, Boolean] =
-    settings.pauseWhen.getOrElse(Signal.constant[F, Boolean](false))
 
   private def deliveryCountOf(record: KafkaByteConsumerRecord): Short =
     record.deliveryCount().toScala.fold(1: Short)(_.shortValue)
@@ -162,14 +158,13 @@ object KafkaShareConsumer {
     valueDeserializer: ValueDeserializer[F, V],
     core: ShareConsumerCore[F],
     scheduler: ShareConsumerScheduler[F, K, V],
-    lifecycle: SignallingRef[F, Lifecycle]
+    lifecycle: SignallingRef[F, Lifecycle],
+    pauseSignal: Signal[F, Boolean]
   )(implicit F: Async[F])
     extends KafkaShareConsumer[F, K, V]
     with Acknowledger[F] {
 
     override val settings: ShareConsumerSettings[F, K, V] = config.settings
-
-    private val pauseSignal: Signal[F, Boolean] = pauseOf(settings)
 
     override def metrics: F[Map[MetricName, Metric]] =
       core.metrics
