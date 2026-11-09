@@ -38,6 +38,8 @@ final private[kafka] class ShareConsumerScheduler[F[_], K, V] private (
 
   /**
     * A failure of the deadlines themselves, such as a failing pause signal, is retried as well.
+    * A deadline wakes the scheduler when it changes. A user renewal's deadline is always zero, so
+    * it wakes the scheduler every time, or a renewal asked for right after another could be missed.
     */
   def run: F[Unit] =
     retried(
@@ -45,7 +47,7 @@ final private[kafka] class ShareConsumerScheduler[F[_], K, V] private (
         .applicativeInstance[F]
         .map2(core.held, pause)((s, p) => actions(s, p).map(_._1).reduceOption(_ min _))
         .discrete
-        .changes(cats.Eq.fromUniversalEquals[Option[FiniteDuration]])
+        .filterWithPrevious((previous, next) => previous != next || next.contains(Duration.Zero))
         .switchMap {
           case None => Stream.empty
           case Some(at) =>
