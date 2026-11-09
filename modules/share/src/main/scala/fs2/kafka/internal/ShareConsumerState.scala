@@ -211,6 +211,10 @@ final private[kafka] case class ShareConsumerState(
     )
   }
 
+  // A renewal failed half-way: the records being renewed are held again as they were.
+  def withRenewalFailed(at: FiniteDuration): ShareConsumerState =
+    withRenewalEnded(records.values.collect { case Entry(d, Renewing(_)) => d.record }.toVector, None, at)._1
+
 }
 
 private[kafka] object ShareConsumerState {

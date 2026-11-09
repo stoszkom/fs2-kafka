@@ -264,10 +264,13 @@ object KafkaShareConsumer {
                 F.raiseError(NotSubscribedException()),
                 failure.set(None) *> F.race(driverFailed, run).void
               )
-          ).guarantee(lifecycle.update {
-            case Consuming => Idle
-            case other => other
-          })
+          ).guarantee(
+            // However `consume` ended, no poll follows to carry what is left.
+            send(identity).attempt.void *> lifecycle.update {
+              case Consuming => Idle
+              case other => other
+            }
+          )
       }
 
     private def refusal(lifecycle: Lifecycle): String =
@@ -298,10 +301,12 @@ object KafkaShareConsumer {
         lifecycle.get.flatMap {
           case Stopped => finish
           case _ =>
-            paused.ifM(
-              withConsumer.blocking(_.commitAsync()) *> F.race(stopped, pauseSignal.waitUntil(!_)) *> next,
-              F.race(stopped, state.waitUntil(!_.hasRenewing)).flatMap(_.fold(_ => next, _ => polling))
-            )
+            (paused, state.get.map(_.hasRenewing)).tupled.flatMap {
+              case (true, _) =>
+                withConsumer.blocking(_.commitAsync()) *> F.race(stopped, pauseSignal.waitUntil(!_)) *> next
+              case (_, true) => F.race(stopped, state.waitUntil(!_.hasRenewing)) *> next
+              case _ => polling
+            }
         }
       lazy val polling: F[Unit] =
         F.uncancelable { cancelable =>
@@ -438,10 +443,13 @@ object KafkaShareConsumer {
         .iterateWhile(identity)
         .void
 
+    // Commits only if there is something to send: in implicit mode a commit would accept the poll.
     private def send(prepare: ShareConsumerState => ShareConsumerState): F[Unit] =
       javaStep(prepare(_).takeUnsent) { (consumer, acks) =>
-        recordIn(consumer, acks)
-        consumer.commitAsync()
+        if (acks.nonEmpty) {
+          recordIn(consumer, acks)
+          consumer.commitAsync()
+        }
       }
 
     // Overdue records are released and sent at once, so that a late acknowledgement fails.
@@ -478,14 +486,13 @@ object KafkaShareConsumer {
                   Some(sent.toSet -> acquisitionLock(consumer))
                 case (_, None) => None
               }
-                // Java failed before it had every renewal: none is counted on.
-                .onError { case _ =>
-                  F.monotonic.flatMap(now => state.update(_.withRenewalEnded(Vector.empty, None, now)._1))
-                }
                 .flatMap(_.traverse_ { case (sent, lock) =>
                   val forgetAt = at + lock.getOrElse(Duration.Zero) + config.apiTimeout
                   confirmed(sent, forgetAt, Set.empty).flatMap(takeBack)
                 })
+                // If Java failed on the way, the records are held again as they were, and renewed or
+                // released later, rather than left renewing for good.
+                .onError { case _ => F.monotonic.flatMap(now => state.update(_.withRenewalFailed(now))) }
           )
       }
 
