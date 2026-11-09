@@ -67,8 +67,6 @@ final private[kafka] case class ShareConsumerState(
   lock: Option[FiniteDuration]
 ) {
 
-  def isEmpty: Boolean = records.isEmpty
-
   def hasRenewing: Boolean = records.size > unacked + unsent.size
 
   def holds(offset: TopicPartitionOffset, deliveryCount: Short): Boolean =
@@ -122,8 +120,8 @@ final private[kafka] case class ShareConsumerState(
 
   /**
     * Records a chunk's acknowledgements at `at`, the last per record winning; one for a record being
-    * renewed waits for it, and a renewal clears it. Returns the offsets whose delivery isn't held,
-    * in order.
+    * renewed waits for it, a renewal too, which then comes after it. Returns the offsets whose
+    * delivery isn't held, in order.
     */
   def acknowledged(
     acks: Chunk[Acknowledgement],
@@ -133,7 +131,7 @@ final private[kafka] case class ShareConsumerState(
     val next = inFlight.foldLeft(this) { (s, a) =>
       s.withStatus(List(a.offset), at) { e =>
         Some(e.copy(status = e.status match {
-          case Renewing(_) => Renewing(Some(a.acknowledgeType).filter(_ != AcknowledgeType.Renew))
+          case Renewing(_) => Renewing(Some(a.acknowledgeType))
           case _ => Acked(a.acknowledgeType)
         }))
       }
@@ -202,7 +200,8 @@ final private[kafka] case class ShareConsumerState(
     val ended = records.toVector.collect { case (p, Entry(d, Renewing(kept))) =>
       p -> byOffset.get(p).map { record =>
         val status =
-          if (open) kept.fold[Status](Unacked)(Acked(_)) else Acked(kept.getOrElse(AcknowledgeType.Release))
+          if (open) kept.fold[Status](Unacked)(Acked(_))
+          else Acked(kept.filter(_ != AcknowledgeType.Renew).getOrElse(AcknowledgeType.Release))
         Entry(d.copy(record = record), status)
       }
     }
@@ -246,8 +245,9 @@ private[kafka] object ShareConsumerState {
         case _ => 0
       }
 
+    // A record the user renewed is not timed: its time held restarts with the renewal.
     def timed(offset: TopicPartitionOffset): Option[(FiniteDuration, TopicPartitionOffset)] =
-      if (unacked > 0) Some(delivery.heldSince -> offset) else None
+      if (status == Unacked) Some(delivery.heldSince -> offset) else None
 
   }
 
@@ -258,15 +258,14 @@ private[kafka] object ShareConsumerState {
   val empty: ShareConsumerState =
     ShareConsumerState(false, Map.empty, 0, Set.empty, 0, None, SortedSet.empty, Duration.Zero, None)
 
-  // A new poll, started at `polledAt` and taken by the consumer at `at`. Nothing was held before it.
+  // A new poll, started at `polledAt`, with the lock last reported. Nothing was held before it.
   def polled(
     deliveries: Vector[(TopicPartitionOffset, Delivery)],
     polledAt: FiniteDuration,
-    reportedLock: Option[FiniteDuration],
-    previous: ShareConsumerState
+    lock: Option[FiniteDuration]
   ): ShareConsumerState =
     empty
-      .copy(open = true, lockedSince = polledAt, lock = reportedLock.orElse(previous.lock))
+      .copy(open = true, lockedSince = polledAt, lock = lock)
       .withStatuses(deliveries.map { case (p, d) => p -> Some(Entry(d, Unacked)) }, polledAt)
 
 }

@@ -156,6 +156,9 @@ object KafkaShareConsumer {
   // How often an unsubscribed consumer checks for a subscription.
   private val subscriptionCheckInterval: FiniteDuration = 50.millis
 
+  // How long the driver waits before trying again what failed.
+  private val retryInterval: FiniteDuration = 1.second
+
   // How often a renewal asks Java whether the broker answered.
   private val renewalCheckInterval: FiniteDuration = 10.millis
 
@@ -344,7 +347,7 @@ object KafkaShareConsumer {
     )(cancelable: Poll[F], polled: Polled): F[Unit] =
       F.monotonic.flatMap { now =>
         val deliveries = polled.records.map(r => offsetOf(r) -> Delivery(r, deliveryCountOf(r), now))
-        state.update(ShareConsumerState.polled(deliveries, polled.start, polled.lock, _)) *>
+        state.update(s => ShareConsumerState.polled(deliveries, polled.start, polled.lock.orElse(s.lock))) *>
           cancelable(Chunk.from(polled.records).traverse(decode).flatMap(process))
             .guaranteeCase(outcome =>
               F.monotonic.flatMap(at => state.update(_.closed(at))) *> send(identity).unlessA(
@@ -404,18 +407,25 @@ object KafkaShareConsumer {
           case Some(at) =>
             Stream.eval(F.monotonic).flatMap(now => Stream.sleep_[F](at - now)) ++ Stream.emit(())
         }
-        .evalMap(_ => due.handleErrorWith(error => failure.set(Some(error))))
+        .evalMap(_ => retried(due))
         .compile
         .drain
+
+    // A failure fails the running `consume`; what was due is tried again later, as the deadline
+    // which made it due may not change.
+    private def retried(step: F[Unit]): F[Unit] =
+      step.handleErrorWith(error => failure.set(Some(error)) *> F.sleep(retryInterval) *> retried(step))
 
     // What the driver does, each with its deadline, in the order they go when due together.
     private def actions(s: ShareConsumerState, paused: Boolean): List[(FiniteDuration, F[Unit])] =
       List(
         settings.maxProcessingTime.flatMap(max => s.nextOverdue(max).tupleRight(releaseOverdue(max))),
-        s.nextRenewal(Some(config.renewalInterval(s.lock)).filter(_ => settings.autoRenewal))
-          .tupleRight(renew),
+        s.nextRenewal(autoRenewalInterval(s)).tupleRight(renew),
         s.nextSend(settings.maxAcknowledgementDelay, paused).tupleRight(send(identity))
       ).flatten
+
+    private def autoRenewalInterval(s: ShareConsumerState): Option[FiniteDuration] =
+      Some(config.renewalInterval(s.lock)).filter(_ => settings.autoRenewal)
 
     // Does one due thing at a time and looks again, as what is done moves only its own deadline.
     private def due: F[Unit] =
@@ -453,23 +463,29 @@ object KafkaShareConsumer {
           .ifM(
             state.update(_.withRenewalSkipped(at)),
             results.set(Vector.empty) *>
+              // Still due once the mutex is held, or a poll since then would have its fresh records renewed.
               javaStep { s =>
-                val (taken, acks) = s.takeUnsent
-                val (renewing, renewed) = taken.renewal(at)
-                (renewing, (acks, renewed))
-              } { case (consumer, (acks, renewed)) =>
-                recordIn(consumer, acks)
-                val sent = renewed.collect { case (p, record) if renewedIn(consumer, record) => p }
-                consumer.commitAsync()
-                (sent.toSet, acquisitionLock(consumer))
-              }.flatMap { case (sent, lock) =>
-                val forgetAt = at + lock.getOrElse(Duration.Zero) + config.apiTimeout
-                confirmed(sent, forgetAt, Set.empty).flatMap(takeBack)
+                if (s.nextRenewal(autoRenewalInterval(s)).exists(_ <= at)) {
+                  val (taken, acks) = s.takeUnsent
+                  val (renewing, renewed) = taken.renewal(at)
+                  (renewing, Some(acks -> renewed))
+                } else (s, None)
+              } {
+                case (consumer, Some((acks, renewed))) =>
+                  recordIn(consumer, acks)
+                  val sent = renewed.collect { case (p, record) if renewedIn(consumer, record) => p }
+                  consumer.commitAsync()
+                  Some(sent.toSet -> acquisitionLock(consumer))
+                case (_, None) => None
               }
                 // Java failed before it had every renewal: none is counted on.
                 .onError { case _ =>
                   F.monotonic.flatMap(now => state.update(_.withRenewalEnded(Vector.empty, None, now)._1))
                 }
+                .flatMap(_.traverse_ { case (sent, lock) =>
+                  val forgetAt = at + lock.getOrElse(Duration.Zero) + config.apiTimeout
+                  confirmed(sent, forgetAt, Set.empty).flatMap(takeBack)
+                })
           )
       }
 
@@ -491,6 +507,8 @@ object KafkaShareConsumer {
                 consumer.commitAsync()
                 consumer.subscription().isEmpty
               })
+              // A failed check is no answer yet: Java still has the renewals.
+              .handleError(_ => false)
               .product(results.getAndSet(Vector.empty))
               .flatMap { case (unsubscribed, reported) =>
                 val answered = reported.filter { case (p, _) => waiting(p) }
@@ -506,7 +524,8 @@ object KafkaShareConsumer {
 
     // A poll takes the confirmed records back, after Java got the held records' acknowledgements,
     // which its poll needs first; the others are lost. Records it returned which no one knows are
-    // released.
+    // released. Back after the poll closed, their acknowledgements are sent at once, as `consume`
+    // may have ended.
     private def takeBack(confirmed: Set[TopicPartitionOffset]): F[Unit] =
       javaStep(_.takeUnsent) { (consumer, acks) =>
         recordIn(consumer, acks)
@@ -519,7 +538,7 @@ object KafkaShareConsumer {
               recordIn(consumer, unknown.map(_ -> AcknowledgeType.Release))
               consumer.commitAsync()
             }
-            .whenA(unknown.nonEmpty)
+            .whenA(unknown.nonEmpty) *> state.get.map(_.open).ifM(F.unit, send(identity))
         }
       }
 
