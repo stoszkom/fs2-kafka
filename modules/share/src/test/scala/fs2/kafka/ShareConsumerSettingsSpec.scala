@@ -7,7 +7,9 @@
 package fs2.kafka
 
 import cats.effect.IO
+import cats.effect.Resource
 import cats.syntax.all.*
+import fs2.kafka.security.KafkaCredentialStore
 import scala.concurrent.duration.*
 
 final class ShareConsumerSettingsSpec extends BaseSpec {
@@ -61,6 +63,30 @@ final class ShareConsumerSettingsSpec extends BaseSpec {
         "max.poll.records" -> "10",
         "max.poll.interval.ms" -> "60000"
       )
+    }
+
+    it("should set the timeouts, client rack, topic creation and credentials as Java properties") {
+      settings
+        .withRequestTimeout(10.seconds)
+        .withDefaultApiTimeout(20.seconds)
+        .withClientRack("rack-1")
+        .withAllowAutoCreateTopics(false)
+        .withCredentials(KafkaCredentialStore.fromPemStrings("ca", "key", "cert"))
+        .properties shouldBe settings.properties ++ Map(
+        "request.timeout.ms" -> "10000",
+        "default.api.timeout.ms" -> "20000",
+        "client.rack" -> "rack-1",
+        "allow.auto.create.topics" -> "false"
+      ) ++ KafkaCredentialStore.fromPemStrings("ca", "key", "cert").properties
+    }
+
+    it("should replace the deserializers") {
+      val replaced = settings.withDeserializers(
+        Resource.pure[IO, KeyDeserializer[IO, Int]](Deserializer[IO, Int]),
+        Resource.pure[IO, ValueDeserializer[IO, Long]](Deserializer[IO, Long])
+      )
+      replaced.properties shouldBe settings.properties
+      replaced.closeTimeout shouldBe settings.closeTimeout
     }
 
     it("should show as its toString") {

@@ -9,6 +9,7 @@ package fs2.kafka
 import cats.Show
 import cats.effect.Resource
 import fs2.concurrent.Signal
+import fs2.kafka.security.KafkaCredentialStore
 import org.apache.kafka.clients.consumer.ConsumerConfig
 import scala.concurrent.duration.*
 
@@ -42,6 +43,15 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
     * The `Deserializer` to use for deserializing record values.
     */
   def valueDeserializer: Resource[F, ValueDeserializer[F, V]]
+
+  /**
+    * Creates a new [[ShareConsumerSettings]] instance that replaces the deserializers with those
+    * provided.
+    */
+  def withDeserializers[K0, V0](
+    keyDeserializer: Resource[F, KeyDeserializer[F, K0]],
+    valueDeserializer: Resource[F, ValueDeserializer[F, V0]]
+  ): ShareConsumerSettings[F, K0, V0]
 
   /**
     * Properties which can be provided when creating a Java `KafkaShareConsumer` instance. Numerous
@@ -145,6 +155,53 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
     withProperty(ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG, interval.toMillis.toString)
 
   /**
+    * Returns a new [[ShareConsumerSettings]] instance with the specified request timeout. This is
+    * equivalent to setting the following property using the [[withProperty]] function, except you
+    * can specify it with a `FiniteDuration` instead of a `String`.
+    *
+    * {{{
+    * ConsumerConfig.REQUEST_TIMEOUT_MS_CONFIG
+    * }}}
+    */
+  final def withRequestTimeout(timeout: FiniteDuration): ShareConsumerSettings[F, K, V] =
+    withProperty(ConsumerConfig.REQUEST_TIMEOUT_MS_CONFIG, timeout.toMillis.toString)
+
+  /**
+    * Returns a new [[ShareConsumerSettings]] instance with the specified default api timeout. This
+    * is equivalent to setting the following property using the [[withProperty]] function, except
+    * you can specify it with a `FiniteDuration` instead of a `String`.
+    *
+    * {{{
+    * ConsumerConfig.DEFAULT_API_TIMEOUT_MS_CONFIG
+    * }}}
+    */
+  final def withDefaultApiTimeout(timeout: FiniteDuration): ShareConsumerSettings[F, K, V] =
+    withProperty(ConsumerConfig.DEFAULT_API_TIMEOUT_MS_CONFIG, timeout.toMillis.toString)
+
+  /**
+    * Returns a new [[ShareConsumerSettings]] instance with the specified allow auto create topics.
+    * This is equivalent to setting the following property using the [[withProperty]] function,
+    * except you can specify it with a `Boolean` instead of a `String`.
+    *
+    * {{{
+    * ConsumerConfig.ALLOW_AUTO_CREATE_TOPICS_CONFIG
+    * }}}
+    */
+  final def withAllowAutoCreateTopics(allow: Boolean): ShareConsumerSettings[F, K, V] =
+    withProperty(ConsumerConfig.ALLOW_AUTO_CREATE_TOPICS_CONFIG, allow.toString)
+
+  /**
+    * Returns a new [[ShareConsumerSettings]] instance with the specified client rack. This is
+    * equivalent to setting the following property using the [[withProperty]] function.
+    *
+    * {{{
+    * ConsumerConfig.CLIENT_RACK_CONFIG
+    * }}}
+    */
+  final def withClientRack(rack: String): ShareConsumerSettings[F, K, V] =
+    withProperty(ConsumerConfig.CLIENT_RACK_CONFIG, rack)
+
+  /**
     * Includes a property with the specified `key` and `value`. The key should be one of the keys in
     * `ConsumerConfig`, and the value should be a valid choice for the key.
     */
@@ -162,6 +219,13 @@ sealed abstract class ShareConsumerSettings[F[_], K, V] {
     * `ConsumerConfig` keys, and the values should be valid choices for the keys.
     */
   def withProperties(properties: Map[String, String]): ShareConsumerSettings[F, K, V]
+
+  /**
+    * Includes the credentials properties from the provided
+    * [[fs2.kafka.security.KafkaCredentialStore]].
+    */
+  final def withCredentials(credentialsStore: KafkaCredentialStore): ShareConsumerSettings[F, K, V] =
+    withProperties(credentialsStore.properties)
 
   /**
     * The time to wait for the Java `KafkaShareConsumer` to shutdown.<br><br>
@@ -365,6 +429,12 @@ object ShareConsumerSettings {
 
     override def withProperties(values: Map[String, String]): ShareConsumerSettings[F, K, V] =
       copy(properties = properties ++ values)
+
+    override def withDeserializers[K0, V0](
+      keyDeserializer: Resource[F, KeyDeserializer[F, K0]],
+      valueDeserializer: Resource[F, ValueDeserializer[F, V0]]
+    ): ShareConsumerSettings[F, K0, V0] =
+      copy(keyDeserializer = keyDeserializer, valueDeserializer = valueDeserializer)
 
     override def withCloseTimeout(timeout: FiniteDuration): ShareConsumerSettings[F, K, V] = {
       require(timeout >= Duration.Zero, "close timeout must be non-negative")
